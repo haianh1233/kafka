@@ -485,16 +485,20 @@ public final class HttpResponseSerializer {
 
     /**
      * Serializes an OffsetFetchResponse to JSON.
-     * Returns committed offsets for the group. Partitions with negative offsets
-     * (no committed offset) are filtered out.
+     * Returns committed offsets for the group, grouped by topic.
      *
      * If a group-level error is present, returns an error object instead.
      *
      * Output shape (success):
      * {
      *   "group": "checkout-consumer",
-     *   "offsets": [
-     *     { "topic": "orders", "partition": 0, "offset": 150, "metadata": "" }
+     *   "topics": [
+     *     {
+     *       "topic": "orders",
+     *       "partitions": [
+     *         { "partition": 0, "offset": 150, "metadata": "" }
+     *       ]
+     *     }
      *   ]
      * }
      *
@@ -519,15 +523,17 @@ public final class HttpResponseSerializer {
                     return root;
                 }
 
-                ArrayNode offsetsArray = root.putArray("offsets");
+                ArrayNode topicsArray = root.putArray("topics");
                 for (OffsetFetchResponseData.OffsetFetchResponseTopics topic : groupData.topics()) {
+                    ObjectNode topicNode = topicsArray.addObject();
+                    topicNode.put("topic", topic.name());
+                    ArrayNode partitionsArray = topicNode.putArray("partitions");
                     for (OffsetFetchResponseData.OffsetFetchResponsePartitions partition : topic.partitions()) {
-                        if (partition.errorCode() == 0 && partition.committedOffset() >= 0) {
-                            ObjectNode node = offsetsArray.addObject();
-                            node.put("topic", topic.name());
-                            node.put("partition", partition.partitionIndex());
-                            node.put("offset", partition.committedOffset());
-                            node.put("metadata", partition.metadata());
+                        ObjectNode partNode = partitionsArray.addObject();
+                        partNode.put("partition", partition.partitionIndex());
+                        partNode.put("offset", partition.committedOffset());
+                        if (partition.metadata() != null) {
+                            partNode.put("metadata", partition.metadata());
                         }
                     }
                 }
@@ -535,8 +541,8 @@ public final class HttpResponseSerializer {
             }
         }
 
-        // Group not found in response -- return empty offsets
-        root.putArray("offsets");
+        // Group not found in response -- return empty topics
+        root.putArray("topics");
         return root;
     }
 

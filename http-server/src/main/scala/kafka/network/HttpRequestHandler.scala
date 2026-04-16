@@ -19,6 +19,7 @@
 // Time: Modified - TASK-B.06 (request pipeline wiring)
 package kafka.network
 
+import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import io.netty.buffer.Unpooled
 import io.netty.channel.{ChannelFutureListener, ChannelHandlerContext, SimpleChannelInboundHandler}
 import io.netty.handler.codec.http.{DefaultFullHttpResponse, FullHttpRequest, HttpHeaderNames, HttpResponseStatus, HttpVersion}
@@ -26,11 +27,13 @@ import io.netty.handler.ssl.SslHandler
 import kafka.server.http.{HttpProcessor, HttpRequestTranslator, HttpRouter, HttpServerConfigs}
 import org.apache.kafka.common.memory.MemoryPool
 import org.apache.kafka.common.network.{ClientInformation, ListenerName}
+import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.requests.{RequestContext, RequestHeader}
 import org.apache.kafka.common.security.auth.{HttpAuthenticationContext, KafkaPrincipal, KafkaPrincipalBuilder, SecurityProtocol}
 import org.apache.kafka.common.utils.Time
 
 import java.net.InetSocketAddress
+import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.cert.X509Certificate
 import java.util.Base64
@@ -81,6 +84,9 @@ class HttpRequestHandler(
 
   /** Translator instance (has a round-robin counter for batch-sticky partitioning). */
   private val translator: HttpRequestTranslator = new HttpRequestTranslator()
+
+  /** Jackson ObjectMapper for JSON parsing in offset request handling. */
+  private val objectMapper: ObjectMapper = new ObjectMapper()
 
   /** Correlation ID counter — monotonically increasing per handler instance. */
   private val correlationIdCounter: AtomicInteger = new AtomicInteger(0)
@@ -224,6 +230,14 @@ class HttpRequestHandler(
         }
       }
 
+      // --- Handle COMMIT_OFFSETS and FETCH_OFFSETS with dedicated translation ---
+      if (handlerType == HttpRouter.HandlerType.COMMIT_OFFSETS ||
+          handlerType == HttpRouter.HandlerType.FETCH_OFFSETS) {
+        handleOffsetRequest(ctx, req, routeResult)
+        handedOffToAsyncPipeline = true
+        return
+      }
+
       // --- Translate the request ---
       val bodyBytes = if (req.content().isReadable) {
         val bytes = new Array[Byte](req.content().readableBytes())
@@ -354,6 +368,151 @@ class HttpRequestHandler(
     response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json")
     response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length)
     ctx.writeAndFlush(response)
+  }
+
+  /**
+   * Handles offset commit (POST) and offset fetch (GET) requests.
+   * Parses the body, translates to Kafka request, and sends through the standard pipeline.
+   *
+   * Commit body format (nested by topic):
+   * {
+   *   "topics": [{"topic":"t","partitions":[{"partition":0,"offset":3}]}]
+   * }
+   *
+   * Also supports the flat format:
+   * {
+   *   "offsets": [{"topic":"t","partition":0,"offset":3}]
+   * }
+   */
+  private[network] def handleOffsetRequest(
+    ctx: ChannelHandlerContext,
+    req: FullHttpRequest,
+    routeResult: HttpRouter.RouteResult
+  ): Unit = {
+    val group = routeResult.consumerGroup()
+    val isCommit = routeResult.handlerType() == HttpRouter.HandlerType.COMMIT_OFFSETS
+
+    try {
+      val (apiKey: ApiKeys, apiVersion: Short, buffer: ByteBuffer) = if (isCommit) {
+        val bodyBytes = if (req.content().isReadable) {
+          val bytes = new Array[Byte](req.content().readableBytes())
+          req.content().readBytes(bytes)
+          bytes
+        } else {
+          null
+        }
+        if (bodyBytes == null || bodyBytes.isEmpty) {
+          sendErrorResponse(ctx, HttpResponseStatus.BAD_REQUEST,
+            """{"errorCode":-1,"errorMessage":"Request body is required for offset commit"}""")
+          return
+        }
+
+        val json = objectMapper.readTree(bodyBytes)
+        // Convert nested format to flat format if needed
+        val flatJson = convertToFlatOffsetFormat(json)
+        val result = HttpRequestTranslator.translateCommitOffsets(group, flatJson)
+        // Use version 9 (last version with topic names, before topic IDs in v10)
+        val version: Short = Math.min(9, ApiKeys.OFFSET_COMMIT.latestVersion()).toShort
+        val request = result.builder().build(version)
+        (ApiKeys.OFFSET_COMMIT, version, request.serialize().buffer())
+      } else {
+        // FETCH_OFFSETS - always fetch all offsets for the group (null = all topics)
+        // Topic filtering is done in the response serializer if needed
+        val result = HttpRequestTranslator.translateFetchOffsets(group, null)
+        val request = result.builder().build()
+        val version = request.version()
+        (ApiKeys.OFFSET_FETCH, version, request.serialize().buffer())
+      }
+
+      // Build request context and enqueue (same pattern as generic requests)
+      val principal = buildPrincipal(ctx, req)
+      val connectionId = ctx.channel().id().asLongText()
+      val clientAddress = ctx.channel().remoteAddress().asInstanceOf[InetSocketAddress]
+      val clientId = HttpRouter.validateClientId(req.headers().get("X-Kafka-Client-ID"))
+      val correlationId = correlationIdCounter.getAndIncrement()
+
+      val requestHeader = new RequestHeader(apiKey, apiVersion, clientId, correlationId)
+      val requestContext = new RequestContext(
+        requestHeader, connectionId, clientAddress.getAddress,
+        Optional.of(Integer.valueOf(clientAddress.getPort)),
+        principal, ListenerName.normalised("HTTP"), securityProtocol,
+        ClientInformation.EMPTY, false
+      )
+
+      if (buffer.position() != 0) buffer.rewind()
+
+      val channelRequest = new RequestChannel.Request(
+        processor = httpProcessor.id(),
+        context = requestContext,
+        startTimeNanos = Time.SYSTEM.nanoseconds(),
+        memoryPool = MemoryPool.NONE,
+        buffer = buffer,
+        metrics = requestChannel.metrics,
+        envelope = None
+      )
+
+      httpProcessor.registerChannel(connectionId, ctx)
+      val enqueued = requestChannel.tryEnqueue(channelRequest)
+      if (!enqueued) {
+        httpProcessor.unregisterChannel(connectionId)
+        sendErrorResponse(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE,
+          """{"errorCode":-1,"errorMessage":"Request queue full","detail":"SERVICE_UNAVAILABLE"}""")
+        inFlightCount.decrementAndGet()
+      }
+    } catch {
+      case e: org.apache.kafka.common.errors.InvalidRequestException =>
+        sendErrorResponse(ctx, HttpResponseStatus.BAD_REQUEST,
+          s"""{"errorCode":-1,"errorMessage":"${escapeJson(e.getMessage)}"}""")
+        inFlightCount.decrementAndGet()
+      case e: Exception =>
+        sendErrorResponse(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR,
+          s"""{"errorCode":-1,"errorMessage":"${escapeJson(e.getMessage)}"}""")
+        inFlightCount.decrementAndGet()
+    }
+  }
+
+  /**
+   * Converts a nested topic/partition offset format to the flat format expected
+   * by HttpRequestTranslator.translateCommitOffsets.
+   *
+   * Nested: {"topics": [{"topic":"t","partitions":[{"partition":0,"offset":3}]}]}
+   * Flat:   {"offsets": [{"topic":"t","partition":0,"offset":3}]}
+   *
+   * If the input already has "offsets" at top level, returns as-is.
+   */
+  private def convertToFlatOffsetFormat(json: JsonNode): JsonNode = {
+    if (json.has("offsets")) return json // Already flat format
+
+    val topicsNode = json.get("topics")
+    if (topicsNode == null || !topicsNode.isArray) {
+      throw new org.apache.kafka.common.errors.InvalidRequestException(
+        "'offsets' or 'topics' array is required in offset commit body")
+    }
+
+    val flatRoot = objectMapper.createObjectNode()
+    val offsetsArray = flatRoot.putArray("offsets")
+
+    val topicsIter = topicsNode.elements()
+    while (topicsIter.hasNext) {
+      val topicEntry = topicsIter.next()
+      val topicName = topicEntry.get("topic").asText()
+      val partitionsNode = topicEntry.get("partitions")
+      if (partitionsNode != null && partitionsNode.isArray) {
+        val partIter = partitionsNode.elements()
+        while (partIter.hasNext) {
+          val partEntry = partIter.next()
+          val flat = offsetsArray.addObject()
+          flat.put("topic", topicName)
+          flat.put("partition", partEntry.get("partition").asInt())
+          flat.put("offset", partEntry.get("offset").asLong())
+          if (partEntry.has("metadata")) {
+            flat.put("metadata", partEntry.get("metadata").asText())
+          }
+        }
+      }
+    }
+
+    flatRoot
   }
 
   /**
