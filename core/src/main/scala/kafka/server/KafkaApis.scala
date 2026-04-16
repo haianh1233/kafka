@@ -21,6 +21,7 @@ import kafka.coordinator.transaction.{InitProducerIdResult, TransactionCoordinat
 import kafka.network.RequestChannel
 import kafka.server.QuotaFactory.{QuotaManagers, UNBOUNDED_QUOTA}
 import kafka.server.handlers.DescribeTopicPartitionsRequestHandler
+import kafka.server.http.FetchForwardManager
 import kafka.server.share.SharePartitionManager
 import kafka.utils.Logging
 import org.apache.kafka.clients.CommonClientConfigs
@@ -84,6 +85,7 @@ import scala.annotation.nowarn
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.{Map, Seq, Set, mutable}
 import scala.jdk.CollectionConverters._
+import kafka.server.http.ProduceForwardManager
 import scala.jdk.javaapi.OptionConverters
 
 /**
@@ -112,7 +114,9 @@ class KafkaApis(val requestChannel: RequestChannel,
                 val apiVersionManager: ApiVersionManager,
                 val clientMetricsManager: ClientMetricsManager,
                 val groupConfigManager: GroupConfigManager,
-                val httpAsyncExecutor: ScheduledExecutorService = null
+                val httpAsyncExecutor: ScheduledExecutorService = null,
+                val fetchForwardManager: FetchForwardManager = null,
+                val produceForwardManager: ProduceForwardManager = null
 ) extends ApiRequestHandler with Logging {
 
   type ProduceResponseStats = Map[TopicIdPartition, RecordValidationStats]
@@ -280,22 +284,29 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   /**
-   * Handles HTTP produce requests -- LOCAL leader path only.
+   * Handles HTTP produce requests -- FULL path with local append + forwarding.
    *
-   * For partitions where this broker is the leader, delegates to
-   * ReplicaManager.appendRecords(). For partitions with a remote leader,
-   * returns LEADER_NOT_AVAILABLE (forwarding added in TASK-D.03).
+   * Partitions are bucketed by leader:
+   *   - LOCAL:   ReplicaManager.appendRecords() (same as C.01)
+   *   - REMOTE:  ProduceForwardManager.forward(leaderId, ...)
+   *   - UNKNOWN: return LEADER_NOT_AVAILABLE
+   *
+   * All futures are merged via CompletableFuture.allOf().handleAsync(httpAsyncExecutor).
+   *
+   * Retry: on NOT_LEADER_OR_FOLLOWER from remote broker, retry ONCE with
+   * refreshed metadata (section 5.5C).
    *
    * CRITICAL: This method must NEVER block the KafkaRequestHandler thread.
    * All CompletableFuture composition uses .handleAsync(httpAsyncExecutor)
    * per design doc section 14.1.
    *
    * @see handleProduceRequest for the binary protocol equivalent
-   * // Time: Update - TASK-C.01
+   * // Time: Update - TASK-D.03
    */
   private def handleHttpProduceRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
     val produceRequest = request.body[ProduceRequest]
     val localBrokerId = config.brokerId
+    val forwardingTimeoutMs = produceRequest.timeout.toLong
 
     // ---------------------------------------------------------------
     // 1. Parse partition data from the ProduceRequest
@@ -306,6 +317,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     val invalidRequestResponses = mutable.Map[TopicIdPartition, PartitionResponse]()
     val leaderNotAvailableResponses = mutable.Map[TopicIdPartition, PartitionResponse]()
     val authorizedLocalRequestInfo = mutable.Map[TopicIdPartition, MemoryRecords]()
+    val remoteEntriesByLeader = mutable.Map[Int, mutable.Map[TopicIdPartition, MemoryRecords]]()
 
     val topicIdToPartitionData =
       new mutable.ArrayBuffer[(TopicIdPartition, ProduceRequestData.PartitionProduceData)]
@@ -336,7 +348,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     // ---------------------------------------------------------------
     // 3. Classify each partition: unauthorized, non-existing,
-    //    invalid, local-leader, or remote-leader
+    //    invalid, local-leader, remote-leader, or unknown-leader
     // ---------------------------------------------------------------
     topicIdToPartitionData.foreach { case (topicIdPartition, partition) =>
       val memoryRecords = partition.records.asInstanceOf[MemoryRecords]
@@ -350,19 +362,26 @@ class KafkaApis(val requestChannel: RequestChannel,
         try {
           ProduceRequest.validateRecords(request.header.apiVersion, memoryRecords)
 
-          // Leader check: is this broker the leader for this partition?
-          val isLocal = OptionConverters.toScala(metadataCache.getLeaderAndIsr(
+          // Determine leader for this partition from MetadataCache
+          val leaderAndIsrOpt = OptionConverters.toScala(metadataCache.getLeaderAndIsr(
             topicIdPartition.topicPartition.topic,
             topicIdPartition.topicPartition.partition
-          )).exists(_.leader == localBrokerId)
+          ))
 
-          if (isLocal) {
-            authorizedLocalRequestInfo += (topicIdPartition -> memoryRecords)
-          } else {
-            // Phase C: no forwarding yet -- return LEADER_NOT_AVAILABLE
-            // Phase D (TASK-D.03) will replace this with actual forwarding
-            leaderNotAvailableResponses += topicIdPartition ->
-              new PartitionResponse(Errors.LEADER_NOT_AVAILABLE)
+          leaderAndIsrOpt match {
+            case Some(info) if info.leader == localBrokerId =>
+              // LOCAL: this broker is the leader
+              authorizedLocalRequestInfo += (topicIdPartition -> memoryRecords)
+
+            case Some(info) if info.leader >= 0 =>
+              // REMOTE: another broker is the leader -- forward
+              remoteEntriesByLeader.getOrElseUpdate(info.leader, mutable.Map.empty) +=
+                (topicIdPartition -> memoryRecords)
+
+            case _ =>
+              // UNKNOWN: leader not known
+              leaderNotAvailableResponses += topicIdPartition ->
+                new PartitionResponse(Errors.LEADER_NOT_AVAILABLE)
           }
         } catch {
           case e: ApiException =>
@@ -373,7 +392,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     // ---------------------------------------------------------------
-    // 4. Merge all non-appendable partition results
+    // 4. Merge all non-appendable partition results (immutable snapshot)
     // ---------------------------------------------------------------
     val preComputedErrors: Map[TopicIdPartition, PartitionResponse] =
       (unauthorizedTopicResponses ++ nonExistingTopicResponses ++
@@ -384,11 +403,11 @@ class KafkaApis(val requestChannel: RequestChannel,
     // ---------------------------------------------------------------
     @nowarn("cat=deprecation")
     def sendMergedResponse(
-      appendResults: java.util.Map[TopicIdPartition, PartitionResponse]
+      allResults: Map[TopicIdPartition, PartitionResponse]
     ): Unit = {
       val mergedResponseStatus: java.util.Map[TopicIdPartition, PartitionResponse] =
         new java.util.HashMap[TopicIdPartition, PartitionResponse]()
-      mergedResponseStatus.putAll(appendResults)
+      allResults.foreach { case (tp, resp) => mergedResponseStatus.put(tp, resp) }
       preComputedErrors.foreach { case (tp, resp) => mergedResponseStatus.put(tp, resp) }
 
       // Quota handling (same pattern as existing handler)
@@ -423,58 +442,144 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     // ---------------------------------------------------------------
-    // 6. If no local partitions to append, send immediate response
+    // 6. If nothing to append or forward, respond immediately
     // ---------------------------------------------------------------
-    if (authorizedLocalRequestInfo.isEmpty) {
-      sendMergedResponse(java.util.Collections.emptyMap())
+    if (authorizedLocalRequestInfo.isEmpty && remoteEntriesByLeader.isEmpty) {
+      sendMergedResponse(Map.empty)
       return
     }
 
     // ---------------------------------------------------------------
-    // 7. Local append via ReplicaManager (async via CompletableFuture)
+    // 7. LOCAL append via ReplicaManager (async via CompletableFuture)
     //    CRITICAL: responseCallback may be called synchronously
     //    (acks=1 fast path). Wrap in CompletableFuture so the merge
     //    always runs on httpAsyncExecutor (section 14.1).
     // ---------------------------------------------------------------
-    val localFuture = new CompletableFuture[java.util.Map[TopicIdPartition, PartitionResponse]]()
+    val localFuture = new CompletableFuture[Map[TopicIdPartition, PartitionResponse]]()
 
-    replicaManager.appendRecords(
-      timeout = produceRequest.timeout.toLong,
-      requiredAcks = produceRequest.acks,
-      internalTopicsAllowed = request.header.clientId == "__admin_client",
-      origin = AppendOrigin.CLIENT,
-      entriesPerPartition = authorizedLocalRequestInfo,
-      responseCallback = { results: java.util.Map[TopicIdPartition, PartitionResponse] =>
-        localFuture.complete(results)
-      }
-    )
+    if (authorizedLocalRequestInfo.nonEmpty) {
+      replicaManager.appendRecords(
+        timeout = produceRequest.timeout.toLong,
+        requiredAcks = produceRequest.acks,
+        internalTopicsAllowed = request.header.clientId == "__admin_client",
+        origin = AppendOrigin.CLIENT,
+        entriesPerPartition = authorizedLocalRequestInfo,
+        responseCallback = { results: java.util.Map[TopicIdPartition, PartitionResponse] =>
+          localFuture.complete(results.asScala.toMap)
+        }
+      )
+    } else {
+      localFuture.complete(Map.empty)
+    }
 
     // Clear partition records to allow GC (same as existing handler)
     produceRequest.clearPartitionRecords()
 
     // ---------------------------------------------------------------
-    // 8. When the local append completes, merge and send response
-    //    ALWAYS use .handleAsync with httpAsyncExecutor to avoid
-    //    running on the handler thread or InterBrokerSendThread.
+    // 8. REMOTE forwarding via ProduceForwardManager
     // ---------------------------------------------------------------
-    localFuture
-      .orTimeout(produceRequest.timeout.toLong, TimeUnit.MILLISECONDS)
+    val remoteFutures: Seq[(Int, CompletableFuture[java.util.Map[TopicIdPartition, PartitionResponse]])] =
+      if (produceForwardManager != null && remoteEntriesByLeader.nonEmpty) {
+        remoteEntriesByLeader.toSeq.map { case (leaderId, entries) =>
+          leaderId -> produceForwardManager.forward(
+            leaderId,
+            entries.toMap.asJava,
+            produceRequest.acks,
+            produceRequest.timeout
+          )
+        }
+      } else {
+        // No forwarder available -- treat all remote as leader-not-available
+        // (This path should not be hit in production if HTTP is enabled)
+        remoteEntriesByLeader.foreach { case (_, entries) =>
+          entries.keys.foreach { tp =>
+            leaderNotAvailableResponses += tp ->
+              new PartitionResponse(Errors.LEADER_NOT_AVAILABLE)
+          }
+        }
+        Seq.empty
+      }
+
+    // ---------------------------------------------------------------
+    // 9. Combine all futures and merge results
+    //    ALWAYS use .handleAsync with httpAsyncExecutor (section 14.1)
+    // ---------------------------------------------------------------
+    val allFutures: Array[CompletableFuture[_]] =
+      (Seq(localFuture) ++ remoteFutures.map(_._2)).toArray
+
+    CompletableFuture.allOf(allFutures: _*)
+      .orTimeout(forwardingTimeoutMs, TimeUnit.MILLISECONDS)
       .handleAsync(
-        new BiFunction[java.util.Map[TopicIdPartition, PartitionResponse], Throwable, Unit] {
-          override def apply(
-            localResults: java.util.Map[TopicIdPartition, PartitionResponse],
-            ex: Throwable
-          ): Unit = {
-            if (ex != null) {
-              // Timeout or unexpected error -- return REQUEST_TIMED_OUT for all local partitions
-              val timedOutResults = new java.util.HashMap[TopicIdPartition, PartitionResponse]()
-              authorizedLocalRequestInfo.keys.foreach { tp =>
-                timedOutResults.put(tp, new PartitionResponse(Errors.REQUEST_TIMED_OUT))
-              }
-              sendMergedResponse(timedOutResults)
-            } else {
-              sendMergedResponse(localResults)
+        new BiFunction[Void, Throwable, Unit] {
+          override def apply(ignored: Void, ex: Throwable): Unit = {
+            val allResults = mutable.Map[TopicIdPartition, PartitionResponse]()
+
+            // Collect local results
+            try {
+              val localResults = localFuture.getNow(Map.empty)
+              allResults ++= localResults
+            } catch {
+              case _: Exception =>
+                authorizedLocalRequestInfo.keys.foreach { tp =>
+                  allResults += tp -> new PartitionResponse(Errors.REQUEST_TIMED_OUT)
+                }
             }
+
+            // Collect remote results and identify retriable partitions
+            val retriablePartitions = mutable.Map[TopicIdPartition, MemoryRecords]()
+
+            remoteFutures.foreach { case (leaderId, future) =>
+              try {
+                if (future.isDone && !future.isCompletedExceptionally) {
+                  val remoteResults = future.getNow(null)
+                  if (remoteResults != null) {
+                    remoteResults.forEach { (tp, resp) =>
+                      if (resp.error == Errors.NOT_LEADER_OR_FOLLOWER ||
+                          resp.error == Errors.LEADER_NOT_AVAILABLE) {
+                        // Candidate for retry (section 5.5C)
+                        val originalRecords = remoteEntriesByLeader.get(leaderId)
+                          .flatMap(_.get(tp))
+                        originalRecords.foreach { records =>
+                          retriablePartitions += tp -> records
+                        }
+                      } else {
+                        allResults += tp -> resp
+                      }
+                    }
+                  }
+                } else {
+                  // Future failed (timeout or disconnect)
+                  remoteEntriesByLeader.get(leaderId).foreach { entries =>
+                    entries.keys.foreach { tp =>
+                      allResults += tp -> new PartitionResponse(Errors.REQUEST_TIMED_OUT)
+                    }
+                  }
+                }
+              } catch {
+                case _: Exception =>
+                  remoteEntriesByLeader.get(leaderId).foreach { entries =>
+                    entries.keys.foreach { tp =>
+                      allResults += tp -> new PartitionResponse(Errors.REQUEST_TIMED_OUT)
+                    }
+                  }
+              }
+            }
+
+            // ----------------------------------------------------------
+            // 10. Retry once for NOT_LEADER_OR_FOLLOWER partitions
+            //     (section 5.5C: at most 1 retry per forwarded group)
+            // ----------------------------------------------------------
+            if (retriablePartitions.nonEmpty && produceForwardManager != null) {
+              retryFailedPartitions(
+                retriablePartitions.toMap,
+                produceRequest.acks,
+                produceRequest.timeout,
+                forwardingTimeoutMs,
+                allResults
+              )
+            }
+
+            sendMergedResponse(allResults.toMap)
           }
         },
         httpAsyncExecutor // NEVER use plain .handle() here
@@ -484,12 +589,85 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   /**
-   * Handles HTTP consume (fetch) requests -- LOCAL leader path only.
+   * Retry produce for partitions that returned NOT_LEADER_OR_FOLLOWER.
+   * Re-buckets partitions with refreshed metadata and forwards once more.
+   * Results (success or failure) are written into allResults.
    *
-   * For partitions where this broker is the leader, delegates to
-   * ReplicaManager.fetchMessages(). For partitions with a remote leader,
-   * returns empty records with LEADER_NOT_AVAILABLE (forwarding added in
-   * TASK-D.04).
+   * This runs on httpAsyncExecutor, so a short blocking wait is acceptable
+   * (bounded by remaining timeout budget).
+   *
+   * // Time: Created - TASK-D.03
+   */
+  private def retryFailedPartitions(
+    partitions: Map[TopicIdPartition, MemoryRecords],
+    requiredAcks: Short,
+    timeoutMs: Int,
+    forwardingTimeoutMs: Long,
+    allResults: mutable.Map[TopicIdPartition, PartitionResponse]
+  ): Unit = {
+    val localBrokerId = config.brokerId
+
+    partitions.foreach { case (tp, records) =>
+      // Refresh metadata for this partition
+      val leaderAndIsrOpt = OptionConverters.toScala(metadataCache.getLeaderAndIsr(
+        tp.topicPartition.topic, tp.topicPartition.partition))
+
+      leaderAndIsrOpt match {
+        case Some(info) if info.leader == localBrokerId =>
+          // Leader moved to this broker -- append locally (synchronous on retry)
+          try {
+            val retryFuture = new CompletableFuture[Map[TopicIdPartition, PartitionResponse]]()
+            replicaManager.appendRecords(
+              timeout = timeoutMs.toLong,
+              requiredAcks = requiredAcks,
+              internalTopicsAllowed = false,
+              origin = AppendOrigin.CLIENT,
+              entriesPerPartition = Map(tp -> records),
+              responseCallback = { results: java.util.Map[TopicIdPartition, PartitionResponse] =>
+                retryFuture.complete(results.asScala.toMap)
+              }
+            )
+            val retryResults = retryFuture.get(forwardingTimeoutMs, TimeUnit.MILLISECONDS)
+            allResults ++= retryResults
+          } catch {
+            case _: Exception =>
+              allResults += tp -> new PartitionResponse(Errors.REQUEST_TIMED_OUT)
+          }
+
+        case Some(info) if info.leader >= 0 =>
+          // Forward to new leader
+          try {
+            val retryResult = produceForwardManager.forward(
+              info.leader,
+              java.util.Map.of(tp, records),
+              requiredAcks,
+              timeoutMs
+            ).get(forwardingTimeoutMs, TimeUnit.MILLISECONDS)
+
+            retryResult.forEach { (retryTp, resp) =>
+              allResults += retryTp -> resp
+            }
+          } catch {
+            case _: Exception =>
+              allResults += tp -> new PartitionResponse(Errors.NOT_LEADER_OR_FOLLOWER)
+          }
+
+        case _ =>
+          allResults += tp -> new PartitionResponse(Errors.LEADER_NOT_AVAILABLE)
+      }
+    }
+  }
+
+  /**
+   * Handles HTTP consume (fetch) requests -- FULL path with local fetch + forwarding.
+   *
+   * Partitions are bucketed by leader:
+   *   - LOCAL:   ReplicaManager.fetchMessages() (same as C.02)
+   *   - REMOTE:  FetchForwardManager.forward(leaderId, ...)
+   *   - UNKNOWN: errorCode=LEADER_NOT_AVAILABLE, records=[]
+   *
+   * The capped effectiveMaxWaitMs is passed to both local and remote fetches
+   * so all branches operate within the same time budget.
    *
    * Key behavioral differences from handleFetchRequest:
    *   - effectiveMaxWaitMs = min(request.maxWaitMs, http.consume.max.wait.ms)
@@ -505,8 +683,8 @@ class KafkaApis(val requestChannel: RequestChannel,
    * httpAsyncExecutor per design doc section 14.1.
    *
    * @see handleFetchRequest for the binary protocol equivalent
-   * @see <a href="ivy-docs/http-protocol-design.md">Design doc section 6</a>
-   * // Time: Update - TASK-C.02
+   * @see <a href="ivy-docs/http-protocol-design.md">Design doc sections 6, 7.5, 7.6</a>
+   * // Time: Update - TASK-D.04
    */
   private def handleHttpConsumeRequest(request: RequestChannel.Request): Unit = {
     val fetchRequest = request.body[FetchRequest]
@@ -540,8 +718,8 @@ class KafkaApis(val requestChannel: RequestChannel,
     // 3. Authorization: READ on each topic
     // ---------------------------------------------------------------
     val erroneous = mutable.ArrayBuffer[(TopicIdPartition, FetchResponseData.PartitionData)]()
-    val interesting = mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]()
-    val leaderNotAvailable = mutable.ArrayBuffer[(TopicIdPartition, FetchResponseData.PartitionData)]()
+    val localFetchSpecs = mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]()
+    val remoteFetchSpecsByLeader = mutable.Map[Int, mutable.Map[TopicIdPartition, FetchRequest.PartitionData]]()
 
     val partitionDatas = new mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]
     fetchData.forEach { (topicIdPartition, partitionData) =>
@@ -566,49 +744,43 @@ class KafkaApis(val requestChannel: RequestChannel,
           FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
       } else {
         // ---------------------------------------------------------------
-        // 4. Leader check: same pattern as handleHttpProduceRequest (C.01)
-        //    Use metadataCache.getLeaderAndIsr to determine if this broker
-        //    is the partition leader.
+        // 4. Leader check and bucketing (section 7.5 forwarding decision matrix)
+        //    Local leaders -> localFetchSpecs
+        //    Known remote leaders -> remoteFetchSpecsByLeader
+        //    Unknown leaders -> erroneous (LEADER_NOT_AVAILABLE)
         // ---------------------------------------------------------------
-        val isLocal = OptionConverters.toScala(metadataCache.getLeaderAndIsr(
+        val leaderOpt = OptionConverters.toScala(metadataCache.getLeaderAndIsr(
           topicIdPartition.topicPartition.topic,
           topicIdPartition.topicPartition.partition
-        )).exists(_.leader == localBrokerId)
+        ))
 
-        if (isLocal) {
-          interesting += topicIdPartition -> data
-        } else {
-          // Phase C: no forwarding yet -- return LEADER_NOT_AVAILABLE with empty records
-          // Phase D (TASK-D.04) will replace this with actual forwarding
-          leaderNotAvailable += topicIdPartition ->
-            FetchResponse.partitionResponse(topicIdPartition, Errors.LEADER_NOT_AVAILABLE)
+        leaderOpt match {
+          case Some(info) if info.leader == localBrokerId =>
+            localFetchSpecs += topicIdPartition -> data
+
+          case Some(info) if info.leader >= 0 =>
+            remoteFetchSpecsByLeader.getOrElseUpdate(info.leader, mutable.Map.empty) +=
+              (topicIdPartition -> data)
+
+          case _ =>
+            erroneous += topicIdPartition ->
+              FetchResponse.partitionResponse(topicIdPartition, Errors.LEADER_NOT_AVAILABLE)
         }
       }
     }
 
     // ---------------------------------------------------------------
-    // 5. Response callback -- merges local results with errors
-    //    This callback fires when data is available or maxWaitMs expires
-    //    (via DelayedFetch purgatory). It may fire synchronously if data
-    //    is already available, or asynchronously from the purgatory thread.
-    //    In both cases we wrap in CompletableFuture and merge/send on
-    //    httpAsyncExecutor.
+    // 5. Response builder -- merges local + remote results with errors
+    //    This is called on httpAsyncExecutor after all futures complete.
     // ---------------------------------------------------------------
-    val localFuture = new CompletableFuture[Seq[(TopicIdPartition, FetchPartitionData)]]()
-
-    def processResponseCallback(
-      responsePartitionData: Seq[(TopicIdPartition, FetchPartitionData)]
-    ): Unit = {
-      localFuture.complete(responsePartitionData)
-    }
-
     def sendMergedResponse(
-      responsePartitionData: Seq[(TopicIdPartition, FetchPartitionData)]
+      localResults: Seq[(TopicIdPartition, FetchPartitionData)],
+      remoteResults: scala.collection.Map[TopicIdPartition, FetchPartitionData]
     ): Unit = {
       val partitions = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]
 
       // Convert local fetch results
-      responsePartitionData.foreach { case (topicIdPartition, data) =>
+      localResults.foreach { case (topicIdPartition, data) =>
         val partitionData = new FetchResponseData.PartitionData()
           .setPartitionIndex(topicIdPartition.partition)
           .setErrorCode(data.error.code)
@@ -622,11 +794,22 @@ class KafkaApis(val requestChannel: RequestChannel,
         partitions.put(topicIdPartition, partitionData)
       }
 
-      // Add erroneous partitions (unauthorized, unknown topic)
-      erroneous.foreach { case (tp, data) => partitions.put(tp, data) }
+      // Convert remote fetch results
+      remoteResults.foreach { case (topicIdPartition, data) =>
+        val partitionData = new FetchResponseData.PartitionData()
+          .setPartitionIndex(topicIdPartition.partition)
+          .setErrorCode(data.error.code)
+          .setHighWatermark(data.highWatermark)
+          .setLastStableOffset(data.lastStableOffset.orElse(FetchResponse.INVALID_LAST_STABLE_OFFSET))
+          .setLogStartOffset(data.logStartOffset)
+          .setAbortedTransactions(data.abortedTransactions.orElse(null))
+          .setRecords(data.records)
+          .setPreferredReadReplica(FetchResponse.INVALID_PREFERRED_REPLICA_ID)
+        partitions.put(topicIdPartition, partitionData)
+      }
 
-      // Add leader-not-available partitions (remote leaders, pending TASK-D.04)
-      leaderNotAvailable.foreach { case (tp, data) => partitions.put(tp, data) }
+      // Add erroneous partitions (unauthorized, unknown topic, unknown leader)
+      erroneous.foreach { case (tp, data) => partitions.put(tp, data) }
 
       // Quota handling (same pattern as handleFetchRequest for consumers)
       val timeMs = time.milliseconds()
@@ -661,10 +844,10 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     // ---------------------------------------------------------------
-    // 6. If no interesting (local) partitions, respond immediately
+    // 6. If nothing to fetch locally or remotely, respond immediately
     // ---------------------------------------------------------------
-    if (interesting.isEmpty) {
-      sendMergedResponse(Seq.empty)
+    if (localFetchSpecs.isEmpty && remoteFetchSpecsByLeader.isEmpty) {
+      sendMergedResponse(Seq.empty, scala.collection.Map.empty)
       return
     }
 
@@ -687,38 +870,111 @@ class KafkaApis(val requestChannel: RequestChannel,
     )
 
     // ---------------------------------------------------------------
-    // 8. Fetch from local replicas
+    // 8. LOCAL fetch (async via CompletableFuture)
     //    The callback fires when data is available or maxWaitMs expires
     //    (via DelayedFetch purgatory). It may fire synchronously if
     //    data is already available.
     // ---------------------------------------------------------------
-    replicaManager.fetchMessages(
-      params = params,
-      fetchInfos = interesting,
-      quota = UNBOUNDED_QUOTA, // consumer fetch -- replication quota is not applicable
-      responseCallback = processResponseCallback
-    )
+    val localFuture = new CompletableFuture[Seq[(TopicIdPartition, FetchPartitionData)]]()
+
+    if (localFetchSpecs.nonEmpty) {
+      replicaManager.fetchMessages(
+        params = params,
+        fetchInfos = localFetchSpecs,
+        quota = UNBOUNDED_QUOTA, // consumer fetch -- replication quota is not applicable
+        responseCallback = { results: Seq[(TopicIdPartition, FetchPartitionData)] =>
+          localFuture.complete(results)
+        }
+      )
+    } else {
+      localFuture.complete(Seq.empty)
+    }
 
     // ---------------------------------------------------------------
-    // 9. When the local fetch completes, merge and send response
-    //    ALWAYS use .handleAsync with httpAsyncExecutor to avoid
-    //    running on the handler thread or purgatory thread.
+    // 9. REMOTE fetch via FetchForwardManager (section 7.5, 7.6)
+    //    effectiveMaxWaitMs is passed to remote fetches so the remote
+    //    broker's DelayedFetch purgatory uses the same time budget.
     // ---------------------------------------------------------------
-    localFuture
-      .orTimeout(effectiveMaxWaitMs.toLong + 5000L, TimeUnit.MILLISECONDS) // safety net: maxWait + 5s buffer
+    val remoteFutures: Seq[CompletableFuture[java.util.Map[TopicIdPartition, FetchPartitionData]]] =
+      if (fetchForwardManager != null && remoteFetchSpecsByLeader.nonEmpty) {
+        remoteFetchSpecsByLeader.toSeq.map { case (leaderId, specs) =>
+          fetchForwardManager.forward(
+            leaderId,
+            specs.toMap.asJava,
+            effectiveMaxWaitMs,
+            fetchMinBytes,
+            fetchMaxBytes
+          )
+        }
+      } else {
+        // No forwarder available -- add all remote specs as LEADER_NOT_AVAILABLE
+        remoteFetchSpecsByLeader.foreach { case (_, specs) =>
+          specs.keys.foreach { tp =>
+            erroneous += tp ->
+              FetchResponse.partitionResponse(tp, Errors.LEADER_NOT_AVAILABLE)
+          }
+        }
+        Seq.empty
+      }
+
+    // ---------------------------------------------------------------
+    // 10. Combine all futures and merge results (section 6.2)
+    //     CompletableFuture.allOf(...).orTimeout(effectiveMaxWaitMs)
+    //     is the hard ceiling. Timed-out partitions return empty
+    //     records, not an error (section 6.9).
+    //     ALWAYS use .handleAsync with httpAsyncExecutor to avoid
+    //     running on the handler thread or purgatory thread.
+    // ---------------------------------------------------------------
+    val allFutures: Array[CompletableFuture[_]] =
+      (Seq(localFuture) ++ remoteFutures).toArray
+
+    CompletableFuture.allOf(allFutures: _*)
+      .orTimeout(effectiveMaxWaitMs.toLong, TimeUnit.MILLISECONDS)
       .handleAsync(
-        new BiFunction[Seq[(TopicIdPartition, FetchPartitionData)], Throwable, Unit] {
-          override def apply(
-            localResults: Seq[(TopicIdPartition, FetchPartitionData)],
-            ex: Throwable
-          ): Unit = {
-            if (ex != null) {
-              // Timeout or unexpected error -- return empty results for all local partitions
-              // (the purgatory should have fired by effectiveMaxWaitMs, this is a safety net)
-              sendMergedResponse(Seq.empty)
-            } else {
-              sendMergedResponse(localResults)
+        new BiFunction[Void, Throwable, Unit] {
+          override def apply(ignored: Void, ex: Throwable): Unit = {
+            // Collect local results (use getNow to avoid blocking)
+            val localResults: Seq[(TopicIdPartition, FetchPartitionData)] =
+              try { localFuture.getNow(Seq.empty) }
+              catch { case _: Exception => Seq.empty }
+
+            // Collect remote results
+            val remoteResults = mutable.Map[TopicIdPartition, FetchPartitionData]()
+            remoteFutures.foreach { future =>
+              try {
+                if (future.isDone && !future.isCompletedExceptionally) {
+                  val results = future.getNow(null)
+                  if (results != null) {
+                    results.forEach { (tp, data) => remoteResults += tp -> data }
+                  }
+                }
+                // Partitions from incomplete/failed futures are handled below
+              } catch {
+                case _: Exception => // ignore failed futures
+              }
             }
+
+            // Any remote partitions that did not return results get
+            // empty records (not an error -- section 6.9: empty poll on timeout)
+            remoteFetchSpecsByLeader.foreach { case (_, specs) =>
+              specs.keys.foreach { tp =>
+                if (!remoteResults.contains(tp)) {
+                  remoteResults += tp -> new FetchPartitionData(
+                    Errors.NONE,          // errorCode = 0, not an error
+                    0L,                   // highWatermark
+                    0L,                   // logStartOffset
+                    MemoryRecords.EMPTY,  // empty records
+                    Optional.empty(),     // divergingEpoch
+                    java.util.OptionalLong.empty(), // lastStableOffset
+                    Optional.empty(),     // abortedTransactions
+                    java.util.OptionalInt.empty(),  // preferredReadReplica
+                    false                 // isReassignmentFetch
+                  )
+                }
+              }
+            }
+
+            sendMergedResponse(localResults, remoteResults.toMap)
           }
         },
         httpAsyncExecutor // NEVER use plain .handle() here
