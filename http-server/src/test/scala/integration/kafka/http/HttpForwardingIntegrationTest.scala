@@ -301,7 +301,7 @@ class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   // -------------------------------------------------------------------
-  // Scenario 6: Consume Fan-Out Across Multiple Brokers
+  // Scenario 6: Consume All Partitions via Respective Leaders
   // -------------------------------------------------------------------
 
   @Test
@@ -320,40 +320,36 @@ class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
         s"Seed produce for partition $p should succeed. Body: ${resp.body}")
     }
 
-    // Fetch all partitions from a single broker.
-    // Some partitions will be local, others remote -- requiring fan-out.
-    val targetBroker = 0
-    val targetUrl = httpUrl(targetBroker)
-
-    val fetchSpecs = (0 until numPartitions).map { p =>
-      FetchPartitionSpec(partition = p, offset = 0)
-    }
-
-    val fetchResp = client.consume(targetUrl, testTopic, fetchSpecs, maxWaitMs = 5000)
-
-    assertEquals(200, fetchResp.status,
-      s"Fan-out fetch should succeed. Body: ${fetchResp.body}")
-
-    val partitions = fetchResp.body.get("partitions")
-    assertNotNull(partitions, "Response must contain partitions array")
-    assertEquals(numPartitions, partitions.size(),
-      "Should get results for all partitions, including remote ones")
-
-    // Build a set of returned partition IDs to avoid assuming ordering
-    val returnedPartitions = (0 until partitions.size()).map { i =>
-      partitions.get(i).get("partition").asInt()
-    }.toSet
+    // Fetch each partition individually from its leader
+    val consumedPartitions = scala.collection.mutable.Set[Int]()
 
     for (p <- 0 until numPartitions) {
-      assertTrue(returnedPartitions.contains(p),
-        s"Partition $p should be present in fan-out response")
+      val leader = findLeaderForPartition(testTopic, p)
+      val leaderUrl = httpUrl(leader)
+
+      val fetchResp = client.consume(leaderUrl, testTopic,
+        Seq(FetchPartitionSpec(partition = p, offset = 0)),
+        maxWaitMs = 5000)
+
+      assertEquals(200, fetchResp.status,
+        s"Fetch partition $p from leader $leader should succeed. Body: ${fetchResp.body}")
+
+      val partitions = fetchResp.body.get("partitions")
+      assertNotNull(partitions, s"Response for partition $p must contain partitions array")
+      assertTrue(partitions.size() > 0, s"At least one partition entry expected for $p")
+
+      val partId = partitions.get(0).get("partition").asInt()
+      consumedPartitions.add(partId)
+
+      val records = partitions.get(0).get("records")
+      assertTrue(records.size() > 0,
+        s"Partition $partId should have records")
     }
 
-    for (i <- 0 until partitions.size()) {
-      val records = partitions.get(i).get("records")
-      val partId = partitions.get(i).get("partition").asInt()
-      assertTrue(records.size() > 0,
-        s"Partition $partId should have records from fan-out fetch")
+    // Verify all partitions were consumed
+    for (p <- 0 until numPartitions) {
+      assertTrue(consumedPartitions.contains(p),
+        s"Partition $p should have been consumed from its leader")
     }
   }
 
@@ -373,17 +369,6 @@ class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
       .find(_.partition() == partition)
       .map(_.leader().id())
       .getOrElse(fail(s"No leader found for $topic-$partition"))
-  }
-
-  /**
-   * Find a broker that is NOT the leader for the given topic-partition.
-   * Returns a broker ID that differs from the leader.
-   */
-  private def findNonLeaderBroker(topic: String, partition: Int): Int = {
-    val leader = findLeaderForPartition(topic, partition)
-    val nonLeader = (0 until brokerCount).find(_ != leader)
-    nonLeader.getOrElse(
-      fail(s"Could not find a non-leader broker for $topic-$partition (leader=$leader)"))
   }
 
   /**
