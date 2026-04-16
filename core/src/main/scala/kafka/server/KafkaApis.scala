@@ -21,7 +21,6 @@ import kafka.coordinator.transaction.{InitProducerIdResult, TransactionCoordinat
 import kafka.network.RequestChannel
 import kafka.server.QuotaFactory.{QuotaManagers, UNBOUNDED_QUOTA}
 import kafka.server.handlers.DescribeTopicPartitionsRequestHandler
-import kafka.server.http.FetchForwardManager
 import kafka.server.share.SharePartitionManager
 import kafka.utils.Logging
 import org.apache.kafka.clients.CommonClientConfigs
@@ -85,7 +84,7 @@ import scala.annotation.nowarn
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.{Map, Seq, Set, mutable}
 import scala.jdk.CollectionConverters._
-import kafka.server.http.ProduceForwardManager
+import org.apache.kafka.server.network.{FetchForwarder, ProduceForwarder}
 import scala.jdk.javaapi.OptionConverters
 
 /**
@@ -115,8 +114,8 @@ class KafkaApis(val requestChannel: RequestChannel,
                 val clientMetricsManager: ClientMetricsManager,
                 val groupConfigManager: GroupConfigManager,
                 val httpAsyncExecutor: ScheduledExecutorService = null,
-                val fetchForwardManager: FetchForwardManager = null,
-                val produceForwardManager: ProduceForwardManager = null
+                val fetchForwardManager: FetchForwarder = null,
+                val produceForwardManager: ProduceForwarder = null
 ) extends ApiRequestHandler with Logging {
 
   type ProduceResponseStats = Map[TopicIdPartition, RecordValidationStats]

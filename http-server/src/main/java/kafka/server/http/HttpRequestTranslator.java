@@ -32,6 +32,8 @@ import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.internals.RecordHeader;
 import org.apache.kafka.common.message.ListOffsetsRequestData;
 import org.apache.kafka.common.message.MetadataRequestData;
+import org.apache.kafka.common.message.OffsetCommitRequestData;
+import org.apache.kafka.common.message.OffsetFetchRequestData;
 import org.apache.kafka.common.message.ProduceRequestData;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.record.internal.MemoryRecords;
@@ -39,6 +41,8 @@ import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.common.record.internal.SimpleRecord;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.ListOffsetsRequest;
+import org.apache.kafka.common.requests.OffsetCommitRequest;
+import org.apache.kafka.common.requests.OffsetFetchRequest;
 import org.apache.kafka.common.requests.ProduceRequest;
 import org.apache.kafka.common.utils.Utils;
 
@@ -48,6 +52,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -144,6 +149,8 @@ public final class HttpRequestTranslator {
             case METADATA_ALL -> translateMetadataAll();
             case LIST_OFFSETS -> translateListOffsets(routeResult);
             case CONSUMER_LAG -> translateConsumerLag(routeResult);
+            case COMMIT_OFFSETS, FETCH_OFFSETS -> throw new InvalidRequestException(
+                "Offset commit/fetch requests use dedicated translation methods, not the generic translate()");
             case HEALTH -> throw new InvalidRequestException(
                 "HEALTH requests should be handled directly, not translated");
         };
@@ -587,5 +594,155 @@ public final class HttpRequestTranslator {
             headers.add(new RecordHeader(key, value));
         }
         return headers.toArray(new Header[0]);
+    }
+
+    // --- Consumer Group Offset Commit/Fetch (TASK-F.01) ---
+
+    /**
+     * Result of translating an offset commit HTTP request.
+     */
+    public record OffsetCommitTranslationResult(
+        ApiKeys apiKey,
+        OffsetCommitRequest.Builder builder
+    ) { }
+
+    /**
+     * Result of translating an offset fetch HTTP request.
+     */
+    public record OffsetFetchTranslationResult(
+        ApiKeys apiKey,
+        OffsetFetchRequest.Builder builder
+    ) { }
+
+    /**
+     * Translate JSON body into an OffsetCommitRequest builder.
+     *
+     * Uses generationId=-1 and memberId="" (simple consumer mode).
+     * The group does not need to have active members for this to work.
+     *
+     * @param group consumer group ID from URL path
+     * @param body  parsed JSON body
+     * @return OffsetCommitTranslationResult with apiKey and builder
+     * @throws InvalidRequestException if validation fails
+     */
+    public static OffsetCommitTranslationResult translateCommitOffsets(String group, JsonNode body) {
+        JsonNode offsetsNode = body.get("offsets");
+        if (offsetsNode == null || !offsetsNode.isArray() || offsetsNode.isEmpty()) {
+            throw new InvalidRequestException("'offsets' array is required and must not be empty");
+        }
+
+        // Group offsets by topic using LinkedHashMap to preserve insertion order
+        LinkedHashMap<String, List<OffsetCommitRequestData.OffsetCommitRequestPartition>> byTopic =
+            new LinkedHashMap<>();
+
+        for (JsonNode entry : offsetsNode) {
+            String topic = requireStringField(entry, "topic");
+            int partition = requireIntField(entry, "partition");
+            long offset = requireLongField(entry, "offset");
+            String metadata = optionalStringField(entry, "metadata", "");
+
+            if (partition < 0) {
+                throw new InvalidRequestException("Partition must be non-negative, got " + partition);
+            }
+            if (offset < 0) {
+                throw new InvalidRequestException("Offset must be non-negative, got " + offset);
+            }
+
+            OffsetCommitRequestData.OffsetCommitRequestPartition partitionData =
+                new OffsetCommitRequestData.OffsetCommitRequestPartition()
+                    .setPartitionIndex(partition)
+                    .setCommittedOffset(offset)
+                    .setCommittedMetadata(metadata);
+
+            byTopic.computeIfAbsent(topic, k -> new ArrayList<>()).add(partitionData);
+        }
+
+        List<OffsetCommitRequestData.OffsetCommitRequestTopic> topics = new ArrayList<>();
+        byTopic.forEach((topicName, partitions) ->
+            topics.add(new OffsetCommitRequestData.OffsetCommitRequestTopic()
+                .setName(topicName)
+                .setPartitions(partitions)));
+
+        OffsetCommitRequestData data = new OffsetCommitRequestData()
+            .setGroupId(group)
+            .setMemberId("")
+            .setGenerationIdOrMemberEpoch(-1)
+            .setTopics(topics);
+
+        return new OffsetCommitTranslationResult(
+            ApiKeys.OFFSET_COMMIT,
+            OffsetCommitRequest.Builder.forTopicNames(data));
+    }
+
+    /**
+     * Translate into an OffsetFetchRequest builder.
+     *
+     * @param group       consumer group ID from URL path
+     * @param topicFilter optional topic name filter from query string (null for all topics)
+     * @return OffsetFetchTranslationResult with apiKey and builder
+     */
+    public static OffsetFetchTranslationResult translateFetchOffsets(String group, String topicFilter) {
+        OffsetFetchRequestData.OffsetFetchRequestGroup groupData =
+            new OffsetFetchRequestData.OffsetFetchRequestGroup()
+                .setGroupId(group);
+
+        if (topicFilter != null && !topicFilter.isEmpty()) {
+            // Fetch offsets for a specific topic (all partitions)
+            OffsetFetchRequestData.OffsetFetchRequestTopics topicData =
+                new OffsetFetchRequestData.OffsetFetchRequestTopics()
+                    .setName(topicFilter)
+                    .setPartitionIndexes(Collections.emptyList());
+            groupData.setTopics(Collections.singletonList(topicData));
+        } else {
+            // Fetch offsets for all topics in the group (null = all topics)
+            groupData.setTopics(null);
+        }
+
+        OffsetFetchRequestData data = new OffsetFetchRequestData()
+            .setGroups(Collections.singletonList(groupData));
+
+        return new OffsetFetchTranslationResult(
+            ApiKeys.OFFSET_FETCH,
+            OffsetFetchRequest.Builder.forTopicNames(data, false));
+    }
+
+    // --- JSON field extraction helpers for offset requests ---
+
+    private static String requireStringField(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        if (value == null || value.isNull()) {
+            throw new InvalidRequestException("Required field '" + field + "' is missing");
+        }
+        return value.asText();
+    }
+
+    private static int requireIntField(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        if (value == null || value.isNull()) {
+            throw new InvalidRequestException("Required field '" + field + "' is missing");
+        }
+        if (!value.isNumber()) {
+            throw new InvalidRequestException("Field '" + field + "' must be an integer");
+        }
+        return value.asInt();
+    }
+
+    private static long requireLongField(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        if (value == null || value.isNull()) {
+            throw new InvalidRequestException("Required field '" + field + "' is missing");
+        }
+        if (!value.isNumber()) {
+            throw new InvalidRequestException("Field '" + field + "' must be a number");
+        }
+        return value.asLong();
+    }
+
+    private static String optionalStringField(JsonNode node, String field, String defaultValue) {
+        JsonNode value = node.get(field);
+        if (value == null || value.isNull()) {
+            return defaultValue;
+        }
+        return value.asText();
     }
 }

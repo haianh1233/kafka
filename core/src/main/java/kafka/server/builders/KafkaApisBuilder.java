@@ -231,6 +231,8 @@ public class KafkaApisBuilder {
                              apiVersionManager,
                              clientMetricsManager,
                              groupConfigManager,
-                             null);
+                             null,  // httpAsyncExecutor
+                             null,  // fetchForwardManager
+                             null); // produceForwardManager
     }
 }

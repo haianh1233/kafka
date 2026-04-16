@@ -35,6 +35,7 @@ import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.metadata.MetadataCache;
 import org.apache.kafka.server.config.AbstractKafkaConfig;
+import org.apache.kafka.server.network.FetchForwarder;
 import org.apache.kafka.server.storage.log.FetchPartitionData;
 
 import java.io.Closeable;
@@ -58,7 +59,7 @@ import org.slf4j.LoggerFactory;
  * @see FetchForwardThread
  * @see ProduceForwardManager
  */
-public class FetchForwardManager implements Closeable {
+public class FetchForwardManager implements FetchForwarder, Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(FetchForwardManager.class);
 

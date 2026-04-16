@@ -32,6 +32,8 @@ import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.message.FetchResponseData;
 import org.apache.kafka.common.message.ListOffsetsResponseData;
 import org.apache.kafka.common.message.MetadataResponseData;
+import org.apache.kafka.common.message.OffsetCommitResponseData;
+import org.apache.kafka.common.message.OffsetFetchResponseData;
 import org.apache.kafka.common.message.ProduceResponseData;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
@@ -43,6 +45,8 @@ import org.apache.kafka.common.requests.AbstractResponse;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.requests.ListOffsetsResponse;
 import org.apache.kafka.common.requests.MetadataResponse;
+import org.apache.kafka.common.requests.OffsetCommitResponse;
+import org.apache.kafka.common.requests.OffsetFetchResponse;
 import org.apache.kafka.common.requests.ProduceResponse;
 
 import java.nio.ByteBuffer;
@@ -129,6 +133,17 @@ public final class HttpResponseSerializer {
                 body = serializeListOffsetsResponse((ListOffsetsResponse) kafkaResponse);
                 collectListOffsetsErrors((ListOffsetsResponse) kafkaResponse, partitionErrors);
                 break;
+            case OFFSET_COMMIT:
+                body = serializeOffsetCommitResponse((OffsetCommitResponse) kafkaResponse);
+                collectOffsetCommitErrors((OffsetCommitResponse) kafkaResponse, partitionErrors);
+                break;
+            case OFFSET_FETCH:
+                OffsetFetchResponse ofr = (OffsetFetchResponse) kafkaResponse;
+                // Extract the first group ID from the response
+                String groupId = ofr.data().groups().isEmpty() ? "" :
+                    ofr.data().groups().get(0).groupId();
+                body = serializeOffsetFetchResponse(ofr, groupId);
+                break;
             default:
                 body = serializeGenericResponse(kafkaResponse);
                 break;
@@ -185,6 +200,16 @@ public final class HttpResponseSerializer {
         for (FetchResponseData.FetchableTopicResponse topicResponse : response.data().responses()) {
             for (FetchResponseData.PartitionData partitionData : topicResponse.partitions()) {
                 errors.add(Errors.forCode(partitionData.errorCode()));
+            }
+        }
+    }
+
+    // --- OffsetCommit response errors ---
+
+    private static void collectOffsetCommitErrors(OffsetCommitResponse response, List<Errors> errors) {
+        for (OffsetCommitResponseData.OffsetCommitResponseTopic topicResult : response.data().topics()) {
+            for (OffsetCommitResponseData.OffsetCommitResponsePartition partitionResult : topicResult.partitions()) {
+                errors.add(Errors.forCode(partitionResult.errorCode()));
             }
         }
     }
@@ -395,6 +420,95 @@ public final class HttpResponseSerializer {
             }
         }
 
+        return root;
+    }
+
+    /**
+     * Serializes an OffsetCommitResponse to JSON.
+     * Returns per-partition commit results with error codes.
+     *
+     * Output shape:
+     * {
+     *   "offsets": [
+     *     { "topic": "orders", "partition": 0, "errorCode": 0 },
+     *     { "topic": "orders", "partition": 1, "errorCode": 0 }
+     *   ]
+     * }
+     */
+    static ObjectNode serializeOffsetCommitResponse(OffsetCommitResponse response) {
+        ObjectNode root = MAPPER.createObjectNode();
+        ArrayNode offsetsArray = root.putArray("offsets");
+
+        for (OffsetCommitResponseData.OffsetCommitResponseTopic topic : response.data().topics()) {
+            for (OffsetCommitResponseData.OffsetCommitResponsePartition partition : topic.partitions()) {
+                ObjectNode node = offsetsArray.addObject();
+                node.put("topic", topic.name());
+                node.put("partition", partition.partitionIndex());
+                node.put("errorCode", partition.errorCode());
+                if (partition.errorCode() != 0) {
+                    Errors error = Errors.forCode(partition.errorCode());
+                    node.put("errorMessage", error.message());
+                }
+            }
+        }
+
+        return root;
+    }
+
+    /**
+     * Serializes an OffsetFetchResponse to JSON.
+     * Returns committed offsets for the group. Partitions with negative offsets
+     * (no committed offset) are filtered out.
+     *
+     * If a group-level error is present, returns an error object instead.
+     *
+     * Output shape (success):
+     * {
+     *   "group": "checkout-consumer",
+     *   "offsets": [
+     *     { "topic": "orders", "partition": 0, "offset": 150, "metadata": "" }
+     *   ]
+     * }
+     *
+     * Output shape (group-level error):
+     * {
+     *   "group": "checkout-consumer",
+     *   "errorCode": 30,
+     *   "errorMessage": "GROUP_AUTHORIZATION_FAILED"
+     * }
+     */
+    static ObjectNode serializeOffsetFetchResponse(OffsetFetchResponse response, String group) {
+        ObjectNode root = MAPPER.createObjectNode();
+        root.put("group", group);
+
+        for (OffsetFetchResponseData.OffsetFetchResponseGroup groupData : response.data().groups()) {
+            if (groupData.groupId().equals(group)) {
+                // Check group-level error
+                if (groupData.errorCode() != 0) {
+                    Errors error = Errors.forCode(groupData.errorCode());
+                    root.put("errorCode", groupData.errorCode());
+                    root.put("errorMessage", error.name());
+                    return root;
+                }
+
+                ArrayNode offsetsArray = root.putArray("offsets");
+                for (OffsetFetchResponseData.OffsetFetchResponseTopics topic : groupData.topics()) {
+                    for (OffsetFetchResponseData.OffsetFetchResponsePartitions partition : topic.partitions()) {
+                        if (partition.errorCode() == 0 && partition.committedOffset() >= 0) {
+                            ObjectNode node = offsetsArray.addObject();
+                            node.put("topic", topic.name());
+                            node.put("partition", partition.partitionIndex());
+                            node.put("offset", partition.committedOffset());
+                            node.put("metadata", partition.metadata());
+                        }
+                    }
+                }
+                return root;
+            }
+        }
+
+        // Group not found in response -- return empty offsets
+        root.putArray("offsets");
         return root;
     }
 

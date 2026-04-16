@@ -42,6 +42,8 @@ import java.util.regex.Pattern;
  *   GET  /v1/topics                     -> METADATA_ALL
  *   GET  /v1/topics/{t}/partitions/{p}/offsets -> LIST_OFFSETS
  *   GET  /v1/consumer-groups/{g}/lags   -> CONSUMER_LAG
+ *   POST /v1/consumer-groups/{g}/offsets -> COMMIT_OFFSETS
+ *   GET  /v1/consumer-groups/{g}/offsets -> FETCH_OFFSETS
  *   GET  /v1/health                     -> HEALTH
  */
 public final class HttpRouter {
@@ -54,6 +56,8 @@ public final class HttpRouter {
         METADATA_ALL,
         LIST_OFFSETS,
         CONSUMER_LAG,
+        COMMIT_OFFSETS,
+        FETCH_OFFSETS,
         HEALTH
     }
 
@@ -93,6 +97,10 @@ public final class HttpRouter {
     private static final Pattern CONSUMER_LAG_PATTERN =
         Pattern.compile("^/v1/consumer-groups/([^/?]+)/lags$");
 
+    // Matches: /v1/consumer-groups/{group}/offsets
+    private static final Pattern CONSUMER_GROUP_OFFSETS_PATTERN =
+        Pattern.compile("^/v1/consumer-groups/([^/?]+)/offsets$");
+
     // Matches: /v1/health
     private static final Pattern HEALTH_PATTERN =
         Pattern.compile("^/v1/health$");
@@ -129,9 +137,25 @@ public final class HttpRouter {
         }
 
         Map<String, String> queryParams = parseQueryParams(queryString);
-        Matcher matcher;
 
-        // Match path against patterns in order (most specific first)
+        // Try topic routes first, then consumer-group routes, then utility routes
+        RouteResult result = matchTopicRoutes(method, path, queryParams);
+        if (result != null) return result;
+
+        result = matchConsumerGroupRoutes(method, path, queryParams);
+        if (result != null) return result;
+
+        result = matchUtilityRoutes(method, path, queryParams);
+        if (result != null) return result;
+
+        throw new InvalidRequestException("No route found for " + method + " " + path);
+    }
+
+    /**
+     * Matches topic-related routes: FETCH, PRODUCE, LIST_OFFSETS, METADATA_TOPIC, METADATA_ALL.
+     */
+    private RouteResult matchTopicRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
+        Matcher matcher;
 
         // FETCH must be checked before PRODUCE because /records:fetch is more specific than /records
         matcher = FETCH_PATTERN.matcher(path);
@@ -169,6 +193,15 @@ public final class HttpRouter {
             return new RouteResult(HandlerType.METADATA_ALL, null, null, null, queryParams);
         }
 
+        return null;
+    }
+
+    /**
+     * Matches consumer-group routes: CONSUMER_LAG, COMMIT_OFFSETS, FETCH_OFFSETS.
+     */
+    private RouteResult matchConsumerGroupRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
+        Matcher matcher;
+
         matcher = CONSUMER_LAG_PATTERN.matcher(path);
         if (matcher.matches()) {
             requireMethod(method, HttpMethod.GET, path);
@@ -176,13 +209,32 @@ public final class HttpRouter {
             return new RouteResult(HandlerType.CONSUMER_LAG, null, null, consumerGroup, queryParams);
         }
 
-        matcher = HEALTH_PATTERN.matcher(path);
+        matcher = CONSUMER_GROUP_OFFSETS_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            String consumerGroup = validateGroupId(matcher.group(1));
+            if (method.equals(HttpMethod.POST)) {
+                return new RouteResult(HandlerType.COMMIT_OFFSETS, null, null, consumerGroup, queryParams);
+            } else if (method.equals(HttpMethod.GET)) {
+                return new RouteResult(HandlerType.FETCH_OFFSETS, null, null, consumerGroup, queryParams);
+            } else {
+                throw new InvalidRequestException(
+                    "Method " + method + " not allowed for " + path + "; expected POST or GET");
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Matches utility routes: HEALTH.
+     */
+    private RouteResult matchUtilityRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
+        Matcher matcher = HEALTH_PATTERN.matcher(path);
         if (matcher.matches()) {
             requireMethod(method, HttpMethod.GET, path);
             return new RouteResult(HandlerType.HEALTH, null, null, null, queryParams);
         }
-
-        throw new InvalidRequestException("No route found for " + method + " " + path);
+        return null;
     }
 
     /**
@@ -220,6 +272,26 @@ public final class HttpRouter {
         // 3. Kafka validation (checks valid chars, length, ".", "..")
         Topic.validate(decoded);
 
+        return decoded;
+    }
+
+    /**
+     * URL-decodes and validates a consumer group ID from the URI path.
+     * Group IDs must be non-empty and at most 255 characters after decoding.
+     *
+     * @param rawSegment URL-encoded group ID from the URI path
+     * @return validated, decoded group ID
+     * @throws InvalidRequestException if the group ID is empty or too long
+     */
+    static String validateGroupId(String rawSegment) {
+        String decoded = URLDecoder.decode(rawSegment, StandardCharsets.UTF_8);
+        if (decoded.isEmpty()) {
+            throw new InvalidRequestException("Consumer group ID must not be empty");
+        }
+        if (decoded.length() > 255) {
+            throw new InvalidRequestException(
+                "Consumer group ID must not exceed 255 characters, got " + decoded.length());
+        }
         return decoded;
     }
 
