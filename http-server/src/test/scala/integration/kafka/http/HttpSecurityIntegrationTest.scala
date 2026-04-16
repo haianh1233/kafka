@@ -123,6 +123,8 @@ class HttpSecurityIntegrationTest extends HttpIntegrationTestHarness {
         BrokerPrincipal.toString)
       config.setProperty(StandardAuthorizer.ALLOW_EVERYONE_IF_NO_ACL_IS_FOUND_CONFIG,
         "false")
+      config.setProperty(BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG,
+        classOf[HttpTestPrincipalBuilder].getName)
     }
     configs
   }
