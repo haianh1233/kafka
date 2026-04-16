@@ -167,9 +167,18 @@ class KafkaApis(val requestChannel: RequestChannel,
         throw new IllegalStateException(s"API ${request.header.apiKey} with version ${request.header.apiVersion} is not enabled")
       }
 
+      // Time: Update - TASK-B.06 — HTTP dispatch for PRODUCE and FETCH
       request.header.apiKey match {
-        case ApiKeys.PRODUCE => handleProduceRequest(request, requestLocal)
-        case ApiKeys.FETCH => handleFetchRequest(request)
+        case ApiKeys.PRODUCE =>
+          if (request.context.securityProtocol.isHttp)
+            handleHttpProduceRequest(request, requestLocal)
+          else
+            handleProduceRequest(request, requestLocal)
+        case ApiKeys.FETCH =>
+          if (request.context.securityProtocol.isHttp)
+            handleHttpConsumeRequest(request)
+          else
+            handleFetchRequest(request)
         case ApiKeys.LIST_OFFSETS => handleListOffsetRequest(request)
         case ApiKeys.METADATA => handleTopicMetadataRequest(request)
         case ApiKeys.OFFSET_COMMIT => handleOffsetCommitRequest(request, requestLocal).exceptionally(handleError)
@@ -266,6 +275,38 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   override def tryCompleteActions(): Unit = {
     replicaManager.tryCompleteActions()
+  }
+
+  /**
+   * Handles HTTP produce requests. Phase 1: delegates to existing handleProduceRequest.
+   * Phase 2 will add fan-out and forwarding via ProduceForwardManager.
+   *
+   * LIMITATION: Phase 1 only works correctly for single-partition requests
+   * where the receiving broker is the partition leader. Multi-partition and
+   * cross-broker requests will fail with LEADER_NOT_AVAILABLE for non-local
+   * partitions. This is expected -- Phase 2 adds proper forwarding.
+   *
+   * // Time: Update - TASK-B.06
+   */
+  private def handleHttpProduceRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
+    // Phase 1: delegate to existing handler (local path only)
+    handleProduceRequest(request, requestLocal)
+  }
+
+  /**
+   * Handles HTTP consume (fetch) requests. Phase 1: delegates to existing handleFetchRequest.
+   * Phase 2 will add fan-out and forwarding via FetchForwardManager.
+   *
+   * LIMITATION: Phase 1 only works correctly for single-partition requests
+   * where the receiving broker is the partition leader. Multi-partition and
+   * cross-broker requests will fail with LEADER_NOT_AVAILABLE for non-local
+   * partitions. This is expected -- Phase 2 adds proper forwarding.
+   *
+   * // Time: Update - TASK-B.06
+   */
+  private def handleHttpConsumeRequest(request: RequestChannel.Request): Unit = {
+    // Phase 1: delegate to existing handler (local path only)
+    handleFetchRequest(request)
   }
 
   /**

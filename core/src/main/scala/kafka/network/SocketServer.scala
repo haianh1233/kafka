@@ -101,6 +101,10 @@ class SocketServer(
   private[network] val dataPlaneAcceptors = new ConcurrentHashMap[Endpoint, DataPlaneAcceptor]()
   val dataPlaneRequestChannel = new RequestChannel(maxQueuedRequests, time, apiVersionManager.newRequestMetrics)
 
+  // HTTP acceptors (separate from binary DataPlaneAcceptors — different types)
+  // Time: Update - TASK-B.06
+  private[network] val httpAcceptors = new ConcurrentHashMap[Endpoint, HttpAcceptor]()
+
   private[this] val nextProcessorId: AtomicInteger = new AtomicInteger(0)
   val connectionQuotas = new ConnectionQuotas(config, time, metrics)
 
@@ -205,26 +209,66 @@ class SocketServer(
     FutureUtils.chainFuture(CompletableFuture.allOf(authorizerFutures.values.toArray: _*),
         allAuthorizerFuturesComplete)
 
+    // Time: Update - TASK-B.06 — Start HTTP acceptors after authorizer is ready
+    httpAcceptors.asScala.values.foreach { acc =>
+      allAuthorizerFuturesComplete.whenComplete((_, e) => {
+        if (e != null) {
+          acc.startedFuture.completeExceptionally(e)
+        } else {
+          try {
+            acc.startup()
+          } catch {
+            case ex: Exception =>
+              error(s"Failed to start HTTP acceptor for ${acc.endPoint.listener}", ex)
+              acc.startedFuture.completeExceptionally(ex)
+          }
+        }
+      })
+    }
+
     // Construct a future that will be completed when all Acceptors have been successfully started.
     // Alternately, if any of them fail to start, this future will be completed exceptionally.
     val enableFuture = new CompletableFuture[Void]
-    FutureUtils.chainFuture(CompletableFuture.allOf(dataPlaneAcceptors.values().asScala.toArray.map(_.startedFuture): _*), enableFuture)
+    val allStartedFutures = dataPlaneAcceptors.values().asScala.toArray.map(_.startedFuture) ++
+      httpAcceptors.values().asScala.toArray.map(_.startedFuture)  // Time: Update - TASK-B.06
+    FutureUtils.chainFuture(CompletableFuture.allOf(allStartedFutures: _*), enableFuture)
     enableFuture
   }
 
+  // Time: Update - TASK-B.06
   private def createDataPlaneAcceptorAndProcessors(endpoint: Endpoint): Unit = synchronized {
     if (stopped) {
       throw new RuntimeException("Can't create new data plane acceptor and processors: SocketServer is stopped.")
     }
-    val listenerName =  ListenerName.normalised(endpoint.listener)
-    val parsedConfigs = config.valuesFromThisConfigWithPrefixOverride(listenerName.configPrefix)
-    connectionQuotas.addListener(config, listenerName)
-    val isPrivilegedListener = config.interBrokerListenerName == listenerName
-    val dataPlaneAcceptor = createDataPlaneAcceptor(endpoint, isPrivilegedListener, dataPlaneRequestChannel)
-    config.addReconfigurable(dataPlaneAcceptor)
-    dataPlaneAcceptor.configure(parsedConfigs)
-    dataPlaneAcceptors.put(endpoint, dataPlaneAcceptor)
-    info(s"Created data-plane acceptor and processors for endpoint : ${listenerName}")
+    val listenerName = ListenerName.normalised(endpoint.listener)
+
+    // Validate inter-broker listener is not HTTP/HTTPS
+    if (config.interBrokerListenerName == listenerName) {
+      require(!endpoint.securityProtocol().isHttp,
+        s"inter.broker.listener.name ($listenerName) must not be an HTTP/HTTPS listener")
+    }
+
+    endpoint.securityProtocol() match {
+      case SecurityProtocol.HTTP | SecurityProtocol.HTTPS =>
+        // HTTP/HTTPS endpoint — create HttpAcceptor (Netty-based)
+        val httpProcessorId = nextProcessorId()
+        val httpProcessor = new HttpProcessor(httpProcessorId)
+        val httpAcceptor = new HttpAcceptor(
+          this, endpoint, config, dataPlaneRequestChannel, httpProcessor, time)
+        httpAcceptors.put(endpoint, httpAcceptor)
+        info(s"Created HTTP acceptor for endpoint: $listenerName")
+
+      case _ =>
+        // Binary protocol: existing DataPlaneAcceptor path (UNCHANGED)
+        val parsedConfigs = config.valuesFromThisConfigWithPrefixOverride(listenerName.configPrefix)
+        connectionQuotas.addListener(config, listenerName)
+        val isPrivilegedListener = config.interBrokerListenerName == listenerName
+        val dataPlaneAcceptor = createDataPlaneAcceptor(endpoint, isPrivilegedListener, dataPlaneRequestChannel)
+        config.addReconfigurable(dataPlaneAcceptor)
+        dataPlaneAcceptor.configure(parsedConfigs)
+        dataPlaneAcceptors.put(endpoint, dataPlaneAcceptor)
+        info(s"Created data-plane acceptor and processors for endpoint : ${listenerName}")
+    }
   }
 
   private def endpoints = config.listeners.map(l => ListenerName.normalised(l.listener) -> l).toMap
@@ -236,12 +280,28 @@ class SocketServer(
   /**
    * Stop processing requests and new connections.
    */
+  // Time: Update - TASK-B.06
   def stopProcessingRequests(): Unit = synchronized {
     if (!stopped) {
       stopped = true
       info("Stopping socket server request processors")
+
+      // 1. Existing: shut down binary acceptors (UNCHANGED)
       dataPlaneAcceptors.asScala.values.foreach(_.beginShutdown())
       dataPlaneAcceptors.asScala.values.foreach(_.close())
+
+      // 2. NEW: drain HTTP in-flight requests (bounded window)
+      httpAcceptors.asScala.values.foreach(_.beginDrain())
+      val httpDrainMs = 2000L // default drain timeout
+      val drainDeadline = time.milliseconds() + httpDrainMs
+      httpAcceptors.asScala.values.foreach { acc =>
+        val remaining = drainDeadline - time.milliseconds()
+        if (remaining > 0) acc.awaitDrain(remaining)
+      }
+      httpAcceptors.asScala.values.foreach(_.close())
+      info("Stopped HTTP acceptors")
+
+      // 3. Existing: clear request queue (UNCHANGED)
       dataPlaneRequestChannel.clear()
       info("Stopped socket server request processors")
     }
@@ -280,6 +340,7 @@ class SocketServer(
   /**
    * This method is called to dynamically add listeners.
    */
+  // Time: Update - TASK-B.06
   def addListeners(listenersAdded: Seq[Endpoint]): Unit = synchronized {
     if (stopped) {
       throw new RuntimeException("can't add new listeners: SocketServer is stopped.")
@@ -287,27 +348,50 @@ class SocketServer(
     info(s"Adding data-plane listeners for endpoints $listenersAdded")
     listenersAdded.foreach { endpoint =>
       createDataPlaneAcceptorAndProcessors(endpoint)
-      val acceptor = dataPlaneAcceptors.get(endpoint)
-      // There is no authorizer future for this new listener endpoint. So start the
-      // listener once all authorizer futures are complete.
-      allAuthorizerFuturesComplete.whenComplete((_, e) => {
-        if (e != null) {
-          acceptor.startedFuture.completeExceptionally(e)
-        } else {
-          acceptor.start()
-        }
-      })
+      if (endpoint.securityProtocol().isHttp) {
+        // HTTP/HTTPS: start HttpAcceptor once authorizer is ready
+        val httpAcceptor = httpAcceptors.get(endpoint)
+        allAuthorizerFuturesComplete.whenComplete((_, e) => {
+          if (e != null) {
+            httpAcceptor.startedFuture.completeExceptionally(e)
+          } else {
+            try {
+              httpAcceptor.startup()
+            } catch {
+              case ex: Exception =>
+                error(s"Failed to start HTTP acceptor for ${endpoint.listener}", ex)
+                httpAcceptor.startedFuture.completeExceptionally(ex)
+            }
+          }
+        })
+      } else {
+        val acceptor = dataPlaneAcceptors.get(endpoint)
+        // There is no authorizer future for this new listener endpoint. So start the
+        // listener once all authorizer futures are complete.
+        allAuthorizerFuturesComplete.whenComplete((_, e) => {
+          if (e != null) {
+            acceptor.startedFuture.completeExceptionally(e)
+          } else {
+            acceptor.start()
+          }
+        })
+      }
     }
   }
 
+  // Time: Update - TASK-B.06
   def removeListeners(listenersRemoved: Seq[Endpoint]): Unit = synchronized {
     info(s"Removing data-plane listeners for endpoints $listenersRemoved")
     listenersRemoved.foreach { endpoint =>
-      connectionQuotas.removeListener(config, ListenerName.normalised(endpoint.listener))
-      dataPlaneAcceptors.asScala.remove(endpoint).foreach { acceptor =>
-        acceptor.beginShutdown()
-        acceptor.close()
-        config.removeReconfigurable(acceptor)
+      if (endpoint.securityProtocol().isHttp) {
+        httpAcceptors.asScala.remove(endpoint).foreach(_.close())
+      } else {
+        connectionQuotas.removeListener(config, ListenerName.normalised(endpoint.listener))
+        dataPlaneAcceptors.asScala.remove(endpoint).foreach { acceptor =>
+          acceptor.beginShutdown()
+          acceptor.close()
+          config.removeReconfigurable(acceptor)
+        }
       }
     }
   }
