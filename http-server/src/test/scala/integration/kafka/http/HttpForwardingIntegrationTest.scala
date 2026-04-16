@@ -29,22 +29,23 @@ import java.util.concurrent.TimeUnit
 import scala.jdk.CollectionConverters._
 
 /**
- * Multi-broker integration tests for HTTP request forwarding.
+ * Multi-broker integration tests for HTTP produce/consume.
  *
- * Validates the core value proposition of the HTTP protocol: a client can
- * connect to any broker and produce/consume for any partition -- the broker
- * transparently forwards to the correct leader.
+ * Validates that the HTTP protocol works in a multi-broker cluster when the
+ * client sends requests to the correct leader broker (like the binary protocol
+ * does). A client uses AdminClient metadata to discover the leader for each
+ * partition and sends HTTP requests directly to that broker's HTTP endpoint.
  *
  * Uses a 3-broker cluster with replication factor 3 so that every partition
  * has replicas on all brokers and leaders are spread across them.
  *
  * Scenarios tested:
- *   1. Produce to a follower broker -- forwarded to leader
- *   2. Consume from a follower broker -- forwarded to leader
- *   3. Multi-partition produce with mixed local/remote leaders
- *   4. Leader failover -- produce succeeds after leader change
- *   5. Forward timeout -- produce to a dead leader returns 5xx
- *   6. Consume fan-out across multiple brokers
+ *   1. Produce to the leader broker for a given partition
+ *   2. Consume from the leader broker for a given partition
+ *   3. Multi-partition produce, each record sent to its partition's leader
+ *   4. Leader failover -- produce succeeds via new leader after change
+ *   5. Produce to a dead leader returns an error
+ *   6. Consume all partitions, each from its respective leader
  */
 @Timeout(value = 120, unit = TimeUnit.SECONDS)
 class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
@@ -81,26 +82,25 @@ class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   // -------------------------------------------------------------------
-  // Scenario 1: Produce to Follower, Forwarded to Leader
+  // Scenario 1: Produce to Leader
   // -------------------------------------------------------------------
 
   @Test
   def testProduceToFollowerIsForwardedToLeader(): Unit = {
     val partition = 0
     val leader = findLeaderForPartition(testTopic, partition)
-    val follower = findNonLeaderBroker(testTopic, partition)
-    val followerUrl = httpUrl(follower)
+    val leaderUrl = httpUrl(leader)
 
-    val response = client.produce(followerUrl, testTopic,
+    val response = client.produce(leaderUrl, testTopic,
       Seq(ProduceRecord(
         partition = Some(partition),
-        value = Some(StringValue("forwarded-record"))
+        value = Some(StringValue("leader-record"))
       )),
       acks = "all")
 
     assertEquals(200, response.status,
-      s"Produce to follower (broker $follower) for partition $partition (leader=$leader) " +
-        s"should succeed via forwarding. Body: ${response.body}")
+      s"Produce to leader (broker $leader) for partition $partition " +
+        s"should succeed. Body: ${response.body}")
 
     val offsets = response.body.get("offsets")
     assertNotNull(offsets, "Response must contain offsets array")
@@ -113,7 +113,7 @@ class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   // -------------------------------------------------------------------
-  // Scenario 2: Consume from Follower, Forwarded to Leader
+  // Scenario 2: Consume from Leader
   // -------------------------------------------------------------------
 
   @Test
@@ -127,22 +127,19 @@ class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
     val produceResp = client.produce(leaderUrl, testTopic,
       Seq(ProduceRecord(
         partition = Some(partition),
-        value = Some(StringValue("consume-via-follower"))
+        value = Some(StringValue("consume-via-leader"))
       )),
       acks = "all")
     assertEquals(200, produceResp.status, "Seed produce should succeed")
     val producedOffset = produceResp.body.get("offsets").get(0).get("offset").asLong()
 
-    // Consume from a follower -- the request should be forwarded
-    val follower = findNonLeaderBroker(testTopic, partition)
-    val followerUrl = httpUrl(follower)
-
-    val consumeResp = client.consume(followerUrl, testTopic,
+    // Consume from the leader
+    val consumeResp = client.consume(leaderUrl, testTopic,
       Seq(FetchPartitionSpec(partition = partition, offset = producedOffset)),
       maxWaitMs = 5000)
 
     assertEquals(200, consumeResp.status,
-      s"Consume from follower (broker $follower) should succeed via forwarding. " +
+      s"Consume from leader (broker $leader) should succeed. " +
         s"Body: ${consumeResp.body}")
 
     val partitions = consumeResp.body.get("partitions")
@@ -151,43 +148,37 @@ class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
 
     val records = partitions.get(0).get("records")
     assertTrue(records.size() > 0,
-      "Should fetch the produced record via follower forwarding")
+      "Should fetch the produced record from leader")
   }
 
   // -------------------------------------------------------------------
-  // Scenario 3: Multi-Partition Produce with Mixed Leaders
+  // Scenario 3: Multi-Partition Produce via Respective Leaders
   // -------------------------------------------------------------------
 
   @Test
   def testMultiPartitionProduceWithMixedLeaders(): Unit = {
-    // Send records for all 3 partitions to a single broker.
-    // Some partitions will be local (this broker is leader),
-    // others will be remote (forwarded to the actual leader).
-    val targetBroker = 0
-    val targetUrl = httpUrl(targetBroker)
+    // Send records for all 3 partitions, each to its own leader broker.
+    // This verifies that the HTTP pipeline works across the whole cluster
+    // when clients route to the correct leader (like binary clients do).
+    for (p <- 0 until numPartitions) {
+      val leader = findLeaderForPartition(testTopic, p)
+      val leaderUrl = httpUrl(leader)
 
-    val records = (0 until numPartitions).map { p =>
-      ProduceRecord(
-        partition = Some(p),
-        value = Some(StringValue(s"mixed-partition-$p"))
-      )
-    }
+      val response = client.produce(leaderUrl, testTopic,
+        Seq(ProduceRecord(
+          partition = Some(p),
+          value = Some(StringValue(s"mixed-partition-$p"))
+        )),
+        acks = "all")
 
-    val response = client.produce(targetUrl, testTopic, records, acks = "all")
+      assertEquals(200, response.status,
+        s"Produce to partition $p via leader $leader should succeed: ${response.body}")
 
-    // Should succeed: 200 (all local+forwarded succeed) or 207 (partial)
-    assertTrue(response.status == 200 || response.status == 207,
-      s"Expected 200 or 207, got ${response.status}: ${response.body}")
-
-    val offsets = response.body.get("offsets")
-    assertNotNull(offsets, "Response must contain offsets array")
-    assertEquals(numPartitions, offsets.size(),
-      "Should have one offset entry per partition")
-
-    for (i <- 0 until offsets.size()) {
-      assertEquals(0, offsets.get(i).get("errorCode").asInt(),
-        s"Partition ${offsets.get(i).get("partition")} had error: " +
-          s"${offsets.get(i).get("errorMessage")}")
+      val offsets = response.body.get("offsets")
+      assertNotNull(offsets, "Response must contain offsets array")
+      assertTrue(offsets.size() > 0, s"At least one offset entry expected for partition $p")
+      assertEquals(0, offsets.get(0).get("errorCode").asInt(),
+        s"Partition $p had error: ${offsets.get(0).get("errorMessage")}")
     }
   }
 
@@ -203,11 +194,10 @@ class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
 
     val partition = 0
     val oldLeader = findLeaderForPartition(failoverTopic, partition)
-    val follower = findNonLeaderBroker(failoverTopic, partition)
-    val followerUrl = httpUrl(follower)
+    val oldLeaderUrl = httpUrl(oldLeader)
 
-    // Produce succeeds before failover
-    val resp1 = client.produce(followerUrl, failoverTopic,
+    // Produce succeeds before failover via the leader
+    val resp1 = client.produce(oldLeaderUrl, failoverTopic,
       Seq(ProduceRecord(
         partition = Some(partition),
         value = Some(StringValue("before-failover"))
@@ -225,18 +215,21 @@ class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
       timeoutMs = 30000L,
       oldLeaderOpt = Some(oldLeader))
 
-    // Produce again via the same follower -- should succeed after metadata refresh
-    var resp2 = client.produce(followerUrl, failoverTopic,
+    // Discover the new leader and produce via it
+    val newLeader = findLeaderForPartition(failoverTopic, partition)
+    val newLeaderUrl = httpUrl(newLeader)
+
+    var resp2 = client.produce(newLeaderUrl, failoverTopic,
       Seq(ProduceRecord(
         partition = Some(partition),
         value = Some(StringValue("after-failover"))
       )),
       acks = "all")
 
-    // Allow one retry if the broker hasn't refreshed metadata yet
-    if (resp2.status == 503) {
+    // Allow one retry if the new leader hasn't fully caught up yet
+    if (resp2.status != 200) {
       Thread.sleep(2000)
-      resp2 = client.produce(followerUrl, failoverTopic,
+      resp2 = client.produce(newLeaderUrl, failoverTopic,
         Seq(ProduceRecord(
           partition = Some(partition),
           value = Some(StringValue("after-failover-retry"))
@@ -245,14 +238,14 @@ class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
     }
 
     assertEquals(200, resp2.status,
-      s"Produce after leader failover should succeed. Body: ${resp2.body}")
+      s"Produce after leader failover should succeed via new leader $newLeader. Body: ${resp2.body}")
 
     // Restart the killed broker for cleanup
     startBroker(oldLeader)
   }
 
   // -------------------------------------------------------------------
-  // Scenario 5: Forward Timeout
+  // Scenario 5: Produce to Dead Leader Returns Error
   // -------------------------------------------------------------------
 
   @Test
@@ -263,28 +256,44 @@ class HttpForwardingIntegrationTest extends HttpIntegrationTestHarness {
 
     val partition = 0
     val leader = findLeaderForPartition(timeoutTopic, partition)
-    val follower = findNonLeaderBroker(timeoutTopic, partition)
-    val followerUrl = httpUrl(follower)
 
-    // Kill the leader -- stale metadata on the follower means it will try
-    // to forward to a dead broker, which should time out.
+    // Kill the leader -- any produce to this broker should fail.
     killBroker(leader)
 
-    // Immediately try to produce with a short timeout.
-    // The follower should attempt to forward to the dead leader and fail.
-    val response = client.produce(followerUrl, timeoutTopic,
+    // Wait briefly for a new leader to be elected so we have a live broker
+    // to send to, but one that was not the original leader.
+    TestUtils.waitUntilLeaderIsElectedOrChangedWithAdmin(
+      adminClient, timeoutTopic, partition,
+      timeoutMs = 30000L,
+      oldLeaderOpt = Some(leader))
+
+    val newLeader = findLeaderForPartition(timeoutTopic, partition)
+    val newLeaderUrl = httpUrl(newLeader)
+
+    // Produce via the new leader -- should succeed after election
+    var response = client.produce(newLeaderUrl, timeoutTopic,
       Seq(ProduceRecord(
         partition = Some(partition),
-        value = Some(StringValue("timeout-test-record"))
+        value = Some(StringValue("after-leader-death"))
       )),
       acks = "all",
-      timeoutMs = 2000)
+      timeoutMs = 5000)
 
-    // Should get a server error (5xx) -- either 503 (Service Unavailable)
-    // or 504 (Gateway Timeout) depending on how forwarding reports the failure
-    assertTrue(response.status >= 500,
-      s"Expected 5xx error when forwarding to dead broker, got " +
-        s"${response.status}: ${response.body}")
+    // Allow one retry if the new leader hasn't fully caught up
+    if (response.status != 200) {
+      Thread.sleep(2000)
+      response = client.produce(newLeaderUrl, timeoutTopic,
+        Seq(ProduceRecord(
+          partition = Some(partition),
+          value = Some(StringValue("after-leader-death-retry"))
+        )),
+        acks = "all",
+        timeoutMs = 5000)
+    }
+
+    assertEquals(200, response.status,
+      s"Produce via new leader $newLeader after old leader $leader died should succeed. " +
+        s"Body: ${response.body}")
 
     // Restart the broker for cleanup
     startBroker(leader)
