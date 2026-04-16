@@ -1,0 +1,317 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package kafka.server.http;
+
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpHeaderValues;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpVersion;
+import kafka.network.RequestChannel;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Response routing bridge between {@link RequestChannel} and Netty.
+ *
+ * Mirrors the binary protocol's {@code Processor} response handling pattern
+ * (SocketServer.scala lines 935-973) but routes to Netty channels instead of
+ * NIO channels.
+ *
+ * <h3>Threading model:</h3>
+ * <ul>
+ *   <li>{@link #enqueueResponse} is called from KafkaRequestHandler threads (via RequestChannel)</li>
+ *   <li>{@link #processResponses} is called from a dedicated response-drainer thread</li>
+ *   <li>{@link #registerChannel} is called from Netty worker threads</li>
+ * </ul>
+ *
+ * All three paths are thread-safe via ConcurrentHashMap and LinkedBlockingDeque.
+ *
+ * <h3>Response type handling:</h3>
+ * <ul>
+ *   <li>{@code SendResponse} -> serialize response data, write to Netty channel</li>
+ *   <li>{@code CloseConnectionResponse} -> close the Netty channel</li>
+ *   <li>{@code StartThrottlingResponse} -> HTTP 429 + Retry-After header</li>
+ *   <li>{@code EndThrottlingResponse} -> no-op (HTTP has no mute/unmute)</li>
+ * </ul>
+ *
+ * // Time: Created - TASK-B.04
+ */
+public class HttpProcessor {
+
+    private static final Logger log = LoggerFactory.getLogger(HttpProcessor.class);
+
+    // --- Processor ID (registered with RequestChannel) ---
+    private final int id;
+
+    // --- Response queue (unbounded, non-blocking add) ---
+    private final LinkedBlockingDeque<RequestChannel.Response> responseQueue =
+        new LinkedBlockingDeque<>();
+
+    // --- Active Netty channels: connectionId -> ChannelHandlerContext ---
+    private final ConcurrentHashMap<String, ChannelHandlerContext> channels =
+        new ConcurrentHashMap<>();
+
+    // --- Drainer thread state ---
+    private final AtomicBoolean running = new AtomicBoolean(false);
+    private volatile Thread drainerThread;
+
+    // --- Polling interval for the drainer thread when queue is empty ---
+    static final long POLL_INTERVAL_MS = 10;
+
+    // --- Throttle response JSON template ---
+    private static final String THROTTLE_BODY_TEMPLATE =
+        "{\"errorCode\":%d,\"errorMessage\":\"%s\",\"throttleTimeMs\":%d}";
+
+    // --- HTTP 429 status ---
+    private static final HttpResponseStatus TOO_MANY_REQUESTS =
+        HttpResponseStatus.valueOf(429, "Too Many Requests");
+
+    // --- Throttle error code (THROTTLING_QUOTA_EXCEEDED = 89) ---
+    private static final int THROTTLE_ERROR_CODE = 89;
+    private static final String THROTTLE_ERROR_MESSAGE = "THROTTLING_QUOTA_EXCEEDED";
+
+    /**
+     * Creates a new HttpProcessor.
+     *
+     * @param id unique processor ID for RequestChannel registration
+     */
+    public HttpProcessor(int id) {
+        this.id = id;
+    }
+
+    /**
+     * Returns the processor ID used by RequestChannel for response routing.
+     */
+    public int id() {
+        return id;
+    }
+
+    /**
+     * Registers a Netty channel for a connection. Called by HttpRequestHandler
+     * when a new HTTP request is received. A close listener automatically removes
+     * the entry when the channel closes (client disconnect).
+     *
+     * @param connectionId Netty channel long text ID (ctx.channel().id().asLongText())
+     * @param ctx          the Netty ChannelHandlerContext for writing responses
+     */
+    public void registerChannel(String connectionId, ChannelHandlerContext ctx) {
+        Objects.requireNonNull(connectionId, "connectionId");
+        Objects.requireNonNull(ctx, "ctx");
+
+        channels.put(connectionId, ctx);
+
+        // Add close listener to auto-remove the channel entry on disconnect
+        ctx.channel().closeFuture().addListener((ChannelFutureListener) future ->
+            channels.remove(connectionId));
+    }
+
+    /**
+     * Enqueues a response for delivery to the Netty channel.
+     * Non-blocking — called from KafkaRequestHandler threads via RequestChannel.sendResponse().
+     *
+     * @param response the response to deliver
+     */
+    public void enqueueResponse(RequestChannel.Response response) {
+        Objects.requireNonNull(response, "response");
+        responseQueue.add(response);  // non-blocking on unbounded deque
+    }
+
+    /**
+     * Drains and processes all queued responses. For each response:
+     * - Looks up the Netty channel by connectionId
+     * - Dispatches based on response type (SendResponse, CloseConnection, etc.)
+     * - Handles exceptions per-response to prevent one failure from blocking others
+     *
+     * Called by the response-drainer thread.
+     */
+    public void processResponses() {
+        List<RequestChannel.Response> batch = new ArrayList<>();
+        responseQueue.drainTo(batch);
+
+        for (RequestChannel.Response response : batch) {
+            String connectionId = response.request().context().connectionId();
+            try {
+                if (response instanceof RequestChannel.SendResponse) {
+                    RequestChannel.SendResponse sendResp = (RequestChannel.SendResponse) response;
+                    ChannelHandlerContext ctx = channels.get(connectionId);
+                    if (ctx != null && ctx.channel().isActive()) {
+                        // Build HTTP response from the Send object
+                        // The responseSend contains the serialized Kafka protocol bytes.
+                        // For now, write the raw response log as JSON if available,
+                        // or indicate the response was sent. HttpResponseSerializer (future task)
+                        // will handle full JSON serialization.
+                        byte[] body = serializeSendResponse(sendResp);
+                        FullHttpResponse httpResponse = new DefaultFullHttpResponse(
+                            HttpVersion.HTTP_1_1,
+                            HttpResponseStatus.OK,
+                            Unpooled.wrappedBuffer(body));
+                        httpResponse.headers().set(HttpHeaderNames.CONTENT_TYPE, HttpHeaderValues.APPLICATION_JSON);
+                        httpResponse.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length);
+                        ctx.writeAndFlush(httpResponse);
+                    } else {
+                        log.debug("Channel closed before response could be sent: {}", connectionId);
+                    }
+                    channels.remove(connectionId);
+
+                } else if (response instanceof RequestChannel.CloseConnectionResponse) {
+                    ChannelHandlerContext ctx = channels.remove(connectionId);
+                    if (ctx != null) {
+                        ctx.close();
+                    }
+
+                } else if (response instanceof RequestChannel.StartThrottlingResponse) {
+                    // HTTP: convert to immediate 429 response
+                    ChannelHandlerContext ctx = channels.get(connectionId);
+                    if (ctx != null && ctx.channel().isActive()) {
+                        long throttleTimeMs = response.request().apiThrottleTimeMs();
+                        sendThrottleResponse(ctx, throttleTimeMs);
+                    }
+                    channels.remove(connectionId);
+
+                } else if (response instanceof RequestChannel.EndThrottlingResponse) {
+                    // No-op for HTTP — no mute/unmute mechanism
+                }
+            } catch (Exception e) {
+                log.error("Error processing response for connection {}", connectionId, e);
+                // Continue processing remaining responses
+            }
+        }
+    }
+
+    /**
+     * Serializes a SendResponse into a JSON byte array for the HTTP response body.
+     * This is a preliminary implementation — the full HttpResponseSerializer (future task)
+     * will handle proper Kafka response-to-JSON conversion.
+     *
+     * @param sendResp the SendResponse to serialize
+     * @return JSON bytes for the HTTP response body
+     */
+    private byte[] serializeSendResponse(RequestChannel.SendResponse sendResp) {
+        // Use the response log JSON if available (it's a Jackson JsonNode)
+        scala.Option<com.fasterxml.jackson.databind.JsonNode> logOpt = sendResp.responseLog();
+        if (logOpt.isDefined()) {
+            return logOpt.get().toString().getBytes(StandardCharsets.UTF_8);
+        }
+        // Fallback: minimal JSON indicating the response was sent
+        String apiKey = sendResp.request().header().apiKey().name();
+        return String.format("{\"apiKey\":\"%s\",\"status\":\"ok\"}", apiKey)
+            .getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Sends an HTTP 429 Too Many Requests response for throttled requests.
+     *
+     * @param ctx            Netty channel context
+     * @param throttleTimeMs throttle duration in milliseconds
+     */
+    private void sendThrottleResponse(ChannelHandlerContext ctx, long throttleTimeMs) {
+        String body = String.format(THROTTLE_BODY_TEMPLATE,
+            THROTTLE_ERROR_CODE, THROTTLE_ERROR_MESSAGE, throttleTimeMs);
+        byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
+
+        FullHttpResponse httpResponse = new DefaultFullHttpResponse(
+            HttpVersion.HTTP_1_1,
+            TOO_MANY_REQUESTS,
+            Unpooled.wrappedBuffer(bodyBytes));
+
+        // Retry-After header: ceiling of throttleTimeMs in seconds, minimum 1
+        int retryAfterSeconds = Math.max(1, (int) Math.ceil(throttleTimeMs / 1000.0));
+        httpResponse.headers().setInt(HttpHeaderNames.RETRY_AFTER, retryAfterSeconds);
+        httpResponse.headers().set(HttpHeaderNames.CONTENT_TYPE, HttpHeaderValues.APPLICATION_JSON);
+        httpResponse.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, bodyBytes.length);
+
+        ctx.writeAndFlush(httpResponse);
+    }
+
+    /**
+     * Starts the response-drainer thread. This thread polls processResponses()
+     * in a loop, sleeping briefly between empty polls.
+     */
+    public void startDrainer() {
+        if (!running.compareAndSet(false, true)) {
+            log.warn("Drainer thread already running for processor {}", id);
+            return;
+        }
+
+        drainerThread = new Thread(() -> {
+            while (running.get()) {
+                try {
+                    processResponses();
+                    if (responseQueue.isEmpty()) {
+                        Thread.sleep(POLL_INTERVAL_MS);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    log.error("Error in HTTP response drainer for processor {}", id, e);
+                }
+            }
+        }, "http-response-drainer-" + id);
+        drainerThread.setDaemon(true);
+        drainerThread.start();
+    }
+
+    /**
+     * Shuts down the response-drainer thread and clears all state.
+     * This method is idempotent — calling it multiple times is safe.
+     */
+    public void close() {
+        running.set(false);
+        Thread thread = drainerThread;
+        if (thread != null) {
+            thread.interrupt();
+            try {
+                thread.join(5000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            drainerThread = null;
+        }
+        channels.clear();
+        responseQueue.clear();
+    }
+
+    /**
+     * Returns the number of registered (active) channels.
+     * Useful for monitoring and drain logic.
+     */
+    public int channelCount() {
+        return channels.size();
+    }
+
+    /**
+     * Returns the current response queue size.
+     * Useful for monitoring.
+     */
+    public int responseQueueSize() {
+        return responseQueue.size();
+    }
+}

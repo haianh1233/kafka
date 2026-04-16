@@ -1590,6 +1590,10 @@ project(':http-server') {
 
     testRuntimeOnly runtimeTestLibs
   }
+
+  checkstyle {
+    configProperties = checkstyleConfigProperties("import-control-http-server.xml")
+  }
 }
 
 project(':test-common:test-common-internal-api') {
