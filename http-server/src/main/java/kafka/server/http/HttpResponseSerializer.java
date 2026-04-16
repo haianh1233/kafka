@@ -1,0 +1,677 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package kafka.server.http;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.netty.buffer.Unpooled;
+import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpHeaderValues;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpVersion;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.message.FetchResponseData;
+import org.apache.kafka.common.message.ListOffsetsResponseData;
+import org.apache.kafka.common.message.MetadataResponseData;
+import org.apache.kafka.common.message.ProduceResponseData;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.internal.BaseRecords;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.Record;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.requests.AbstractResponse;
+import org.apache.kafka.common.requests.FetchResponse;
+import org.apache.kafka.common.requests.ListOffsetsResponse;
+import org.apache.kafka.common.requests.MetadataResponse;
+import org.apache.kafka.common.requests.ProduceResponse;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collection;
+import java.util.List;
+import java.util.Objects;
+
+/**
+ * Serializes Kafka {@link AbstractResponse} objects into Netty {@link FullHttpResponse}
+ * with JSON body.
+ *
+ * Responsibilities:
+ * - Kafka error code -> HTTP status mapping (section 11.1)
+ * - Value type detection for consumed records (section 14.7)
+ * - Partial failure -> 207 Multi-Status (section 11.2)
+ * - Response headers: X-Kafka-Request-ID, X-Kafka-MaxWait-Applied, Retry-After
+ *
+ * // Time: Created - TASK-B.02
+ */
+public final class HttpResponseSerializer {
+
+    // --- Jackson ObjectMapper ---
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    // --- HTTP header names ---
+    static final String HEADER_REQUEST_ID = "X-Kafka-Request-ID";
+    static final String HEADER_MAX_WAIT_APPLIED = "X-Kafka-MaxWait-Applied";
+    static final String HEADER_RETRY_AFTER = "Retry-After";
+
+    // --- Content-type record header name (underscore prefix to avoid HTTP header collision) ---
+    static final String RECORD_HEADER_CONTENT_TYPE = "_content-type";
+    static final String CONTENT_TYPE_JSON = "application/json";
+
+    // --- DataObject type constants ---
+    static final String TYPE_NULL = "NULL";
+    static final String TYPE_JSON = "JSON";
+    static final String TYPE_STRING = "STRING";
+    static final String TYPE_BINARY = "BINARY";
+
+    // --- HTTP 207 Multi-Status (not in Netty's HttpResponseStatus by default) ---
+    static final HttpResponseStatus MULTI_STATUS = HttpResponseStatus.valueOf(207);
+
+    private HttpResponseSerializer() {} // utility class
+
+    /**
+     * Serializes a Kafka AbstractResponse into a Netty FullHttpResponse.
+     *
+     * @param kafkaResponse     the Kafka protocol response (ProduceResponse, FetchResponse, etc.)
+     * @param requestId         X-Kafka-Request-ID to echo back in response header
+     * @param apiKey            the ApiKey of the original request (determines JSON shape)
+     * @param effectiveMaxWaitMs applied maxWaitMs cap for FETCH responses (-1 if not applicable)
+     * @return FullHttpResponse ready to write to Netty channel
+     */
+    public static FullHttpResponse serialize(
+            AbstractResponse kafkaResponse,
+            String requestId,
+            ApiKeys apiKey,
+            int effectiveMaxWaitMs) {
+        Objects.requireNonNull(kafkaResponse, "kafkaResponse");
+        Objects.requireNonNull(apiKey, "apiKey");
+
+        ObjectNode body;
+        List<Errors> partitionErrors = new ArrayList<>();
+
+        switch (apiKey) {
+            case PRODUCE:
+                body = serializeProduceResponse((ProduceResponse) kafkaResponse);
+                collectProduceErrors((ProduceResponse) kafkaResponse, partitionErrors);
+                break;
+            case FETCH:
+                body = serializeFetchResponse((FetchResponse) kafkaResponse);
+                collectFetchErrors((FetchResponse) kafkaResponse, partitionErrors);
+                break;
+            case METADATA:
+                body = serializeMetadataResponse((MetadataResponse) kafkaResponse);
+                break;
+            case LIST_OFFSETS:
+                body = serializeListOffsetsResponse((ListOffsetsResponse) kafkaResponse);
+                collectListOffsetsErrors((ListOffsetsResponse) kafkaResponse, partitionErrors);
+                break;
+            default:
+                body = serializeGenericResponse(kafkaResponse);
+                break;
+        }
+
+        String jsonBody;
+        try {
+            jsonBody = MAPPER.writeValueAsString(body);
+        } catch (JsonProcessingException e) {
+            // Should not happen for ObjectNode, but handle gracefully
+            jsonBody = buildErrorBody(Errors.UNKNOWN_SERVER_ERROR, "Failed to serialize response: " + e.getMessage());
+            return buildResponse(HttpResponseStatus.INTERNAL_SERVER_ERROR, jsonBody,
+                    requestId, effectiveMaxWaitMs);
+        }
+
+        HttpResponseStatus status;
+        if (!partitionErrors.isEmpty()) {
+            status = determineOverallStatus(partitionErrors);
+        } else {
+            status = HttpResponseStatus.OK;
+        }
+
+        FullHttpResponse response = buildResponse(status, jsonBody, requestId,
+                apiKey == ApiKeys.FETCH ? effectiveMaxWaitMs : -1);
+
+        // Add Retry-After header if applicable
+        if (!partitionErrors.isEmpty()) {
+            // Find a representative retriable error for Retry-After header
+            for (Errors err : partitionErrors) {
+                int retryAfter = retryAfterSeconds(err);
+                if (retryAfter > 0) {
+                    response.headers().set(HEADER_RETRY_AFTER, String.valueOf(retryAfter));
+                    break;
+                }
+            }
+        }
+
+        return response;
+    }
+
+    // --- Produce response errors ---
+
+    private static void collectProduceErrors(ProduceResponse response, List<Errors> errors) {
+        for (ProduceResponseData.TopicProduceResponse topicResponse : response.data().responses()) {
+            for (ProduceResponseData.PartitionProduceResponse partitionResponse : topicResponse.partitionResponses()) {
+                errors.add(Errors.forCode(partitionResponse.errorCode()));
+            }
+        }
+    }
+
+    // --- Fetch response errors ---
+
+    private static void collectFetchErrors(FetchResponse response, List<Errors> errors) {
+        for (FetchResponseData.FetchableTopicResponse topicResponse : response.data().responses()) {
+            for (FetchResponseData.PartitionData partitionData : topicResponse.partitions()) {
+                errors.add(Errors.forCode(partitionData.errorCode()));
+            }
+        }
+    }
+
+    // --- ListOffsets response errors ---
+
+    private static void collectListOffsetsErrors(ListOffsetsResponse response, List<Errors> errors) {
+        for (ListOffsetsResponseData.ListOffsetsTopicResponse topicResponse : response.data().topics()) {
+            for (ListOffsetsResponseData.ListOffsetsPartitionResponse partitionResponse : topicResponse.partitions()) {
+                errors.add(Errors.forCode(partitionResponse.errorCode()));
+            }
+        }
+    }
+
+    /**
+     * Serializes a ProduceResponse to JSON.
+     *
+     * Output shape:
+     * {
+     *   "offsets": [
+     *     { "partition": 0, "offset": 10042, "errorCode": 0, "errorMessage": null }
+     *   ]
+     * }
+     */
+    static ObjectNode serializeProduceResponse(ProduceResponse response) {
+        ObjectNode root = MAPPER.createObjectNode();
+        ArrayNode offsets = root.putArray("offsets");
+
+        for (ProduceResponseData.TopicProduceResponse topicResponse : response.data().responses()) {
+            for (ProduceResponseData.PartitionProduceResponse partitionResponse : topicResponse.partitionResponses()) {
+                ObjectNode entry = offsets.addObject();
+                entry.put("partition", partitionResponse.index());
+                entry.put("offset", partitionResponse.baseOffset());
+                entry.put("errorCode", partitionResponse.errorCode());
+                Errors error = Errors.forCode(partitionResponse.errorCode());
+                if (error == Errors.NONE) {
+                    entry.putNull("errorMessage");
+                } else {
+                    entry.put("errorMessage", error.name());
+                }
+            }
+        }
+
+        return root;
+    }
+
+    /**
+     * Serializes a FetchResponse to JSON with value type detection.
+     *
+     * Output shape:
+     * {
+     *   "partitions": [
+     *     {
+     *       "partition": 0,
+     *       "highWatermark": 10050,
+     *       "records": [...],
+     *       "errorCode": 0, "errorMessage": null
+     *     }
+     *   ]
+     * }
+     */
+    static ObjectNode serializeFetchResponse(FetchResponse response) {
+        ObjectNode root = MAPPER.createObjectNode();
+        ArrayNode partitionsArray = root.putArray("partitions");
+
+        for (FetchResponseData.FetchableTopicResponse topicResponse : response.data().responses()) {
+            for (FetchResponseData.PartitionData partitionData : topicResponse.partitions()) {
+                ObjectNode partitionNode = partitionsArray.addObject();
+                partitionNode.put("partition", partitionData.partitionIndex());
+                partitionNode.put("highWatermark", partitionData.highWatermark());
+
+                ArrayNode recordsArray = partitionNode.putArray("records");
+                BaseRecords baseRecords = partitionData.records();
+                if (baseRecords instanceof MemoryRecords) {
+                    MemoryRecords memoryRecords = (MemoryRecords) baseRecords;
+                    for (RecordBatch batch : memoryRecords.batches()) {
+                        for (Record record : batch) {
+                            ObjectNode recordNode = recordsArray.addObject();
+                            recordNode.put("offset", record.offset());
+                            recordNode.put("timestamp", record.timestamp());
+
+                            // Serialize key
+                            byte[] keyBytes = bufferToBytes(record.key());
+                            recordNode.set("key", detectAndSerializeValue(keyBytes, record.headers()));
+
+                            // Serialize value
+                            byte[] valueBytes = bufferToBytes(record.value());
+                            recordNode.set("value", detectAndSerializeValue(valueBytes, record.headers()));
+
+                            // Serialize record headers
+                            ArrayNode headersArray = recordNode.putArray("headers");
+                            for (Header header : record.headers()) {
+                                ObjectNode headerNode = headersArray.addObject();
+                                headerNode.put("name", header.key());
+                                if (header.value() != null) {
+                                    headerNode.put("value", new String(header.value(), StandardCharsets.UTF_8));
+                                } else {
+                                    headerNode.putNull("value");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                partitionNode.put("errorCode", partitionData.errorCode());
+                Errors error = Errors.forCode(partitionData.errorCode());
+                if (error == Errors.NONE) {
+                    partitionNode.putNull("errorMessage");
+                } else {
+                    partitionNode.put("errorMessage", error.name());
+                }
+            }
+        }
+
+        return root;
+    }
+
+    /**
+     * Converts a ByteBuffer to byte array, or null if the buffer is null.
+     */
+    private static byte[] bufferToBytes(ByteBuffer buffer) {
+        if (buffer == null) {
+            return null;
+        }
+        byte[] bytes = new byte[buffer.remaining()];
+        buffer.duplicate().get(bytes);
+        return bytes;
+    }
+
+    /**
+     * Serializes a MetadataResponse to JSON.
+     *
+     * Output shape for single topic:
+     * {
+     *   "topic": "orders",
+     *   "partitions": [...]
+     * }
+     *
+     * Output shape for all topics:
+     * {
+     *   "topics": ["orders", "payments", "inventory"]
+     * }
+     */
+    static ObjectNode serializeMetadataResponse(MetadataResponse response) {
+        ObjectNode root = MAPPER.createObjectNode();
+        MetadataResponseData data = response.data();
+
+        if (data.topics().size() == 1) {
+            // Single topic — detailed partition info
+            MetadataResponseData.MetadataResponseTopic topic = data.topics().iterator().next();
+            root.put("topic", topic.name());
+
+            ArrayNode partitionsArray = root.putArray("partitions");
+            for (MetadataResponseData.MetadataResponsePartition partition : topic.partitions()) {
+                ObjectNode partitionNode = partitionsArray.addObject();
+                partitionNode.put("partition", partition.partitionIndex());
+
+                // Find leader broker info
+                ObjectNode leaderNode = partitionNode.putObject("leader");
+                int leaderId = partition.leaderId();
+                leaderNode.put("brokerId", leaderId);
+                // Look up broker host/port from brokers collection
+                for (MetadataResponseData.MetadataResponseBroker broker : data.brokers()) {
+                    if (broker.nodeId() == leaderId) {
+                        leaderNode.put("host", broker.host());
+                        leaderNode.put("port", broker.port());
+                        break;
+                    }
+                }
+
+                ArrayNode replicasArray = partitionNode.putArray("replicas");
+                for (int replicaId : partition.replicaNodes()) {
+                    replicasArray.add(replicaId);
+                }
+
+                ArrayNode isrArray = partitionNode.putArray("isr");
+                for (int isrId : partition.isrNodes()) {
+                    isrArray.add(isrId);
+                }
+            }
+        } else {
+            // Multiple topics — just list the names
+            ArrayNode topicsArray = root.putArray("topics");
+            for (MetadataResponseData.MetadataResponseTopic topic : data.topics()) {
+                topicsArray.add(topic.name());
+            }
+        }
+
+        return root;
+    }
+
+    /**
+     * Serializes a ListOffsetsResponse to JSON.
+     *
+     * Output shape:
+     * { "partition": 0, "offset": 10042, "timestamp": 1713260400000 }
+     */
+    static ObjectNode serializeListOffsetsResponse(ListOffsetsResponse response) {
+        ObjectNode root = MAPPER.createObjectNode();
+
+        for (ListOffsetsResponseData.ListOffsetsTopicResponse topicResponse : response.data().topics()) {
+            for (ListOffsetsResponseData.ListOffsetsPartitionResponse partitionResponse : topicResponse.partitions()) {
+                root.put("partition", partitionResponse.partitionIndex());
+                root.put("offset", partitionResponse.offset());
+                root.put("timestamp", partitionResponse.timestamp());
+                // Return first partition data (single-partition expected for HTTP use case)
+                return root;
+            }
+        }
+
+        return root;
+    }
+
+    /**
+     * Serializes an unrecognized response type to a generic JSON envelope.
+     */
+    private static ObjectNode serializeGenericResponse(AbstractResponse response) {
+        ObjectNode root = MAPPER.createObjectNode();
+        root.put("apiKey", response.apiKey().name);
+        root.put("throttleTimeMs", response.throttleTimeMs());
+        return root;
+    }
+
+    // --- Error mapping ---
+
+    /**
+     * Maps a Kafka Errors enum value to an HTTP status code.
+     *
+     * NONE -> 200, UNKNOWN_TOPIC_OR_PARTITION -> 404, LEADER_NOT_AVAILABLE -> 503,
+     * NOT_LEADER_OR_FOLLOWER -> 503, MESSAGE_TOO_LARGE -> 413, etc.
+     *
+     * @param error the Kafka error
+     * @return corresponding HttpResponseStatus
+     */
+    static HttpResponseStatus mapErrorToHttpStatus(Errors error) {
+        switch (error) {
+            case NONE:
+                return HttpResponseStatus.OK;
+            case UNKNOWN_TOPIC_OR_PARTITION:
+                return HttpResponseStatus.NOT_FOUND;
+            case LEADER_NOT_AVAILABLE:
+            case NOT_LEADER_OR_FOLLOWER:
+            case NOT_ENOUGH_REPLICAS:
+            case NOT_ENOUGH_REPLICAS_AFTER_APPEND:
+                return HttpResponseStatus.SERVICE_UNAVAILABLE;
+            case MESSAGE_TOO_LARGE:
+            case RECORD_LIST_TOO_LARGE:
+                return HttpResponseStatus.REQUEST_ENTITY_TOO_LARGE;
+            case TOPIC_AUTHORIZATION_FAILED:
+            case CLUSTER_AUTHORIZATION_FAILED:
+                return HttpResponseStatus.FORBIDDEN;
+            case INVALID_REQUEST:
+            case INVALID_TOPIC_EXCEPTION:
+                return HttpResponseStatus.BAD_REQUEST;
+            case REQUEST_TIMED_OUT:
+                return HttpResponseStatus.GATEWAY_TIMEOUT;
+            case THROTTLING_QUOTA_EXCEEDED:
+                return HttpResponseStatus.TOO_MANY_REQUESTS;
+            case KAFKA_STORAGE_ERROR:
+            default:
+                return HttpResponseStatus.INTERNAL_SERVER_ERROR;
+        }
+    }
+
+    /**
+     * Returns the Retry-After header value in seconds for retriable errors.
+     * Returns -1 for non-retriable errors (no Retry-After header needed).
+     *
+     * LEADER_NOT_AVAILABLE, NOT_LEADER_OR_FOLLOWER -> 1
+     * NOT_ENOUGH_REPLICAS, NOT_ENOUGH_REPLICAS_AFTER_APPEND -> 5
+     * REQUEST_TIMED_OUT -> 1
+     * THROTTLING_QUOTA_EXCEEDED -> computed from throttleTimeMs (default 1)
+     * All others -> -1
+     */
+    static int retryAfterSeconds(Errors error) {
+        switch (error) {
+            case LEADER_NOT_AVAILABLE:
+            case NOT_LEADER_OR_FOLLOWER:
+            case REQUEST_TIMED_OUT:
+                return 1;
+            case NOT_ENOUGH_REPLICAS:
+            case NOT_ENOUGH_REPLICAS_AFTER_APPEND:
+                return 5;
+            case THROTTLING_QUOTA_EXCEEDED:
+                return 1; // default when throttleTimeMs not provided
+            default:
+                return -1;
+        }
+    }
+
+    /**
+     * Overload for THROTTLING_QUOTA_EXCEEDED that takes the throttle time.
+     * Returns Math.max(1, (int) Math.ceil(throttleTimeMs / 1000.0))
+     */
+    static int retryAfterSeconds(Errors error, int throttleTimeMs) {
+        if (error == Errors.THROTTLING_QUOTA_EXCEEDED) {
+            return Math.max(1, (int) Math.ceil(throttleTimeMs / 1000.0));
+        }
+        return retryAfterSeconds(error);
+    }
+
+    // --- Value type detection ---
+
+    /**
+     * Detects the value type of a record's byte[] payload and serializes as DataObject.
+     *
+     * Algorithm (section 14.7):
+     * 1. null -> {"type":"NULL"}
+     * 2. _content-type: application/json header -> {"type":"JSON","data":<parsed>}
+     * 3. Valid UTF-8 without control chars -> {"type":"STRING","data":"..."}
+     * 4. Fallback -> {"type":"BINARY","data":"<base64>"}
+     *
+     * @param valueBytes raw record value bytes (may be null)
+     * @param headers    record headers (checked for _content-type)
+     * @return ObjectNode representing the DataObject JSON
+     */
+    static ObjectNode detectAndSerializeValue(byte[] valueBytes, Header[] headers) {
+        ObjectNode node = MAPPER.createObjectNode();
+
+        // Step 1 — null check
+        if (valueBytes == null) {
+            node.put("type", TYPE_NULL);
+            return node;
+        }
+
+        // Step 2 — check headers for _content-type: application/json
+        String contentType = getRecordHeader(headers, RECORD_HEADER_CONTENT_TYPE);
+        if (CONTENT_TYPE_JSON.equals(contentType)) {
+            try {
+                JsonNode parsed = MAPPER.readTree(valueBytes);
+                node.put("type", TYPE_JSON);
+                node.set("data", parsed);
+                return node;
+            } catch (Exception e) {
+                // Fall through to step 3
+            }
+        }
+
+        // Step 3 — try UTF-8 decode, check for control chars
+        try {
+            CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT);
+            String decoded = decoder.decode(ByteBuffer.wrap(valueBytes)).toString();
+
+            if (!containsControlChars(decoded)) {
+                node.put("type", TYPE_STRING);
+                node.put("data", decoded);
+                return node;
+            }
+            // Has control chars — fall through to step 4
+        } catch (CharacterCodingException e) {
+            // Invalid UTF-8 — fall through to step 4
+        }
+
+        // Step 4 — base64 encode as BINARY
+        node.put("type", TYPE_BINARY);
+        node.put("data", Base64.getEncoder().encodeToString(valueBytes));
+        return node;
+    }
+
+    /**
+     * Checks if a string contains C0/C1 control characters that make it unsuitable
+     * for STRING type. Allows HT (0x09), LF (0x0A), CR (0x0D).
+     *
+     * @param s decoded UTF-8 string
+     * @return true if the string contains disallowed control characters
+     */
+    static boolean containsControlChars(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            if (isDisallowedControlChar(s.charAt(i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Returns true if the character is a disallowed control character.
+     * Disallowed: 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0x7F.
+     * Allowed control chars: HT (0x09), LF (0x0A), CR (0x0D).
+     */
+    private static boolean isDisallowedControlChar(char c) {
+        if (c <= 0x08) return true;                  // 0x00-0x08
+        if (c == 0x0B || c == 0x0C) return true;     // VT, FF
+        if (c >= 0x0E && c <= 0x1F) return true;     // 0x0E-0x1F
+        return c == 0x7F;                             // DEL
+    }
+
+    /**
+     * Checks record headers for a specific header name and returns its value.
+     */
+    static String getRecordHeader(Header[] headers, String name) {
+        if (headers == null) {
+            return null;
+        }
+        for (Header header : headers) {
+            if (name.equals(header.key())) {
+                byte[] value = header.value();
+                if (value != null) {
+                    return new String(value, StandardCharsets.UTF_8);
+                }
+                return null;
+            }
+        }
+        return null;
+    }
+
+    // --- Partial failure ---
+
+    /**
+     * Determines the overall HTTP status for a response with potentially mixed errors.
+     *
+     * - All NONE -> 200
+     * - All same non-NONE error -> that error's HTTP status
+     * - Mixed (some success, some failure, or different errors) -> 207 Multi-Status
+     *
+     * @param errors collection of per-partition Errors values
+     * @return the appropriate HTTP status
+     */
+    static HttpResponseStatus determineOverallStatus(Collection<Errors> errors) {
+        if (errors.isEmpty()) {
+            return HttpResponseStatus.OK;
+        }
+
+        Errors first = null;
+        for (Errors error : errors) {
+            if (first == null) {
+                first = error;
+            } else if (error != first) {
+                return MULTI_STATUS;
+            }
+        }
+
+        return mapErrorToHttpStatus(first);
+    }
+
+    // --- Error body builder ---
+
+    /**
+     * Builds a standalone JSON error response body.
+     *
+     * { "errorCode": 3, "errorMessage": "UNKNOWN_TOPIC_OR_PARTITION", "detail": "..." }
+     */
+    static String buildErrorBody(Errors error, String detail) {
+        ObjectNode node = MAPPER.createObjectNode();
+        node.put("errorCode", error.code());
+        node.put("errorMessage", error.name());
+        if (detail != null) {
+            node.put("detail", detail);
+        } else {
+            node.putNull("detail");
+        }
+        try {
+            return MAPPER.writeValueAsString(node);
+        } catch (JsonProcessingException e) {
+            // Should never happen with ObjectNode
+            return "{\"errorCode\":" + error.code() + ",\"errorMessage\":\"" + error.name() + "\"}";
+        }
+    }
+
+    // --- Response builder helper ---
+
+    /**
+     * Builds a FullHttpResponse from a JSON body and status, with standard headers.
+     */
+    static FullHttpResponse buildResponse(HttpResponseStatus status, String jsonBody,
+                                          String requestId, int effectiveMaxWaitMs) {
+        byte[] bodyBytes = jsonBody.getBytes(StandardCharsets.UTF_8);
+        FullHttpResponse response = new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1,
+                status,
+                Unpooled.copiedBuffer(bodyBytes));
+
+        response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json");
+        response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, bodyBytes.length);
+
+        if (requestId != null) {
+            response.headers().set(HEADER_REQUEST_ID, requestId);
+        }
+
+        if (effectiveMaxWaitMs >= 0) {
+            response.headers().setInt(HEADER_MAX_WAIT_APPLIED, effectiveMaxWaitMs);
+        }
+
+        response.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
+
+        return response;
+    }
+}
