@@ -36,7 +36,7 @@ public class IdleStateCloseHandler extends ChannelDuplexHandler {
     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
         if (evt instanceof IdleStateEvent) {
             if (httpMetrics != null) {
-                httpMetrics.recordIdleConnectionClose();
+                httpMetrics.idleConnectionsClosedRate.mark();
             }
             ctx.close();
         } else {

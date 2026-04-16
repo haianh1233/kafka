@@ -238,16 +238,9 @@ class HttpProtocolNegotiationHandlerTest {
     }
 
     /**
-     * No-op implementation of HttpMetrics for testing.
+     * No-op extension of HttpMetrics for testing.
+     * HttpMetrics is a concrete class; metrics are recorded but not verified in these tests.
      */
-    private static class NoOpHttpMetrics implements HttpMetrics {
-        @Override
-        public void recordIdleConnectionClose() { }
-
-        @Override
-        public void recordConnectionCreated() { }
-
-        @Override
-        public void recordConnectionClosed() { }
+    private static class NoOpHttpMetrics extends HttpMetrics {
     }
 }
