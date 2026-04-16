@@ -41,6 +41,23 @@ import scala.jdk.CollectionConverters._
 import scala.jdk.OptionConverters.RichOption
 import scala.reflect.ClassTag
 
+/**
+ * Trait for components that can receive responses from RequestChannel.
+ * Both the binary-protocol Processor (SocketServer) and the HTTP-protocol
+ * HttpProcessor implement this trait so that RequestChannel can route
+ * responses back to the correct transport layer.
+ *
+ * Methods are public so that Java implementations (HttpProcessor) can
+ * implement the trait without visibility issues.
+ *
+ * // Time: Created - TASK-B.06-wiring
+ */
+trait ResponseProcessor {
+  def id: Int
+  def enqueueResponse(response: RequestChannel.Response): Unit
+  def responseQueueSize: Int
+}
+
 object RequestChannel extends Logging {
   private val requestLogger = Logger("kafka.request.logger")
 
@@ -359,7 +376,7 @@ class RequestChannel(val queueSize: Int,
   private val metricsGroup = new KafkaMetricsGroup(metricsPackage, metricsClassName)
 
   private val requestQueue = new ArrayBlockingQueue[BaseRequest](queueSize)
-  private val processors = new ConcurrentHashMap[Int, Processor]()
+  private val processors = new ConcurrentHashMap[Int, ResponseProcessor]()
   private val callbackQueue = new ArrayBlockingQueue[BaseRequest](queueSize)
 
   metricsGroup.newGauge(RequestQueueSizeMetric, () => requestQueue.size)
@@ -370,7 +387,7 @@ class RequestChannel(val queueSize: Int,
     }
   })
 
-  def addProcessor(processor: Processor): Unit = {
+  def addProcessor(processor: ResponseProcessor): Unit = {
     if (processors.putIfAbsent(processor.id, processor) != null)
       warn(s"Unexpected processor with processorId ${processor.id}")
 
@@ -420,6 +437,9 @@ class RequestChannel(val queueSize: Int,
     onComplete: Option[Send => Unit]
   ): Unit = {
     updateErrorMetrics(request.header.apiKey, response.errorCounts.asScala)
+    // Store the AbstractResponse so HTTP processors can access it for JSON serialization
+    // without re-parsing from wire bytes. The binary-protocol processor ignores this.
+    request.requestLocalProperties.put("httpAbstractResponse", response.asInstanceOf[AnyRef])
     sendResponse(new RequestChannel.SendResponse(
       request,
       request.buildResponseSend(response),

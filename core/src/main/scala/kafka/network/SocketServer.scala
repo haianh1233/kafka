@@ -163,6 +163,17 @@ class SocketServer(
   }
 
   /**
+   * Injects a metadata supplier into all HTTP acceptors. The supplier maps
+   * topic names to partition counts and is used by the HTTP produce translator
+   * for partition assignment. Call this after the MetadataCache is available
+   * but before any HTTP requests are processed.
+   */
+  // Time: Created - TASK-B.06
+  def setHttpMetadataSupplier(supplier: java.util.function.Function[String, Integer]): Unit = {
+    httpAcceptors.values().forEach(acc => acc.setMetadataSupplier(supplier))
+  }
+
+  /**
    * This method enables request processing for all endpoints managed by this SocketServer. Each
    * endpoint will be brought up asynchronously as soon as its associated future is completed.
    * Therefore, we do not know that any particular request processor will be running by the end of
@@ -257,6 +268,8 @@ class SocketServer(
             s"HTTP listener $listenerName requires httpAcceptorFactory to be set on SocketServer")
         }
         val httpAcceptor = httpAcceptorFactory(endpoint, time)
+        // Inject the shared RequestChannel so HTTP requests flow through KafkaApis
+        httpAcceptor.setRequestChannel(dataPlaneRequestChannel)
         // Bind immediately so boundPort() is available (unlike binary acceptors
         // which bind in the constructor, Netty binds in startup())
         httpAcceptor.startup()
@@ -913,7 +926,7 @@ private[kafka] class Processor(
   apiVersionManager: ApiVersionManager,
   threadName: String,
   connectionDisconnectListeners: Seq[ConnectionDisconnectListener]
-) extends Runnable with Logging {
+) extends Runnable with ResponseProcessor with Logging {
   private val metricsPackage = "kafka.network"
   private val metricsClassName = "Processor"
   private val metricsGroup = new KafkaMetricsGroup(metricsPackage, metricsClassName)
@@ -1305,7 +1318,7 @@ private[kafka] class Processor(
     connId
   }
 
-  private[network] def enqueueResponse(response: RequestChannel.Response): Unit = {
+  override def enqueueResponse(response: RequestChannel.Response): Unit = {
     responseQueue.put(response)
     wakeup()
   }
@@ -1317,7 +1330,7 @@ private[kafka] class Processor(
     response
   }
 
-  private[network] def responseQueueSize = responseQueue.size
+  override def responseQueueSize: Int = responseQueue.size
 
   // Only for testing
   private[network] def inflightResponseCount: Int = inflightResponses.size

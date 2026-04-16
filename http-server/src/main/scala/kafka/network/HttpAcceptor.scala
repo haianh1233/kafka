@@ -26,6 +26,7 @@ import io.netty.channel.{Channel, ChannelOption, EventLoopGroup}
 import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.nio.NioServerSocketChannel
 import io.netty.handler.ssl.SslContext
+import kafka.server.http.HttpProcessor
 import kafka.utils.Logging
 import org.apache.kafka.common.Endpoint
 import org.apache.kafka.common.utils.Time
@@ -48,6 +49,7 @@ import org.apache.kafka.common.utils.Time
  *   close()       -> shuts down Netty event loop groups
  *
  * // Time: Created - TASK-B.03
+ * // Time: Modified - TASK-B.06 (request pipeline wiring)
  */
 class HttpAcceptor(
     val endpoint: Endpoint,
@@ -99,10 +101,44 @@ class HttpAcceptor(
   //       keystore/truststore. For now, always None.
   private val sslContext: Option[SslContext] = None
 
+  // --- Request pipeline wiring (set via setRequestChannel before startup) ---
+  @volatile private var _requestChannel: RequestChannel = _
+  @volatile private var _metadataSupplier: java.util.function.Function[String, Integer] = _
+  @volatile private var _httpProcessor: HttpProcessor = _
+
+  // Processor ID for the HTTP processor. Uses a high base to avoid collision
+  // with binary protocol processor IDs (which start from 0).
+  private val httpProcessorId = 10000 + brokerId
+
+  override def setRequestChannel(requestChannel: RequestChannel): Unit = {
+    _requestChannel = requestChannel
+  }
+
+  override def setMetadataSupplier(supplier: java.util.function.Function[String, Integer]): Unit = {
+    _metadataSupplier = supplier
+  }
+
+  // Track whether startup has been called already (make idempotent)
+  private val started = new AtomicBoolean(false)
+
   /**
    * Binds the Netty server to the endpoint and starts accepting connections.
+   * Idempotent: calling this multiple times is safe (second call is a no-op).
    */
   def startup(): Unit = {
+    if (!started.compareAndSet(false, true)) {
+      return // Already started
+    }
+
+    // If a RequestChannel was injected, create and register an HttpProcessor
+    // for routing responses back to Netty channels.
+    if (_requestChannel != null && _httpProcessor == null) {
+      _httpProcessor = new HttpProcessor(httpProcessorId, pendingConnectionCount)
+      _requestChannel.addProcessor(_httpProcessor)
+      _httpProcessor.startDrainer()
+      info(s"HTTP processor $httpProcessorId registered with RequestChannel")
+    }
+
     val bootstrap = new ServerBootstrap()
     bootstrap.group(bossGroup, workerGroup)
       .channel(classOf[NioServerSocketChannel])
@@ -110,14 +146,17 @@ class HttpAcceptor(
       .childOption(ChannelOption.SO_KEEPALIVE, Boolean.box(true))
       .childHandler(new HttpChannelInitializer(
         sslContext = sslContext,
-        draining = new java.util.concurrent.atomic.AtomicBoolean(false),
-        inFlightCount = new java.util.concurrent.atomic.AtomicInteger(0),
+        draining = _draining,
+        inFlightCount = pendingConnectionCount,
         httpMetrics = new kafka.server.http.HttpMetrics(),
         maxRequestBytes = httpRequestMaxBytes,
         connectionIdleTimeoutMs = httpConnectionIdleTimeoutMs,
         corsAllowedOrigins = corsAllowedOrigins,
         brokerId = brokerId,
-        clusterId = clusterId))
+        clusterId = clusterId,
+        requestChannel = _requestChannel,
+        httpProcessor = _httpProcessor,
+        metadataSupplier = _metadataSupplier))
 
     val host = if (endpoint.host() == null || endpoint.host().isEmpty) "0.0.0.0" else endpoint.host()
     try {
@@ -188,6 +227,19 @@ class HttpAcceptor(
    */
   override def close(): Unit = {
     if (closed.compareAndSet(false, true)) {
+      try {
+        // 0. Shut down HttpProcessor drainer thread
+        if (_httpProcessor != null) {
+          _httpProcessor.close()
+          if (_requestChannel != null) {
+            _requestChannel.removeProcessor(httpProcessorId)
+          }
+        }
+      } catch {
+        case e: Exception =>
+          warn(s"Error closing HttpProcessor: ${e.getMessage}")
+      }
+
       try {
         // 1. Close server channel
         if (serverChannel != null) {

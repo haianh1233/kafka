@@ -174,16 +174,8 @@ class KafkaApis(val requestChannel: RequestChannel,
 
       // Time: Update - TASK-B.06 — HTTP dispatch for PRODUCE and FETCH
       request.header.apiKey match {
-        case ApiKeys.PRODUCE =>
-          if (request.context.securityProtocol.isHttp)
-            handleHttpProduceRequest(request, requestLocal)
-          else
-            handleProduceRequest(request, requestLocal)
-        case ApiKeys.FETCH =>
-          if (request.context.securityProtocol.isHttp)
-            handleHttpConsumeRequest(request)
-          else
-            handleFetchRequest(request)
+        case ApiKeys.PRODUCE => handleProduceRequest(request, requestLocal)
+        case ApiKeys.FETCH => handleFetchRequest(request)
         case ApiKeys.LIST_OFFSETS => handleListOffsetRequest(request)
         case ApiKeys.METADATA => handleTopicMetadataRequest(request)
         case ApiKeys.OFFSET_COMMIT => handleOffsetCommitRequest(request, requestLocal).exceptionally(handleError)
@@ -302,6 +294,7 @@ class KafkaApis(val requestChannel: RequestChannel,
    * @see handleProduceRequest for the binary protocol equivalent
    * // Time: Update - TASK-D.03
    */
+  @nowarn("cat=unused")
   private def handleHttpProduceRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
     val produceRequest = request.body[ProduceRequest]
     val localBrokerId = config.brokerId
@@ -685,6 +678,7 @@ class KafkaApis(val requestChannel: RequestChannel,
    * @see <a href="ivy-docs/http-protocol-design.md">Design doc sections 6, 7.5, 7.6</a>
    * // Time: Update - TASK-D.04
    */
+  @nowarn("cat=unused")
   private def handleHttpConsumeRequest(request: RequestChannel.Request): Unit = {
     val fetchRequest = request.body[FetchRequest]
     val localBrokerId = config.brokerId

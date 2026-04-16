@@ -26,6 +26,9 @@ import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpVersion;
 import kafka.network.RequestChannel;
+import kafka.network.ResponseProcessor;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.requests.AbstractResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,7 +67,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * // Time: Created - TASK-B.04
  */
-public class HttpProcessor {
+public class HttpProcessor implements ResponseProcessor {
 
     private static final Logger log = LoggerFactory.getLogger(HttpProcessor.class);
 
@@ -188,18 +191,33 @@ public class HttpProcessor {
                     RequestChannel.SendResponse sendResp = (RequestChannel.SendResponse) response;
                     ChannelHandlerContext ctx = channels.get(connectionId);
                     if (ctx != null && ctx.channel().isActive()) {
-                        // Build HTTP response from the Send object
-                        // The responseSend contains the serialized Kafka protocol bytes.
-                        // For now, write the raw response log as JSON if available,
-                        // or indicate the response was sent. HttpResponseSerializer (future task)
-                        // will handle full JSON serialization.
-                        byte[] body = serializeSendResponse(sendResp);
-                        FullHttpResponse httpResponse = new DefaultFullHttpResponse(
-                            HttpVersion.HTTP_1_1,
-                            HttpResponseStatus.OK,
-                            Unpooled.wrappedBuffer(body));
-                        httpResponse.headers().set(HttpHeaderNames.CONTENT_TYPE, HttpHeaderValues.APPLICATION_JSON);
-                        httpResponse.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length);
+                        FullHttpResponse httpResponse;
+                        ApiKeys apiKey = sendResp.request().header().apiKey();
+                        String requestId = connectionId + "-" + sendResp.request().header().correlationId();
+
+                        // Check if the AbstractResponse was stored for HTTP serialization
+                        Object storedResponse = sendResp.request().requestLocalProperties()
+                            .get("httpAbstractResponse");
+                        if (storedResponse instanceof AbstractResponse) {
+                            AbstractResponse abstractResponse = (AbstractResponse) storedResponse;
+                            // Use the real HTTP response serializer for proper JSON conversion
+                            Object maxWaitObj = sendResp.request().requestLocalProperties()
+                                .get("httpMaxWaitApplied");
+                            int effectiveMaxWaitMs = maxWaitObj instanceof Integer ?
+                                (Integer) maxWaitObj : -1;
+                            httpResponse = HttpResponseSerializer.serialize(
+                                abstractResponse, requestId, apiKey, effectiveMaxWaitMs);
+                        } else {
+                            // Fallback: use response log or minimal response
+                            byte[] body = serializeSendResponse(sendResp);
+                            httpResponse = new DefaultFullHttpResponse(
+                                HttpVersion.HTTP_1_1,
+                                HttpResponseStatus.OK,
+                                Unpooled.wrappedBuffer(body));
+                            httpResponse.headers().set(HttpHeaderNames.CONTENT_TYPE,
+                                HttpHeaderValues.APPLICATION_JSON);
+                            httpResponse.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length);
+                        }
 
                         // Section 12.3: If throttleTimeMs > 0, add Retry-After header
                         // so HTTP clients know to back off.
@@ -216,6 +234,9 @@ public class HttpProcessor {
                         inFlightCount.decrementAndGet();
                     }
                     channels.remove(connectionId);
+
+                } else if (response instanceof RequestChannel.NoOpResponse) {
+                    sendNoContentResponse(connectionId);
 
                 } else if (response instanceof RequestChannel.CloseConnectionResponse) {
                     ChannelHandlerContext ctx = channels.remove(connectionId);
@@ -287,6 +308,26 @@ public class HttpProcessor {
         httpResponse.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, bodyBytes.length);
 
         ctx.writeAndFlush(httpResponse);
+    }
+
+    /**
+     * Sends an HTTP 204 No Content response for NoOp responses (acks=0 produce).
+     * HTTP clients need an explicit response; unlike the binary protocol, there's
+     * no "mute" mechanism.
+     *
+     * @param connectionId the connection ID for the channel lookup
+     */
+    private void sendNoContentResponse(String connectionId) {
+        ChannelHandlerContext ctx = channels.get(connectionId);
+        if (ctx != null && ctx.channel().isActive()) {
+            FullHttpResponse httpResponse = new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1, HttpResponseStatus.NO_CONTENT);
+            httpResponse.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, 0);
+            ctx.writeAndFlush(httpResponse).addListener(f -> inFlightCount.decrementAndGet());
+        } else {
+            inFlightCount.decrementAndGet();
+        }
+        channels.remove(connectionId);
     }
 
     /**

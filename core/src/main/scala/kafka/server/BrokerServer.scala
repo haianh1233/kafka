@@ -277,6 +277,13 @@ class BrokerServer(
       // Time: Update - E2E fix: wire real HttpAcceptor factory into SocketServer
       // Uses reflection to avoid compile-time dependency on http-server module
       // (core cannot depend on http-server due to circular dependency)
+      // Time: Update - TASK-B.06 — Build metadata supplier for HTTP produce partition assignment
+      val httpMetadataSupplier: java.util.function.Function[String, Integer] = { (topicName: String) =>
+        metadataCache.numPartitions(topicName).orElseThrow(() =>
+          new org.apache.kafka.common.errors.UnknownTopicOrPartitionException(
+            s"Topic '$topicName' not found"))
+      }
+
       val httpFactory: (org.apache.kafka.common.Endpoint, org.apache.kafka.common.utils.Time) => kafka.network.HttpAcceptorLike = {
         (ep, t) =>
           try {
@@ -291,7 +298,7 @@ class BrokerServer(
               classOf[Int],
               classOf[String]
             )
-            ctor.newInstance(
+            val acceptor = ctor.newInstance(
               ep,
               Int.box(config.getInt(org.apache.kafka.network.HttpServerConfigs.NUM_HTTP_NETWORK_THREADS_CONFIG)),
               Int.box(config.getInt(org.apache.kafka.network.HttpServerConfigs.HTTP_REQUEST_MAX_BYTES_CONFIG)),
@@ -301,6 +308,9 @@ class BrokerServer(
               Int.box(config.nodeId),
               clusterId
             ).asInstanceOf[kafka.network.HttpAcceptorLike]
+            // Inject metadata supplier before SocketServer calls startup()
+            acceptor.setMetadataSupplier(httpMetadataSupplier)
+            acceptor
           } catch {
             case e: ClassNotFoundException =>
               throw new IllegalStateException(

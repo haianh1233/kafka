@@ -32,6 +32,7 @@ import org.apache.kafka.common.Endpoint
  *
  * // Time: Created - TASK-B.03
  * // Time: Modified - TASK-0.02 (converted from concrete stub to abstract trait)
+ * // Time: Modified - TASK-B.06 (added setRequestChannel + setMetadataSupplier for pipeline wiring)
  */
 trait HttpAcceptorLike {
 
@@ -68,4 +69,19 @@ trait HttpAcceptorLike {
 
   /** Current count of in-flight requests. */
   def pendingRequestCount: Int
+
+  /**
+   * Injects the shared RequestChannel so HTTP requests can be enqueued for
+   * processing by KafkaApis. Must be called before startup().
+   * Default implementation is a no-op for backward compatibility.
+   */
+  def setRequestChannel(requestChannel: RequestChannel): Unit = {}
+
+  /**
+   * Injects a metadata supplier that maps topic names to partition counts.
+   * Used by the produce translator for partition assignment.
+   * Must be called before startup().
+   * Default implementation is a no-op for backward compatibility.
+   */
+  def setMetadataSupplier(supplier: java.util.function.Function[String, Integer]): Unit = {}
 }

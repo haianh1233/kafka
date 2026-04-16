@@ -16,18 +16,25 @@
  */
 // Time: Created - TASK-F.05
 // Time: Modified - TASK-F.06 (drain check + in-flight tracking)
+// Time: Modified - TASK-B.06 (request pipeline wiring)
 package kafka.network
 
 import io.netty.buffer.Unpooled
 import io.netty.channel.{ChannelFutureListener, ChannelHandlerContext, SimpleChannelInboundHandler}
 import io.netty.handler.codec.http.{DefaultFullHttpResponse, FullHttpRequest, HttpHeaderNames, HttpResponseStatus, HttpVersion}
 import io.netty.handler.ssl.SslHandler
+import kafka.server.http.{HttpProcessor, HttpRequestTranslator, HttpRouter, HttpServerConfigs}
+import org.apache.kafka.common.memory.MemoryPool
+import org.apache.kafka.common.network.{ClientInformation, ListenerName}
+import org.apache.kafka.common.requests.{RequestContext, RequestHeader}
 import org.apache.kafka.common.security.auth.{HttpAuthenticationContext, KafkaPrincipal, KafkaPrincipalBuilder, SecurityProtocol}
+import org.apache.kafka.common.utils.Time
 
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
 import java.security.cert.X509Certificate
 import java.util.Base64
+import java.util.Optional
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 /**
@@ -44,6 +51,10 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
  * In-flight request tracking: the handler increments the in-flight counter
  * when a request passes the drain check. The counter is decremented when the
  * response is written (handled by HttpProcessor) or on error paths.
+ *
+ * When requestChannel and httpProcessor are provided, non-health requests are
+ * routed through the full Kafka request pipeline:
+ *   HTTP request → HttpRouter → HttpRequestTranslator → RequestChannel → KafkaApis → HttpProcessor → Netty
  */
 class HttpRequestHandler(
   principalBuilder: KafkaPrincipalBuilder,
@@ -51,12 +62,28 @@ class HttpRequestHandler(
   draining: AtomicBoolean,
   inFlightCount: AtomicInteger,
   brokerId: Int = -1,
-  clusterId: String = ""
+  clusterId: String = "",
+  requestChannel: RequestChannel = null,
+  httpProcessor: HttpProcessor = null,
+  metadataSupplier: java.util.function.Function[String, Integer] = null,
+  httpServerConfigs: HttpServerConfigs = HttpServerConfigs.withDefaults()
 ) extends SimpleChannelInboundHandler[FullHttpRequest] {
 
   /** Convenience constructor for backward compatibility (no drain support). */
   def this(principalBuilder: KafkaPrincipalBuilder, securityProtocol: SecurityProtocol) =
     this(principalBuilder, securityProtocol, new AtomicBoolean(false), new AtomicInteger(0))
+
+  /** Whether the request pipeline is wired (non-null requestChannel + httpProcessor). */
+  private val pipelineWired: Boolean = requestChannel != null && httpProcessor != null
+
+  /** Shared stateless router instance. */
+  private val router: HttpRouter = new HttpRouter()
+
+  /** Translator instance (has a round-robin counter for batch-sticky partitioning). */
+  private val translator: HttpRequestTranslator = new HttpRequestTranslator()
+
+  /** Correlation ID counter — monotonically increasing per handler instance. */
+  private val correlationIdCounter: AtomicInteger = new AtomicInteger(0)
 
   /** JSON body for 503 drain response */
   private val DrainingResponseBody =
@@ -129,6 +156,10 @@ class HttpRequestHandler(
 
     inFlightCount.incrementAndGet()
 
+    // Track whether we handed the request off to the async pipeline.
+    // If true, HttpProcessor owns the inFlightCount decrement.
+    var handedOffToAsyncPipeline = false
+
     try {
       // Health check: respond directly without RequestChannel
       val uri = req.uri()
@@ -137,22 +168,126 @@ class HttpRequestHandler(
         return
       }
 
-      // TODO: Route through HttpRouter → HttpRequestTranslator → RequestChannel → KafkaApis
-      // For now, return 501 Not Implemented for non-health endpoints
-      val body = """{"errorCode":-1,"errorMessage":"HTTP endpoint not yet wired to RequestChannel"}""".getBytes(java.nio.charset.StandardCharsets.UTF_8)
-      val response = new DefaultFullHttpResponse(
-        HttpVersion.HTTP_1_1,
-        HttpResponseStatus.NOT_IMPLEMENTED,
-        Unpooled.wrappedBuffer(body))
-      response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json")
-      response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length)
-      ctx.writeAndFlush(response)
-    } catch {
-      case e: Exception =>
-        inFlightCount.decrementAndGet()
-        throw e
+      // If pipeline is not wired, return 501
+      if (!pipelineWired) {
+        sendErrorResponse(ctx, HttpResponseStatus.NOT_IMPLEMENTED,
+          """{"errorCode":-1,"errorMessage":"HTTP endpoint not yet wired to RequestChannel"}""")
+        return
+      }
+
+      // --- Route the request ---
+      val method = io.netty.handler.codec.http.HttpMethod.valueOf(req.method().name())
+      val routeResult = try {
+        router.route(method, uri)
+      } catch {
+        case e: org.apache.kafka.common.errors.InvalidRequestException =>
+          sendErrorResponse(ctx, HttpResponseStatus.NOT_FOUND,
+            s"""{"errorCode":-1,"errorMessage":"${escapeJson(e.getMessage)}"}""")
+          return
+        case e: org.apache.kafka.common.errors.InvalidTopicException =>
+          sendErrorResponse(ctx, HttpResponseStatus.BAD_REQUEST,
+            s"""{"errorCode":-1,"errorMessage":"${escapeJson(e.getMessage)}"}""")
+          return
+      }
+
+      // Health routed through router also handled directly
+      if (routeResult.handlerType() == HttpRouter.HandlerType.HEALTH) {
+        sendHealthResponse(ctx)
+        return
+      }
+
+      // OpenAPI spec not yet implemented
+      if (routeResult.handlerType() == HttpRouter.HandlerType.OPENAPI_SPEC) {
+        sendErrorResponse(ctx, HttpResponseStatus.NOT_IMPLEMENTED,
+          """{"errorCode":-1,"errorMessage":"OpenAPI spec endpoint not yet implemented"}""")
+        return
+      }
+
+      // --- Translate the request ---
+      val bodyBytes = if (req.content().isReadable) {
+        val bytes = new Array[Byte](req.content().readableBytes())
+        req.content().readBytes(bytes)
+        bytes
+      } else {
+        null
+      }
+
+      val translationResult = try {
+        translator.translate(routeResult, bodyBytes, httpServerConfigs, metadataSupplier)
+      } catch {
+        case e: org.apache.kafka.common.errors.InvalidRequestException =>
+          sendErrorResponse(ctx, HttpResponseStatus.BAD_REQUEST,
+            s"""{"errorCode":-1,"errorMessage":"${escapeJson(e.getMessage)}"}""")
+          return
+        case e: Exception =>
+          sendErrorResponse(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR,
+            s"""{"errorCode":-1,"errorMessage":"Translation failed: ${escapeJson(e.getMessage)}"}""")
+          return
+      }
+
+      // --- Build RequestContext and RequestChannel.Request ---
+      val principal = buildPrincipal(ctx, req)
+      val connectionId = ctx.channel().id().asLongText()
+      val clientAddress = ctx.channel().remoteAddress().asInstanceOf[InetSocketAddress]
+      val clientId = HttpRouter.validateClientId(req.headers().get("X-Kafka-Client-ID"))
+      val correlationId = correlationIdCounter.getAndIncrement()
+
+      val requestHeader = new RequestHeader(
+        translationResult.apiKey(),
+        translationResult.apiVersion(),
+        clientId,
+        correlationId
+      )
+
+      val requestContext = new RequestContext(
+        requestHeader,
+        connectionId,
+        clientAddress.getAddress,
+        Optional.of(Integer.valueOf(clientAddress.getPort)),
+        principal,
+        ListenerName.normalised("HTTP"),
+        securityProtocol,
+        ClientInformation.EMPTY,
+        false // fromPrivilegedListener
+      )
+
+      // Ensure buffer is ready to be read
+      val requestBuffer = translationResult.serializedRequest()
+      if (requestBuffer.position() != 0) {
+        requestBuffer.rewind()
+      }
+
+      val channelRequest = new RequestChannel.Request(
+        processor = httpProcessor.id(),
+        context = requestContext,
+        startTimeNanos = Time.SYSTEM.nanoseconds(),
+        memoryPool = MemoryPool.NONE,
+        buffer = requestBuffer,
+        metrics = requestChannel.metrics,
+        envelope = None
+      )
+
+      // --- Register channel with HttpProcessor for response routing ---
+      httpProcessor.registerChannel(connectionId, ctx)
+
+      // --- Enqueue to RequestChannel (non-blocking) ---
+      val enqueued = requestChannel.tryEnqueue(channelRequest)
+      if (!enqueued) {
+        // Queue full — unregister and return 503
+        httpProcessor.unregisterChannel(connectionId)
+        sendErrorResponse(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE,
+          """{"errorCode":-1,"errorMessage":"Request queue full","detail":"SERVICE_UNAVAILABLE"}""")
+        return
+      }
+
+      // Request is now in the async pipeline. HttpProcessor owns the
+      // inFlightCount decrement when the response is written.
+      handedOffToAsyncPipeline = true
+
     } finally {
-      inFlightCount.decrementAndGet()
+      if (!handedOffToAsyncPipeline) {
+        inFlightCount.decrementAndGet()
+      }
     }
   }
 
@@ -179,5 +314,48 @@ class HttpRequestHandler(
     response.headers().set("Retry-After", "5")
     response.headers().set(HttpHeaderNames.CONNECTION, "close")
     ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE)
+  }
+
+  /**
+   * Sends a JSON error response with the given HTTP status and body.
+   * Used for synchronous error paths (routing errors, translation errors, etc.)
+   */
+  private[network] def sendErrorResponse(
+    ctx: ChannelHandlerContext,
+    status: HttpResponseStatus,
+    jsonBody: String
+  ): Unit = {
+    val body = jsonBody.getBytes(StandardCharsets.UTF_8)
+    val response = new DefaultFullHttpResponse(
+      HttpVersion.HTTP_1_1,
+      status,
+      Unpooled.wrappedBuffer(body))
+    response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json")
+    response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length)
+    ctx.writeAndFlush(response)
+  }
+
+  /**
+   * Minimal JSON string escaping for error messages embedded in JSON strings.
+   * Escapes backslash, double-quote, and control characters.
+   */
+  private def escapeJson(s: String): String = {
+    if (s == null) return "null"
+    val sb = new StringBuilder(s.length)
+    var i = 0
+    while (i < s.length) {
+      val c = s.charAt(i)
+      c match {
+        case '"' => sb.append("\\\"")
+        case '\\' => sb.append("\\\\")
+        case '\n' => sb.append("\\n")
+        case '\r' => sb.append("\\r")
+        case '\t' => sb.append("\\t")
+        case _ if c < 0x20 => sb.append(f"\\u${c.toInt}%04x")
+        case _ => sb.append(c)
+      }
+      i += 1
+    }
+    sb.toString()
   }
 }

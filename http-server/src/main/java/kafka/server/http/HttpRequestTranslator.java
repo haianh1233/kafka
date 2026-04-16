@@ -230,7 +230,9 @@ public final class HttpRequestTranslator {
             buildFetchPartitionData(partitions, topicName, maxBytesPerPartition);
 
         // Build and serialize FetchRequest
-        short version = ApiKeys.FETCH.latestVersion();
+        // Use version 12 (not 13+) because version 13 (KIP-516) replaces topic names with
+        // topic IDs. HTTP requests use topic names, so we need a version that supports names.
+        short version = (short) Math.min(12, ApiKeys.FETCH.latestVersion());
         FetchRequest.Builder builder = FetchRequest.Builder.forConsumer(
             version, maxWaitMs, minBytes, fetchData);
         builder.setMaxBytes(maxBytes);
@@ -338,7 +340,10 @@ public final class HttpRequestTranslator {
         data.setTopicData(new ProduceRequestData.TopicProduceDataCollection(
             Collections.singletonList(topicData).iterator()));
 
-        short version = ApiKeys.PRODUCE.latestVersion();
+        // Use version 9 because later versions may have features the HTTP layer
+        // doesn't fully support (e.g., version 13 replaces topic names with topic IDs).
+        // Version 9 is the first flexible version with full topic name support.
+        short version = 9;
         ProduceRequest request = ProduceRequest.builder(data).build(version);
         ByteBuffer buffer = request.serialize().buffer();
 
