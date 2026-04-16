@@ -50,13 +50,13 @@ import org.apache.kafka.common.utils.Time
  * // Time: Created - TASK-B.03
  */
 class HttpAcceptor(
-    endpoint: Endpoint,
+    val endpoint: Endpoint,
     numWorkerThreads: Int,
     httpRequestMaxBytes: Int,
     httpConnectionIdleTimeoutMs: Long,
     time: Time,
     corsAllowedOrigins: String = ""
-) extends Closeable with Logging {
+) extends Closeable with HttpAcceptorLike with Logging {
 
   /**
    * No-arg constructor for use in tests where only accepting/pending state tracking is needed

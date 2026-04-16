@@ -16,6 +16,7 @@
  */
 package kafka.server.http;
 
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelPipeline;
@@ -35,6 +36,7 @@ import org.slf4j.LoggerFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 /**
  * ALPN-based protocol negotiation handler for HTTPS listeners.
@@ -47,8 +49,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * </ul>
  *
  * HTTP/2 uses child channels per stream, so each stream gets its own
- * {@link HttpRequestHandler} instance. HTTP/1.1 is the same as the
- * existing pipeline from TASK-B.03.
+ * request handler instance via the supplied factory. HTTP/1.1 is the same
+ * as the existing pipeline from TASK-B.03.
+ *
+ * // Time: Modified - TASK-0.02 (use handler factory instead of direct HttpRequestHandler construction)
  */
 public class HttpProtocolNegotiationHandler extends ApplicationProtocolNegotiationHandler {
 
@@ -59,15 +63,43 @@ public class HttpProtocolNegotiationHandler extends ApplicationProtocolNegotiati
     private final HttpMetrics httpMetrics;
     private final int maxContentLength;
     private final long connectionIdleTimeoutMs;
+    private final Supplier<ChannelHandler> requestHandlerFactory;
 
     /**
-     * Create a new ALPN-based protocol negotiation handler.
+     * Create a new ALPN-based protocol negotiation handler with a request handler factory.
      *
-     * @param draining          flag indicating whether the server is draining (rejecting new requests)
-     * @param inFlightCount     counter tracking in-flight requests
-     * @param httpMetrics       metrics recorder for the HTTP layer
-     * @param maxContentLength  maximum allowed HTTP request body size in bytes
-     * @param connectionIdleTimeoutMs  idle timeout for connections in milliseconds
+     * @param draining                flag indicating whether the server is draining
+     * @param inFlightCount           counter tracking in-flight requests
+     * @param httpMetrics             metrics recorder for the HTTP layer
+     * @param maxContentLength        maximum allowed HTTP request body size in bytes
+     * @param connectionIdleTimeoutMs idle timeout for connections in milliseconds
+     * @param requestHandlerFactory   factory that creates a new ChannelHandler for each pipeline
+     */
+    public HttpProtocolNegotiationHandler(
+            AtomicBoolean draining,
+            AtomicInteger inFlightCount,
+            HttpMetrics httpMetrics,
+            int maxContentLength,
+            long connectionIdleTimeoutMs,
+            Supplier<ChannelHandler> requestHandlerFactory) {
+        super(ApplicationProtocolNames.HTTP_1_1);  // fallback protocol
+        this.draining = draining;
+        this.inFlightCount = inFlightCount;
+        this.httpMetrics = httpMetrics;
+        this.maxContentLength = maxContentLength;
+        this.connectionIdleTimeoutMs = connectionIdleTimeoutMs;
+        this.requestHandlerFactory = requestHandlerFactory;
+    }
+
+    /**
+     * Backward-compatible constructor without request handler factory.
+     * The factory defaults to throwing UnsupportedOperationException.
+     *
+     * @param draining                flag indicating whether the server is draining
+     * @param inFlightCount           counter tracking in-flight requests
+     * @param httpMetrics             metrics recorder for the HTTP layer
+     * @param maxContentLength        maximum allowed HTTP request body size in bytes
+     * @param connectionIdleTimeoutMs idle timeout for connections in milliseconds
      */
     public HttpProtocolNegotiationHandler(
             AtomicBoolean draining,
@@ -75,12 +107,11 @@ public class HttpProtocolNegotiationHandler extends ApplicationProtocolNegotiati
             HttpMetrics httpMetrics,
             int maxContentLength,
             long connectionIdleTimeoutMs) {
-        super(ApplicationProtocolNames.HTTP_1_1);  // fallback protocol
-        this.draining = draining;
-        this.inFlightCount = inFlightCount;
-        this.httpMetrics = httpMetrics;
-        this.maxContentLength = maxContentLength;
-        this.connectionIdleTimeoutMs = connectionIdleTimeoutMs;
+        this(draining, inFlightCount, httpMetrics, maxContentLength, connectionIdleTimeoutMs,
+            () -> {
+                throw new UnsupportedOperationException(
+                    "requestHandlerFactory must be provided");
+            });
     }
 
     @Override
@@ -102,13 +133,7 @@ public class HttpProtocolNegotiationHandler extends ApplicationProtocolNegotiati
      * Configure HTTP/2 pipeline.
      *
      * Uses {@link Http2MultiplexHandler} which creates a child channel per stream.
-     * Each child channel gets its own {@link HttpRequestHandler} via the initializer.
-     *
-     * Pipeline:
-     * <pre>
-     *   Http2FrameCodec -> Http2MultiplexHandler -> (per-stream child channel):
-     *     Http2StreamFrameToHttpObjectCodec -> HttpObjectAggregator -> HttpRequestHandler
-     * </pre>
+     * Each child channel gets its own request handler via the factory.
      */
     void configureH2Pipeline(ChannelPipeline pipeline) {
         pipeline.addLast("h2-frame-codec",
@@ -119,33 +144,22 @@ public class HttpProtocolNegotiationHandler extends ApplicationProtocolNegotiati
                 @Override
                 protected void initChannel(io.netty.channel.Channel ch) {
                     ChannelPipeline streamPipeline = ch.pipeline();
-                    // Convert HTTP/2 frames to HttpRequest/HttpResponse objects
                     streamPipeline.addLast("h2-to-http",
                         new Http2StreamFrameToHttpObjectCodec(true));
-                    // Aggregate to FullHttpRequest
                     streamPipeline.addLast("http-aggregator",
                         new HttpObjectAggregator(maxContentLength));
-                    // Reuse the same HttpRequestHandler (one per stream)
                     streamPipeline.addLast("kafka-handler",
-                        new HttpRequestHandler(draining, inFlightCount,
-                            httpMetrics, maxContentLength));
+                        requestHandlerFactory.get());
                 }
             }));
 
-        // Idle timeout on the parent connection (not per-stream)
         pipeline.addLast("idle-handler", new IdleStateHandler(
             0, 0, connectionIdleTimeoutMs, TimeUnit.MILLISECONDS));
         pipeline.addLast("idle-closer", new IdleStateCloseHandler(httpMetrics));
     }
 
     /**
-     * Configure HTTP/1.1 pipeline (same as existing HttpChannelInitializer plaintext path).
-     *
-     * Pipeline:
-     * <pre>
-     *   HttpServerCodec -> HttpObjectAggregator -> HttpContentCompressor
-     *     -> IdleStateHandler -> IdleStateCloseHandler -> HttpRequestHandler
-     * </pre>
+     * Configure HTTP/1.1 pipeline.
      */
     void configureHttp11Pipeline(ChannelPipeline pipeline) {
         pipeline.addLast("http-codec", new HttpServerCodec());
@@ -156,7 +170,6 @@ public class HttpProtocolNegotiationHandler extends ApplicationProtocolNegotiati
             0, 0, connectionIdleTimeoutMs, TimeUnit.MILLISECONDS));
         pipeline.addLast("idle-closer", new IdleStateCloseHandler(httpMetrics));
         pipeline.addLast("kafka-handler",
-            new HttpRequestHandler(draining, inFlightCount,
-                httpMetrics, maxContentLength));
+            requestHandlerFactory.get());
     }
 }

@@ -16,13 +16,15 @@
  */
 package kafka.network
 
-import io.netty.channel.{ChannelInitializer, ChannelPipeline}
+import io.netty.channel.{ChannelHandler, ChannelInitializer, ChannelPipeline}
 import io.netty.channel.socket.SocketChannel
 import io.netty.handler.codec.http._
 import io.netty.handler.codec.http.cors.{CorsConfig, CorsConfigBuilder, CorsHandler}
 import io.netty.handler.ssl.SslContext
 import io.netty.handler.timeout.IdleStateHandler
-import kafka.server.http.{HttpMetrics, HttpProtocolNegotiationHandler, HttpRequestHandler, IdleStateCloseHandler}
+import kafka.server.http.{HttpMetrics, HttpProtocolNegotiationHandler, IdleStateCloseHandler}
+import org.apache.kafka.common.security.auth.{KafkaPrincipalBuilder, SecurityProtocol}
+import org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder
 
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
@@ -56,7 +58,9 @@ class HttpChannelInitializer(
   httpMetrics: HttpMetrics,
   maxRequestBytes: Int,
   connectionIdleTimeoutMs: Long,
-  corsAllowedOrigins: String = ""
+  corsAllowedOrigins: String = "",
+  principalBuilder: KafkaPrincipalBuilder = new DefaultKafkaPrincipalBuilder(null, null),
+  securityProtocol: SecurityProtocol = SecurityProtocol.HTTP
 ) extends ChannelInitializer[SocketChannel] {
 
   // Build CORS config once at initialization time, reused for every channel
@@ -69,10 +73,12 @@ class HttpChannelInitializer(
       case Some(ssl) =>
         // HTTPS: TLS + ALPN protocol negotiation (HTTP/2 or HTTP/1.1)
         pipeline.addLast("ssl", ssl.newHandler(ch.alloc()))
+        val handlerFactory: java.util.function.Supplier[ChannelHandler] = () =>
+          new HttpRequestHandler(principalBuilder, securityProtocol, draining, inFlightCount)
         pipeline.addLast("protocol-negotiation",
           new HttpProtocolNegotiationHandler(
             draining, inFlightCount, httpMetrics,
-            maxRequestBytes, connectionIdleTimeoutMs))
+            maxRequestBytes, connectionIdleTimeoutMs, handlerFactory))
 
       case None =>
         // Plaintext HTTP: always HTTP/1.1 (h2c not supported)
@@ -95,7 +101,7 @@ class HttpChannelInitializer(
       0, 0, connectionIdleTimeoutMs, TimeUnit.MILLISECONDS))
     pipeline.addLast("idle-closer", new IdleStateCloseHandler(httpMetrics))
     pipeline.addLast("kafka-handler",
-      new HttpRequestHandler(draining, inFlightCount, httpMetrics, maxRequestBytes))
+      new HttpRequestHandler(principalBuilder, securityProtocol, draining, inFlightCount))
   }
 }
 

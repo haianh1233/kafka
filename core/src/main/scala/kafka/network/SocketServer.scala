@@ -77,7 +77,8 @@ class SocketServer(
   val credentialProvider: CredentialProvider,
   val apiVersionManager: ApiVersionManager,
   val socketFactory: ServerSocketFactory = ServerSocketFactory.INSTANCE,
-  val connectionDisconnectListeners: Seq[ConnectionDisconnectListener] = Seq.empty
+  val connectionDisconnectListeners: Seq[ConnectionDisconnectListener] = Seq.empty,
+  val httpAcceptorFactory: (Endpoint, Time) => HttpAcceptorLike = null
 ) extends Logging with BrokerReconfigurable {
   // Changing the package or class name may cause incompatibility with existing code and metrics configuration
   private val metricsPackage = "kafka.network"
@@ -103,7 +104,7 @@ class SocketServer(
 
   // HTTP acceptors (separate from binary DataPlaneAcceptors — different types)
   // Time: Update - TASK-B.06
-  private[network] val httpAcceptors = new ConcurrentHashMap[Endpoint, HttpAcceptor]()
+  private[network] val httpAcceptors = new ConcurrentHashMap[Endpoint, HttpAcceptorLike]()
 
   private[this] val nextProcessorId: AtomicInteger = new AtomicInteger(0)
   val connectionQuotas = new ConnectionQuotas(config, time, metrics)
@@ -219,7 +220,7 @@ class SocketServer(
             acc.startup()
           } catch {
             case ex: Exception =>
-              error(s"Failed to start HTTP acceptor for ${acc.endPoint.listener}", ex)
+              error(s"Failed to start HTTP acceptor for ${acc.endpoint.listener}", ex)
               acc.startedFuture.completeExceptionally(ex)
           }
         }
@@ -250,11 +251,12 @@ class SocketServer(
 
     endpoint.securityProtocol() match {
       case SecurityProtocol.HTTP | SecurityProtocol.HTTPS =>
-        // HTTP/HTTPS endpoint — create HttpAcceptor (Netty-based)
-        val httpProcessorId = nextProcessorId()
-        val httpProcessor = new HttpProcessor(httpProcessorId)
-        val httpAcceptor = new HttpAcceptor(
-          this, endpoint, config, dataPlaneRequestChannel, httpProcessor, time)
+        // HTTP/HTTPS endpoint — create HttpAcceptor (Netty-based) via factory
+        if (httpAcceptorFactory == null) {
+          throw new IllegalStateException(
+            s"HTTP listener $listenerName requires httpAcceptorFactory to be set on SocketServer")
+        }
+        val httpAcceptor = httpAcceptorFactory(endpoint, time)
         httpAcceptors.put(endpoint, httpAcceptor)
         info(s"Created HTTP acceptor for endpoint: $listenerName")
 

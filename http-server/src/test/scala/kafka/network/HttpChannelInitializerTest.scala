@@ -20,7 +20,7 @@ import io.netty.channel.embedded.EmbeddedChannel
 import io.netty.handler.codec.http.{HttpContentCompressor, HttpObjectAggregator, HttpServerCodec}
 import io.netty.handler.codec.http.cors.CorsHandler
 import io.netty.handler.timeout.IdleStateHandler
-import kafka.server.http.{HttpMetrics, HttpRequestHandler, IdleStateCloseHandler}
+import kafka.server.http.{HttpMetrics, IdleStateCloseHandler}
 
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Test
