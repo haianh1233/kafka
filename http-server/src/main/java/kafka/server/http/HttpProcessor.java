@@ -227,18 +227,26 @@ public class HttpProcessor implements ResponseProcessor {
                             httpResponse.headers().setInt(HttpHeaderNames.RETRY_AFTER, retryAfterSeconds);
                         }
 
+                        // Update request metrics (same as SocketServer.Processor does for binary protocol)
+                        sendResp.request().responseDequeueTimeNanos_$eq(
+                            org.apache.kafka.common.utils.Time.SYSTEM.nanoseconds());
+                        sendResp.request().updateRequestMetrics(0L, response);
+
                         // Decrement in-flight count after the response is written to the channel.
                         ctx.writeAndFlush(httpResponse).addListener(f -> inFlightCount.decrementAndGet());
                     } else {
                         log.debug("Channel closed before response could be sent: {}", connectionId);
+                        sendResp.request().updateRequestMetrics(0L, response);
                         inFlightCount.decrementAndGet();
                     }
                     channels.remove(connectionId);
 
                 } else if (response instanceof RequestChannel.NoOpResponse) {
+                    response.request().updateRequestMetrics(0L, response);
                     sendNoContentResponse(connectionId);
 
                 } else if (response instanceof RequestChannel.CloseConnectionResponse) {
+                    response.request().updateRequestMetrics(0L, response);
                     ChannelHandlerContext ctx = channels.remove(connectionId);
                     if (ctx != null) {
                         ctx.close();

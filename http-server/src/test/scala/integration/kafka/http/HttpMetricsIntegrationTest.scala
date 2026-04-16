@@ -57,17 +57,6 @@ class HttpMetricsIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   /**
-   * Find a metric by name substring in the Yammer metrics registry.
-   * Returns the first matching metric or None.
-   */
-  private def findMetric(nameSubstring: String): Option[(MetricName, Any)] = {
-    val registry = KafkaYammerMetrics.defaultRegistry()
-    registry.allMetrics().asScala.find { case (name, _) =>
-      name.toString.contains(nameSubstring)
-    }
-  }
-
-  /**
    * Find all metrics matching a name substring.
    */
   private def findMetrics(nameSubstring: String): Map[MetricName, Any] = {
@@ -78,14 +67,11 @@ class HttpMetricsIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   /**
-   * Get the count from a Meter metric.
+   * Get the count from a Meter metric, searching all metrics for a Meter that matches.
    */
   private def getMeterCount(nameSubstring: String): Option[Long] = {
-    findMetric(nameSubstring).flatMap { case (_, metric) =>
-      metric match {
-        case m: Meter => Some(m.count())
-        case _ => None
-      }
+    findMetrics(nameSubstring).collectFirst {
+      case (_, m: Meter) => m.count()
     }
   }
 
@@ -103,6 +89,9 @@ class HttpMetricsIntegrationTest extends HttpIntegrationTestHarness {
 
     assertEquals(200, response.status,
       s"Produce should succeed, got ${response.status}")
+
+    // Wait briefly for async metric update from the HTTP response drainer thread
+    Thread.sleep(500)
 
     // Check that produce-related metrics incremented
     // Look for RequestsPerSec with request=Produce
@@ -143,6 +132,9 @@ class HttpMetricsIntegrationTest extends HttpIntegrationTestHarness {
 
     assertEquals(200, response.status,
       s"Consume should succeed, got ${response.status}")
+
+    // Wait briefly for async metric update from the HTTP response drainer thread
+    Thread.sleep(500)
 
     // Check that fetch-related metrics incremented
     val afterCount = getMeterCount("Fetch").getOrElse(0L)
