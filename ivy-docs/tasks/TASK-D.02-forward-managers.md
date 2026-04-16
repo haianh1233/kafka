@@ -840,33 +840,47 @@ class FetchForwardManagerTest {
 
 ## Learning
 
-_To be filled by the executing agent._
+1. **`KafkaConfig` is a Scala class** (`kafka.server.KafkaConfig`), not available as `org.apache.kafka.server.config.KafkaConfig` in Java. The Java base class is `AbstractKafkaConfig` in `server/src/main/java/org/apache/kafka/server/config/AbstractKafkaConfig.java`, which provides `interBrokerListenerName()`, `interBrokerSecurityProtocol()`, `brokerId()`, `requestTimeoutMs()`, `connectionsMaxIdleMs()`, `socketReceiveBufferBytes()`, `connectionSetupTimeoutMs()`, and `connectionSetupTimeoutMaxMs()`.
+2. **`saslMechanismInterBrokerProtocol()`** is only on the Scala KafkaConfig. In Java, use `config.getString(BrokerSecurityConfigs.SASL_MECHANISM_INTER_BROKER_PROTOCOL_CONFIG)` instead.
+3. **`httpInternalForwardingQueueSize()`** does not exist on any config class. The queue size constant is defined in `org.apache.kafka.network.HttpServerConfigs.HTTP_INTERNAL_FORWARDING_QUEUE_SIZE_DEFAULT` but there is no accessor method. Solution: pass `queueCapacity` as a separate constructor parameter.
+4. **`NetworkClient` constructors** all require a `MetadataRecoveryStrategy` parameter (added after the TransactionMarkerChannelManager pattern was documented). Use `MetadataRecoveryStrategy.NONE`.
+5. **Testing managers with NetworkClient**: Since `buildNetworkClient()` creates real network objects, extract thread creation into a package-private `createThread()` method that tests can override via `Mockito.spy()` + `doReturn()`.
 
 ## Limitations
 
-_To be filled by the executing agent._
+1. **No integration test with real network**: Tests mock the `createThread()` method, so they validate lifecycle management (creation, reuse, cleanup, shutdown) but not actual network forwarding. Full integration is covered by TASK-C.03 and TASK-E.04.
+2. **Checkstyle import-control conflict**: The `import-control-http-server.xml` had a merge conflict between two worktrees. Resolved by merging both sets of allowed imports and adding `org.apache.kafka.metadata`.
+3. **Duplicate `project(':http-server')` blocks** in `build.gradle`: The first block (line ~1568) has more dependencies including `:core`, `:server`, netty, jackson. The second block (line ~2290) is more minimal. Gradle merges both additively. Added `:metadata` and `:storage:storage-api` to the first block for explicit dependency clarity.
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- The skeleton code in the task file references `ProduceForwardThread.PartitionResponse` but the actual D.01 implementation uses `ProduceResponse.PartitionResponse` directly. Adapted the manager's `forward()` return type to match.
+- `InterBrokerSendThread.initiateShutdown()` returns `boolean` (not void), which matters when setting up mock expectations.
+- `ShutdownableThread.awaitShutdown()` throws `InterruptedException`, requiring `close()` to handle it per thread.
+- The `FetchForwardManager` reuses `ProduceForwardManager.BrokerNotFoundException` rather than defining its own, keeping the exception type shared.
 
 ## Acceptance Criteria
 
-- [ ] `ProduceForwardManager` compiles and implements `Closeable`.
-- [ ] `FetchForwardManager` compiles and implements `Closeable`.
-- [ ] `forward()` creates a thread on first call per broker ID.
-- [ ] `forward()` reuses existing threads for repeat calls to same broker.
-- [ ] `forward()` throws `BrokerNotFoundException` for unknown brokers.
-- [ ] `cleanupStaleThreads()` removes threads for dead brokers.
-- [ ] `cleanupStaleThreads()` removes threads for relocated brokers (address changed).
-- [ ] `close()` shuts down all threads and clears the map.
-- [ ] `NetworkClient` construction follows `TransactionMarkerChannelManager` pattern.
-- [ ] Thread names include broker IDs.
-- [ ] `activeThreadCount()` returns correct count.
-- [ ] All unit tests pass.
+- [x] `ProduceForwardManager` compiles and implements `Closeable`.
+- [x] `FetchForwardManager` compiles and implements `Closeable`.
+- [x] `forward()` creates a thread on first call per broker ID.
+- [x] `forward()` reuses existing threads for repeat calls to same broker.
+- [x] `forward()` throws `BrokerNotFoundException` for unknown brokers.
+- [x] `cleanupStaleThreads()` removes threads for dead brokers.
+- [x] `cleanupStaleThreads()` removes threads for relocated brokers (address changed).
+- [x] `close()` shuts down all threads and clears the map.
+- [x] `NetworkClient` construction follows `TransactionMarkerChannelManager` pattern.
+- [x] Thread names include broker IDs.
+- [x] `activeThreadCount()` returns correct count.
+- [x] All unit tests pass (16/16: 8 ProduceForwardManagerTest + 8 FetchForwardManagerTest).
 
 ## File Manifest
 
 | File | Action | Description |
 |------|--------|-------------|
-| | | |
+| `http-server/src/main/java/kafka/server/http/ProduceForwardManager.java` | Created | Per-broker thread pool manager for produce forwarding |
+| `http-server/src/main/java/kafka/server/http/FetchForwardManager.java` | Created | Per-broker thread pool manager for fetch forwarding |
+| `http-server/src/test/java/kafka/server/http/ProduceForwardManagerTest.java` | Created | 8 unit tests for ProduceForwardManager |
+| `http-server/src/test/java/kafka/server/http/FetchForwardManagerTest.java` | Created | 8 unit tests for FetchForwardManager |
+| `checkstyle/import-control-http-server.xml` | Modified | Resolved merge conflict, added org.apache.kafka.metadata |
+| `build.gradle` | Modified | Added :metadata and :storage:storage-api dependencies to http-server |
