@@ -382,6 +382,21 @@ class RequestChannel(val queueSize: Int,
     requestQueue.put(request)
   }
 
+  // Time: Update - TASK-A.03
+  /**
+   * Attempt to enqueue a request without blocking. Returns true if the request was
+   * accepted, false if the queue is full. This is used by the HTTP listener (Netty)
+   * where blocking would stall the event loop and cause head-of-line blocking across
+   * all HTTP connections on that worker thread.
+   *
+   * Callers that receive false should return an immediate error response (e.g. HTTP 503)
+   * rather than retrying or blocking.
+   *
+   * @see #sendRequest(RequestChannel.Request) for the blocking variant used by the binary protocol
+   */
+  def tryEnqueue(request: RequestChannel.Request): Boolean =
+    requestQueue.offer(request)
+
   def closeConnection(
     request: RequestChannel.Request,
     errorCounts: java.util.Map[Errors, Integer]
