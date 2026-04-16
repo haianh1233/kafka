@@ -1565,6 +1565,32 @@ project(':group-coordinator') {
   srcJar.dependsOn 'processMessages'
 }
 
+project(':http-server') {
+  base {
+    archivesName = "kafka-http-server"
+  }
+
+  dependencies {
+    implementation project(':core')
+    implementation project(':clients')
+    implementation project(':server-common')
+    implementation project(':server')
+
+    implementation libs.nettyAll
+    implementation libs.jacksonDatabind
+    implementation libs.slf4jApi
+
+    testImplementation project(':core').sourceSets.test.output
+    testImplementation project(':clients').sourceSets.test.output
+    testImplementation project(':server-common').sourceSets.test.output
+
+    testImplementation libs.mockitoCore
+    testImplementation libs.junitJupiter
+    testImplementation testLog4j2Libs
+
+    testRuntimeOnly runtimeTestLibs
+  }
+}
 
 project(':test-common:test-common-internal-api') {
   // Interfaces, config classes, and other test APIs. Java 17 is the minimum Java version.
