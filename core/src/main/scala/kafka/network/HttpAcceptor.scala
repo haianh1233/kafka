@@ -57,6 +57,9 @@ trait HttpAcceptorLike {
    */
   def awaitDrain(timeoutMs: Long): Unit
 
+  /** Returns the actual bound port (-1 if not yet started). */
+  def boundPort: Int
+
   /** Close this acceptor and release all resources. */
   def close(): Unit
 

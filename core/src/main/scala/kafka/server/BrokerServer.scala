@@ -274,13 +274,49 @@ class BrokerServer(
       // Create and start the socket server acceptor threads so that the bound port is known.
       // Delay starting processors until the end of the initialization sequence to ensure
       // that credentials have been loaded before processing authentications.
+      // Time: Update - E2E fix: wire real HttpAcceptor factory into SocketServer
+      // Uses reflection to avoid compile-time dependency on http-server module
+      // (core cannot depend on http-server due to circular dependency)
+      val httpFactory: (org.apache.kafka.common.Endpoint, org.apache.kafka.common.utils.Time) => kafka.network.HttpAcceptorLike = {
+        (ep, t) =>
+          try {
+            val clazz = Class.forName("kafka.network.HttpAcceptor")
+            val ctor = clazz.getConstructor(
+              classOf[org.apache.kafka.common.Endpoint],
+              classOf[Int],
+              classOf[Int],
+              classOf[Long],
+              classOf[org.apache.kafka.common.utils.Time],
+              classOf[String],
+              classOf[Int],
+              classOf[String]
+            )
+            ctor.newInstance(
+              ep,
+              Int.box(config.getInt(org.apache.kafka.network.HttpServerConfigs.NUM_HTTP_NETWORK_THREADS_CONFIG)),
+              Int.box(config.getInt(org.apache.kafka.network.HttpServerConfigs.HTTP_REQUEST_MAX_BYTES_CONFIG)),
+              Long.box(config.getLong(org.apache.kafka.network.HttpServerConfigs.HTTP_CONNECTION_IDLE_TIMEOUT_MS_CONFIG)),
+              t,
+              config.getString(org.apache.kafka.network.HttpServerConfigs.HTTP_CORS_ALLOWED_ORIGINS_CONFIG),
+              Int.box(config.nodeId),
+              clusterId
+            ).asInstanceOf[kafka.network.HttpAcceptorLike]
+          } catch {
+            case e: ClassNotFoundException =>
+              throw new IllegalStateException(
+                "HTTP listener configured but http-server module not on classpath. " +
+                "Add the http-server module to the broker runtime.", e)
+          }
+      }
+
       socketServer = new SocketServer(config,
         metrics,
         time,
         credentialProvider,
         apiVersionManager,
         sharedServer.socketFactory,
-        connectionDisconnectListeners)
+        connectionDisconnectListeners,
+        httpFactory)
 
       clientQuotaMetadataManager = new ClientQuotaMetadataManager(quotaManagers, socketServer.connectionQuotas)
 

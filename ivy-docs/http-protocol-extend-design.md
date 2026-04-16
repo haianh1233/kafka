@@ -137,15 +137,28 @@ via WebSocket subscription. Or manage routing via REST, subscribe via WebSocket.
 - Zero new ports — WebSocket upgrade on existing HTTP listener
 - Publisher confirms over WebSocket
 - Wire-compatible with browser `WebSocket` API and standard WebSocket libraries
+- Passive declare (assert-exists without creating) for exchanges and queues
+- Virtual host support (multi-tenancy via namespace isolation)
+- Alternate exchange routing fallback
+- Server-initiated consumer cancel notification (queue deleted, exclusive eviction)
+- Basic.Get equivalent (pull one message from a queue)
+- All 13 AMQP content properties preserved (including content-encoding, type, user-id)
+- Unacked message requeue on consumer disconnect (at-least-once guarantee)
 
 ### Non-Goals
 
+- AMQP transactions (`Tx.Select`/`Tx.Commit`/`Tx.Rollback`) — Kafka transactions are a
+  fundamentally different model; if needed, use the Kafka binary protocol with transactional
+  producers. May be added as a future phase if demand warrants.
 - Binary WebSocket frames (JSON only — keep it debuggable; binary can be added later)
 - AMQP 0-9-1 wire protocol compatibility (use `amqp091-protocol-design.md` for that)
 - WebSocket Compression Extension (permessage-deflate) in phase 1
 - Consumer group rebalancing over WebSocket (use Kafka consumer groups or share groups)
 - WebSocket multiplexing (one subscription set per connection; open multiple connections for isolation)
 - Admin operations (topic create/delete, ACLs) — use binary protocol / `AdminClient`
+- `Basic.Recover` (redeliver all unacked) — disconnect and reconnect achieves the same effect
+- `noWait` flags — JSON protocol always sends responses for client correlation
+- `immediate` flag on publish — deprecated in AMQP, removed by RabbitMQ 3.0
 
 ---
 

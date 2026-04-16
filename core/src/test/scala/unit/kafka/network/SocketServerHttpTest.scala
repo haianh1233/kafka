@@ -100,6 +100,7 @@ class SocketServerHttpTest {
       override def startup(): Unit = _startedFuture.complete(null)
       override def beginDrain(): Unit = _draining = true
       override def awaitDrain(timeoutMs: Long): Unit = ()
+      override def boundPort: Int = 0
       override def close(): Unit = ()
       override def isDraining: Boolean = _draining
       override def pendingRequestCount: Int = 0

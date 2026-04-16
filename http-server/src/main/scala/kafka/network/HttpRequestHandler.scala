@@ -49,7 +49,9 @@ class HttpRequestHandler(
   principalBuilder: KafkaPrincipalBuilder,
   securityProtocol: SecurityProtocol,
   draining: AtomicBoolean,
-  inFlightCount: AtomicInteger
+  inFlightCount: AtomicInteger,
+  brokerId: Int = -1,
+  clusterId: String = ""
 ) extends SimpleChannelInboundHandler[FullHttpRequest] {
 
   /** Convenience constructor for backward compatibility (no drain support). */
@@ -128,13 +130,42 @@ class HttpRequestHandler(
     inFlightCount.incrementAndGet()
 
     try {
-      buildPrincipal(ctx, req)
-      ctx.fireChannelRead(req.retain())
+      // Health check: respond directly without RequestChannel
+      val uri = req.uri()
+      if (uri == "/v1/health" || uri.startsWith("/v1/health?")) {
+        sendHealthResponse(ctx)
+        return
+      }
+
+      // TODO: Route through HttpRouter → HttpRequestTranslator → RequestChannel → KafkaApis
+      // For now, return 501 Not Implemented for non-health endpoints
+      val body = """{"errorCode":-1,"errorMessage":"HTTP endpoint not yet wired to RequestChannel"}""".getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      val response = new DefaultFullHttpResponse(
+        HttpVersion.HTTP_1_1,
+        HttpResponseStatus.NOT_IMPLEMENTED,
+        Unpooled.wrappedBuffer(body))
+      response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json")
+      response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length)
+      ctx.writeAndFlush(response)
     } catch {
       case e: Exception =>
         inFlightCount.decrementAndGet()
         throw e
+    } finally {
+      inFlightCount.decrementAndGet()
     }
+  }
+
+  private[network] def sendHealthResponse(ctx: ChannelHandlerContext): Unit = {
+    // Health check returns broker state — always RUNNING if we reached here
+    val body = s"""{"status":"RUNNING","brokerId":$brokerId,"clusterId":"$clusterId"}""".getBytes(java.nio.charset.StandardCharsets.UTF_8)
+    val response = new DefaultFullHttpResponse(
+      HttpVersion.HTTP_1_1,
+      HttpResponseStatus.OK,
+      Unpooled.wrappedBuffer(body))
+    response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json")
+    response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length)
+    ctx.writeAndFlush(response)
   }
 
   private[network] def sendDrainingResponse(ctx: ChannelHandlerContext): Unit = {

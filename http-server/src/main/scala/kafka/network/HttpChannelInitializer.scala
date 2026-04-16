@@ -60,7 +60,9 @@ class HttpChannelInitializer(
   connectionIdleTimeoutMs: Long,
   corsAllowedOrigins: String = "",
   principalBuilder: KafkaPrincipalBuilder = new DefaultKafkaPrincipalBuilder(null, null),
-  securityProtocol: SecurityProtocol = SecurityProtocol.HTTP
+  securityProtocol: SecurityProtocol = SecurityProtocol.HTTP,
+  brokerId: Int = -1,
+  clusterId: String = ""
 ) extends ChannelInitializer[SocketChannel] {
 
   // Build CORS config once at initialization time, reused for every channel
@@ -101,7 +103,7 @@ class HttpChannelInitializer(
       0, 0, connectionIdleTimeoutMs, TimeUnit.MILLISECONDS))
     pipeline.addLast("idle-closer", new IdleStateCloseHandler(httpMetrics))
     pipeline.addLast("kafka-handler",
-      new HttpRequestHandler(principalBuilder, securityProtocol, draining, inFlightCount))
+      new HttpRequestHandler(principalBuilder, securityProtocol, draining, inFlightCount, brokerId, clusterId))
   }
 }
 

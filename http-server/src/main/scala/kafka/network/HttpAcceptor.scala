@@ -55,7 +55,9 @@ class HttpAcceptor(
     httpRequestMaxBytes: Int,
     httpConnectionIdleTimeoutMs: Long,
     time: Time,
-    corsAllowedOrigins: String = ""
+    corsAllowedOrigins: String = "",
+    brokerId: Int = -1,
+    clusterId: String = ""
 ) extends Closeable with HttpAcceptorLike with Logging {
 
   /**
@@ -113,19 +115,32 @@ class HttpAcceptor(
         httpMetrics = new kafka.server.http.HttpMetrics(),
         maxRequestBytes = httpRequestMaxBytes,
         connectionIdleTimeoutMs = httpConnectionIdleTimeoutMs,
-        corsAllowedOrigins = corsAllowedOrigins))
+        corsAllowedOrigins = corsAllowedOrigins,
+        brokerId = brokerId,
+        clusterId = clusterId))
 
     val host = if (endpoint.host() == null || endpoint.host().isEmpty) "0.0.0.0" else endpoint.host()
-    val bindFuture = bootstrap.bind(host, endpoint.port())
-    bindFuture.addListener { future: io.netty.util.concurrent.Future[_ >: Void] =>
-      if (future.isSuccess) {
-        serverChannel = bindFuture.channel()
-        startedFuture.complete(null)
-        info(s"HTTP acceptor started on $host:${endpoint.port()}")
-      } else {
-        startedFuture.completeExceptionally(future.cause())
-      }
+    try {
+      // Bind synchronously so boundPort() is available immediately after startup()
+      val channelFuture = bootstrap.bind(host, endpoint.port()).sync()
+      serverChannel = channelFuture.channel()
+      startedFuture.complete(null)
+      val actualPort = serverChannel.localAddress().asInstanceOf[java.net.InetSocketAddress].getPort
+      info(s"HTTP acceptor started on $host:$actualPort")
+    } catch {
+      case e: Exception =>
+        startedFuture.completeExceptionally(e)
+        throw e
     }
+  }
+
+  /**
+   * Returns the actual port the server is bound to. Useful when endpoint port is 0 (random).
+   * Must be called after startup() completes.
+   */
+  def boundPort: Int = {
+    if (serverChannel == null) -1
+    else serverChannel.localAddress().asInstanceOf[java.net.InetSocketAddress].getPort
   }
 
   /**

@@ -257,8 +257,11 @@ class SocketServer(
             s"HTTP listener $listenerName requires httpAcceptorFactory to be set on SocketServer")
         }
         val httpAcceptor = httpAcceptorFactory(endpoint, time)
+        // Bind immediately so boundPort() is available (unlike binary acceptors
+        // which bind in the constructor, Netty binds in startup())
+        httpAcceptor.startup()
         httpAcceptors.put(endpoint, httpAcceptor)
-        info(s"Created HTTP acceptor for endpoint: $listenerName")
+        info(s"Created and started HTTP acceptor for endpoint: $listenerName (port=${httpAcceptor.boundPort})")
 
       case _ =>
         // Binary protocol: existing DataPlaneAcceptor path (UNCHANGED)
@@ -325,13 +328,21 @@ class SocketServer(
     info("Shutdown completed")
   }
 
+  // Time: Update - E2E fix: check httpAcceptors in addition to dataPlaneAcceptors
   def boundPort(listenerName: ListenerName): Int = {
     try {
-      val acceptor = dataPlaneAcceptors.get(endpoints(listenerName))
+      val endpoint = endpoints(listenerName)
+      val acceptor = dataPlaneAcceptors.get(endpoint)
       if (acceptor != null) {
         acceptor.localPort
       } else {
-        throw new KafkaException("Could not find listenerName : " + listenerName + " in data-plane.")
+        // Check HTTP acceptors
+        val httpAcceptor = httpAcceptors.get(endpoint)
+        if (httpAcceptor != null) {
+          httpAcceptor.boundPort
+        } else {
+          throw new KafkaException("Could not find listenerName : " + listenerName + " in data-plane or HTTP acceptors.")
+        }
       }
     } catch {
       case e: Exception =>

@@ -111,14 +111,25 @@ abstract class HttpIntegrationTestHarness extends IntegrationTestHarness {
     val broker = brokers.find(_.config.brokerId == brokerId)
       .getOrElse(throw new IllegalArgumentException(s"No broker with id $brokerId"))
 
-    // Find the HTTP endpoint from the broker's configured listeners
-    val httpEndpoint = broker.config.listeners
-      .find(ep => ep.listener().equalsIgnoreCase("HTTP"))
-      .getOrElse(throw new IllegalStateException(
-        s"No HTTP listener configured on broker $brokerId"))
+    // Read the actual bound port from the HTTP acceptor (handles port=0 random assignment)
+    val socketServer = broker.socketServer
+    val httpAcceptors = socketServer.getClass.getDeclaredField("httpAcceptors")
+    httpAcceptors.setAccessible(true)
+    val acceptorsMap = httpAcceptors.get(socketServer)
+      .asInstanceOf[java.util.concurrent.ConcurrentHashMap[org.apache.kafka.common.Endpoint, kafka.network.HttpAcceptorLike]]
 
-    val port = httpEndpoint.port()
-    s"http://localhost:$port"
+    if (acceptorsMap.isEmpty) {
+      // Fallback: read from configured listeners (pre-wiring state)
+      val httpEndpoint = broker.config.listeners
+        .find(ep => ep.listener().equalsIgnoreCase("HTTP"))
+        .getOrElse(throw new IllegalStateException(
+          s"No HTTP listener configured on broker $brokerId"))
+      s"http://localhost:${httpEndpoint.port()}"
+    } else {
+      val acceptor = acceptorsMap.values().iterator().next()
+      val port = acceptor.boundPort
+      s"http://localhost:$port"
+    }
   }
 
   /**
