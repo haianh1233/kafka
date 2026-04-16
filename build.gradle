@@ -1085,17 +1085,18 @@ project(':http-server') {
 
   dependencies {
     implementation project(':clients')
-    implementation libs.nettyHandler
-    implementation libs.nettyCodecHttp
-    implementation libs.nettyCodecHttp2
-    implementation libs.nettyTransport
-    implementation libs.nettyBuffer
-    implementation libs.nettyCommon
-    implementation libs.slf4jApi
+    implementation project(':server-common')
+    implementation project(':core')
     implementation libs.scalaLibrary
+    implementation libs.scalaLogging
+    implementation libs.slf4jApi
+    implementation libs.nettyAll
 
+    testImplementation project(':clients').sourceSets.test.output
     testImplementation libs.junitJupiter
     testImplementation libs.mockitoCore
+    testImplementation libs.bcpkix
+    testImplementation libs.nettyAll
     testImplementation testLog4j2Libs
 
     testRuntimeOnly runtimeTestLibs
