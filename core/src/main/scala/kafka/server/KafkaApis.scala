@@ -484,19 +484,247 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   /**
-   * Handles HTTP consume (fetch) requests. Phase 1: delegates to existing handleFetchRequest.
-   * Phase 2 will add fan-out and forwarding via FetchForwardManager.
+   * Handles HTTP consume (fetch) requests -- LOCAL leader path only.
    *
-   * LIMITATION: Phase 1 only works correctly for single-partition requests
-   * where the receiving broker is the partition leader. Multi-partition and
-   * cross-broker requests will fail with LEADER_NOT_AVAILABLE for non-local
-   * partitions. This is expected -- Phase 2 adds proper forwarding.
+   * For partitions where this broker is the leader, delegates to
+   * ReplicaManager.fetchMessages(). For partitions with a remote leader,
+   * returns empty records with LEADER_NOT_AVAILABLE (forwarding added in
+   * TASK-D.04).
    *
-   * // Time: Update - TASK-B.06
+   * Key behavioral differences from handleFetchRequest:
+   *   - effectiveMaxWaitMs = min(request.maxWaitMs, http.consume.max.wait.ms)
+   *   - No leader epoch checks (currentLeaderEpoch = -1)
+   *   - No preferred read replica support
+   *   - No incremental fetch session support
+   *   - Response includes X-Kafka-MaxWait-Applied header via requestLocalProperties
+   *
+   * CRITICAL: This method must NEVER block the KafkaRequestHandler thread.
+   * The response callback from ReplicaManager.fetchMessages() may fire
+   * synchronously (data already available) or asynchronously (via DelayedFetch
+   * purgatory). In both cases, response construction and sending runs on
+   * httpAsyncExecutor per design doc section 14.1.
+   *
+   * @see handleFetchRequest for the binary protocol equivalent
+   * @see <a href="ivy-docs/http-protocol-design.md">Design doc section 6</a>
+   * // Time: Update - TASK-C.02
    */
   private def handleHttpConsumeRequest(request: RequestChannel.Request): Unit = {
-    // Phase 1: delegate to existing handler (local path only)
-    handleFetchRequest(request)
+    val fetchRequest = request.body[FetchRequest]
+    val localBrokerId = config.brokerId
+
+    // ---------------------------------------------------------------
+    // 1. Clamp maxWaitMs per section 6.1
+    //    The translator may have already clamped, but we enforce again
+    //    as defense-in-depth (handler must not trust upstream).
+    // ---------------------------------------------------------------
+    val effectiveMaxWaitMs: Int = Math.min(
+      fetchRequest.maxWait,
+      config.httpConsumeMaxWaitMs // default 5000 ms
+    )
+
+    // Stash for HttpResponseSerializer to emit X-Kafka-MaxWait-Applied header
+    request.requestLocalProperties.put("httpMaxWaitApplied", effectiveMaxWaitMs.asInstanceOf[AnyRef])
+
+    // ---------------------------------------------------------------
+    // 2. Resolve topic names from IDs (same pattern as handleFetchRequest)
+    // ---------------------------------------------------------------
+    val topicNames: util.Map[Uuid, String] =
+      if (fetchRequest.version() >= 13)
+        metadataCache.topicIdsToNames()
+      else
+        Collections.emptyMap[Uuid, String]()
+
+    val fetchData = fetchRequest.fetchData(topicNames)
+
+    // ---------------------------------------------------------------
+    // 3. Authorization: READ on each topic
+    // ---------------------------------------------------------------
+    val erroneous = mutable.ArrayBuffer[(TopicIdPartition, FetchResponseData.PartitionData)]()
+    val interesting = mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]()
+    val leaderNotAvailable = mutable.ArrayBuffer[(TopicIdPartition, FetchResponseData.PartitionData)]()
+
+    val partitionDatas = new mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]
+    fetchData.forEach { (topicIdPartition, partitionData) =>
+      if (topicIdPartition.topic == null) {
+        erroneous += topicIdPartition ->
+          FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_ID)
+      } else {
+        partitionDatas += topicIdPartition -> partitionData
+      }
+    }
+
+    val authorizedTopics = authHelper.filterByAuthorized(
+      request.context, READ, TOPIC, partitionDatas
+    )(_._1.topicPartition.topic)
+
+    partitionDatas.foreach { case (topicIdPartition, data) =>
+      if (!authorizedTopics.contains(topicIdPartition.topic)) {
+        erroneous += topicIdPartition ->
+          FetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
+      } else if (!metadataCache.contains(topicIdPartition.topicPartition)) {
+        erroneous += topicIdPartition ->
+          FetchResponse.partitionResponse(topicIdPartition, Errors.UNKNOWN_TOPIC_OR_PARTITION)
+      } else {
+        // ---------------------------------------------------------------
+        // 4. Leader check: same pattern as handleHttpProduceRequest (C.01)
+        //    Use metadataCache.getLeaderAndIsr to determine if this broker
+        //    is the partition leader.
+        // ---------------------------------------------------------------
+        val isLocal = OptionConverters.toScala(metadataCache.getLeaderAndIsr(
+          topicIdPartition.topicPartition.topic,
+          topicIdPartition.topicPartition.partition
+        )).exists(_.leader == localBrokerId)
+
+        if (isLocal) {
+          interesting += topicIdPartition -> data
+        } else {
+          // Phase C: no forwarding yet -- return LEADER_NOT_AVAILABLE with empty records
+          // Phase D (TASK-D.04) will replace this with actual forwarding
+          leaderNotAvailable += topicIdPartition ->
+            FetchResponse.partitionResponse(topicIdPartition, Errors.LEADER_NOT_AVAILABLE)
+        }
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // 5. Response callback -- merges local results with errors
+    //    This callback fires when data is available or maxWaitMs expires
+    //    (via DelayedFetch purgatory). It may fire synchronously if data
+    //    is already available, or asynchronously from the purgatory thread.
+    //    In both cases we wrap in CompletableFuture and merge/send on
+    //    httpAsyncExecutor.
+    // ---------------------------------------------------------------
+    val localFuture = new CompletableFuture[Seq[(TopicIdPartition, FetchPartitionData)]]()
+
+    def processResponseCallback(
+      responsePartitionData: Seq[(TopicIdPartition, FetchPartitionData)]
+    ): Unit = {
+      localFuture.complete(responsePartitionData)
+    }
+
+    def sendMergedResponse(
+      responsePartitionData: Seq[(TopicIdPartition, FetchPartitionData)]
+    ): Unit = {
+      val partitions = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]
+
+      // Convert local fetch results
+      responsePartitionData.foreach { case (topicIdPartition, data) =>
+        val partitionData = new FetchResponseData.PartitionData()
+          .setPartitionIndex(topicIdPartition.partition)
+          .setErrorCode(data.error.code)
+          .setHighWatermark(data.highWatermark)
+          .setLastStableOffset(data.lastStableOffset.orElse(FetchResponse.INVALID_LAST_STABLE_OFFSET))
+          .setLogStartOffset(data.logStartOffset)
+          .setAbortedTransactions(data.abortedTransactions.orElse(null))
+          .setRecords(data.records)
+          // No preferred read replica for HTTP (section 6.6)
+          .setPreferredReadReplica(FetchResponse.INVALID_PREFERRED_REPLICA_ID)
+        partitions.put(topicIdPartition, partitionData)
+      }
+
+      // Add erroneous partitions (unauthorized, unknown topic)
+      erroneous.foreach { case (tp, data) => partitions.put(tp, data) }
+
+      // Add leader-not-available partitions (remote leaders, pending TASK-D.04)
+      leaderNotAvailable.foreach { case (tp, data) => partitions.put(tp, data) }
+
+      // Quota handling (same pattern as handleFetchRequest for consumers)
+      val timeMs = time.milliseconds()
+      val responseSize = partitions.values().asScala
+        .map(p => if (p.records != null) p.records.sizeInBytes else 0)
+        .sum
+      val requestThrottleTimeMs = quotas.request.maybeRecordAndGetThrottleTimeMs(request, timeMs)
+      val bandwidthThrottleTimeMs = quotas.fetch.maybeRecordAndGetThrottleTimeMs(
+        request.session, request.header.clientId(), responseSize, timeMs)
+      val maxThrottleTimeMs = Math.max(bandwidthThrottleTimeMs, requestThrottleTimeMs)
+
+      if (maxThrottleTimeMs > 0) {
+        request.apiThrottleTimeMs = maxThrottleTimeMs
+        if (bandwidthThrottleTimeMs > requestThrottleTimeMs) {
+          requestHelper.throttle(quotas.fetch, request, bandwidthThrottleTimeMs)
+        } else {
+          requestHelper.throttle(quotas.request, request, requestThrottleTimeMs)
+        }
+      }
+
+      // Build and send the FetchResponse
+      // HTTP does not use fetch sessions, so sessionId = INVALID_SESSION_ID
+      val fetchResponse = FetchResponse.of(
+        Errors.NONE,
+        maxThrottleTimeMs,
+        FetchMetadata.INVALID_SESSION_ID,
+        partitions,
+        Collections.emptyList[Node]()
+      )
+
+      requestChannel.sendResponse(request, fetchResponse, None)
+    }
+
+    // ---------------------------------------------------------------
+    // 6. If no interesting (local) partitions, respond immediately
+    // ---------------------------------------------------------------
+    if (interesting.isEmpty) {
+      sendMergedResponse(Seq.empty)
+      return
+    }
+
+    // ---------------------------------------------------------------
+    // 7. Build FetchParams with capped maxWaitMs
+    //    replicaId = -1 (consumer), replicaEpoch = -1, no epoch checks
+    //    No preferred read replica (section 6.6): clientMetadata = empty
+    // ---------------------------------------------------------------
+    val fetchMaxBytes = Math.min(fetchRequest.maxBytes, config.fetchMaxBytes)
+    val fetchMinBytes = Math.min(fetchRequest.minBytes, fetchMaxBytes)
+
+    val params = new FetchParams(
+      /* replicaId = */    -1,          // consumer, not follower
+      /* replicaEpoch = */ -1L,         // no epoch check (section 6.6)
+      /* maxWaitMs = */    effectiveMaxWaitMs.toLong,
+      /* minBytes = */     fetchMinBytes,
+      /* maxBytes = */     fetchMaxBytes,
+      /* isolation = */    FetchIsolation.of(fetchRequest),
+      /* clientMetadata */ Optional.empty[ClientMetadata]()
+    )
+
+    // ---------------------------------------------------------------
+    // 8. Fetch from local replicas
+    //    The callback fires when data is available or maxWaitMs expires
+    //    (via DelayedFetch purgatory). It may fire synchronously if
+    //    data is already available.
+    // ---------------------------------------------------------------
+    replicaManager.fetchMessages(
+      params = params,
+      fetchInfos = interesting,
+      quota = UNBOUNDED_QUOTA, // consumer fetch -- replication quota is not applicable
+      responseCallback = processResponseCallback
+    )
+
+    // ---------------------------------------------------------------
+    // 9. When the local fetch completes, merge and send response
+    //    ALWAYS use .handleAsync with httpAsyncExecutor to avoid
+    //    running on the handler thread or purgatory thread.
+    // ---------------------------------------------------------------
+    localFuture
+      .orTimeout(effectiveMaxWaitMs.toLong + 5000L, TimeUnit.MILLISECONDS) // safety net: maxWait + 5s buffer
+      .handleAsync(
+        new BiFunction[Seq[(TopicIdPartition, FetchPartitionData)], Throwable, Unit] {
+          override def apply(
+            localResults: Seq[(TopicIdPartition, FetchPartitionData)],
+            ex: Throwable
+          ): Unit = {
+            if (ex != null) {
+              // Timeout or unexpected error -- return empty results for all local partitions
+              // (the purgatory should have fired by effectiveMaxWaitMs, this is a safety net)
+              sendMergedResponse(Seq.empty)
+            } else {
+              sendMergedResponse(localResults)
+            }
+          }
+        },
+        httpAsyncExecutor // NEVER use plain .handle() here
+      )
+
+    // Handler thread returns immediately -- KafkaApis.handle() loops back
   }
 
   /**

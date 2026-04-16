@@ -82,6 +82,13 @@ object RequestChannel extends Logging {
     @volatile var callbackRequestDequeueTimeNanos: Option[Long] = None
     @volatile var callbackRequestCompleteTimeNanos: Option[Long] = None
 
+    // Mutable property bag for passing request-scoped values between handler and
+    // response serializer (e.g., httpMaxWaitApplied for the X-Kafka-MaxWait-Applied header).
+    // Thread-safe: written by handler thread, read by response serializer on the same or
+    // httpAsyncExecutor thread after the handler completes.
+    val requestLocalProperties: java.util.concurrent.ConcurrentHashMap[String, AnyRef] =
+      new java.util.concurrent.ConcurrentHashMap[String, AnyRef]()
+
     val session: Session = new Session(context.principal, context.clientAddress)
 
     private val bodyAndSize: RequestAndSize = context.parseRequest(buffer)

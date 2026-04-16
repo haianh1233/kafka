@@ -459,29 +459,40 @@ class KafkaApisHttpConsumeTest {
 
 ## Learning
 
-_To be filled by the executing agent._
+1. The skeleton code referenced `config.httpConsumeMaxWaitMs` but `KafkaConfig` did not expose this property. Required adding `HttpServerConfigs.CONFIG_DEF` to `AbstractKafkaConfig.CONFIG_DEF` merge list and a getter to `KafkaConfig`. The `HttpServerConfigs` class doc already stated this was the intended pattern.
+2. The skeleton used `FetchResponse.toResponseDataList(partitions)` which does not exist. The correct factory is `FetchResponse.of(Errors, throttleTimeMs, sessionId, partitions, nodeEndpoints)`.
+3. The skeleton used `metadataCache.getPartitionInfo(...)` which does not exist. The correct API (matching C.01 pattern) is `metadataCache.getLeaderAndIsr(topic, partition)` with `OptionConverters.toScala`.
+4. The skeleton code used `request.requestLocalProperties` which did not exist on `RequestChannel.Request`. Added a `ConcurrentHashMap[String, AnyRef]` field to `RequestChannel.Request` for passing request-scoped values between handler and response serializer.
+5. HTTP consume does not use fetch sessions (no incremental fetch), so we use `FetchMetadata.INVALID_SESSION_ID` and construct the response directly rather than going through `fetchContext`.
+6. Following C.01 pattern: response callback wraps results in `CompletableFuture` and uses `.handleAsync(httpAsyncExecutor)` to ensure response construction never runs on handler or purgatory threads.
 
 ## Limitations
 
-_To be filled by the executing agent._
+1. No forwarding for remote partitions -- returns `LEADER_NOT_AVAILABLE` with empty records (TASK-D.04).
+2. No incremental fetch session support -- each HTTP request is stateless.
+3. No preferred read replica support -- always fetches from the leader.
+4. The `orTimeout` safety net on the CompletableFuture adds `effectiveMaxWaitMs + 5s`. If the purgatory is severely delayed beyond this buffer, the client gets an empty response rather than actual data.
+5. No down-conversion of `KAFKA_STORAGE_ERROR` to `NOT_LEADER_OR_FOLLOWER` (only needed for old fetch protocol versions, not applicable to HTTP).
 
 ## Field Notes
 
-_To be filled by the executing agent._
+1. The `HttpRequestTranslator` already clamps `maxWaitMs` before building the `FetchRequest`, so the clamp in `handleHttpConsumeRequest` is defense-in-depth. Both layers enforce the same config value.
+2. `FetchIsolation.of(fetchRequest)` correctly handles `replicaId = -1` (consumer) and maps `READ_COMMITTED` to `TXN_COMMITTED`.
+3. The `quota` parameter of `replicaManager.fetchMessages()` is a `ReplicaQuota` (for replication throttling), NOT the consumer quota manager. For consumer fetches, the existing `handleFetchRequest` passes `UNBOUNDED_QUOTA` (via `replicationQuota()`). Consumer bandwidth throttling is handled separately in the response callback via `quotas.fetch.maybeRecordAndGetThrottleTimeMs()`. The skeleton code incorrectly used `quotas.fetch` directly -- this causes a type mismatch since `ClientQuotaManager` is not a `ReplicaQuota`.
 
 ## Acceptance Criteria
 
-- [ ] `handleHttpConsumeRequest()` exists in `KafkaApis.scala` and compiles.
-- [ ] `effectiveMaxWaitMs` is correctly clamped to `min(request, config)`.
-- [ ] `httpMaxWaitApplied` is set in request properties for the response header.
-- [ ] Local leader partitions are fetched via `replicaManager.fetchMessages()`.
-- [ ] Remote leader partitions return `LEADER_NOT_AVAILABLE` with empty records.
-- [ ] `FetchParams.replicaId == -1` (consumer mode).
-- [ ] No leader epoch checks (`currentLeaderEpoch = -1`).
-- [ ] Empty poll returns `errorCode: 0` with empty records (not an error).
-- [ ] Unauthorized topics return `TOPIC_AUTHORIZATION_FAILED`.
-- [ ] `READ_COMMITTED` isolation is correctly mapped.
-- [ ] Quota enforcement works correctly.
+- [x] `handleHttpConsumeRequest()` exists in `KafkaApis.scala` and compiles.
+- [x] `effectiveMaxWaitMs` is correctly clamped to `min(request, config)`.
+- [x] `httpMaxWaitApplied` is set in request properties for the response header.
+- [x] Local leader partitions are fetched via `replicaManager.fetchMessages()`.
+- [x] Remote leader partitions return `LEADER_NOT_AVAILABLE` with empty records.
+- [x] `FetchParams.replicaId == -1` (consumer mode).
+- [x] No leader epoch checks (`currentLeaderEpoch = -1`).
+- [x] Empty poll returns `errorCode: 0` with empty records (not an error).
+- [x] Unauthorized topics return `TOPIC_AUTHORIZATION_FAILED`.
+- [x] `READ_COMMITTED` isolation is correctly mapped.
+- [x] Quota enforcement works correctly.
 - [ ] All unit tests pass.
 - [ ] Existing `handleFetchRequest` tests still pass (no regression).
 
@@ -489,4 +500,7 @@ _To be filled by the executing agent._
 
 | File | Action | Description |
 |------|--------|-------------|
-| | | |
+| `core/src/main/scala/kafka/server/KafkaApis.scala` | Modified | Replaced B.06 stub with full `handleHttpConsumeRequest` implementation (local leader path) |
+| `core/src/main/scala/kafka/network/RequestChannel.scala` | Modified | Added `requestLocalProperties` (`ConcurrentHashMap[String, AnyRef]`) to `Request` class |
+| `core/src/main/scala/kafka/server/KafkaConfig.scala` | Modified | Added `httpConsumeMaxWaitMs` config getter |
+| `server/src/main/java/org/apache/kafka/server/config/AbstractKafkaConfig.java` | Modified | Added `HttpServerConfigs.CONFIG_DEF` to merged CONFIG_DEF |
