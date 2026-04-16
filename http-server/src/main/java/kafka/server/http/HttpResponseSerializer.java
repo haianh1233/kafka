@@ -127,7 +127,15 @@ public final class HttpResponseSerializer {
                 collectFetchErrors((FetchResponse) kafkaResponse, partitionErrors);
                 break;
             case METADATA:
-                body = serializeMetadataResponse((MetadataResponse) kafkaResponse);
+                MetadataResponse metadataResponse = (MetadataResponse) kafkaResponse;
+                // Check for topic-level errors (e.g., UNKNOWN_TOPIC_OR_PARTITION)
+                Errors metadataTopicError = collectMetadataTopicError(metadataResponse);
+                if (metadataTopicError != Errors.NONE) {
+                    String errorBody = buildErrorBody(metadataTopicError, null);
+                    return buildResponse(mapErrorToHttpStatus(metadataTopicError), errorBody,
+                            requestId, -1);
+                }
+                body = serializeMetadataResponse(metadataResponse);
                 break;
             case LIST_OFFSETS:
                 body = serializeListOffsetsResponse((ListOffsetsResponse) kafkaResponse);
@@ -212,6 +220,24 @@ public final class HttpResponseSerializer {
                 errors.add(Errors.forCode(partitionResult.errorCode()));
             }
         }
+    }
+
+    // --- Metadata response errors ---
+
+    /**
+     * Checks for a topic-level error in a single-topic MetadataResponse.
+     * Returns the error if found, or Errors.NONE if no error.
+     * For multi-topic responses, returns NONE (errors are per-topic in the list).
+     */
+    private static Errors collectMetadataTopicError(MetadataResponse response) {
+        MetadataResponseData data = response.data();
+        if (data.topics().size() == 1) {
+            MetadataResponseData.MetadataResponseTopic topic = data.topics().iterator().next();
+            if (topic.errorCode() != 0) {
+                return Errors.forCode(topic.errorCode());
+            }
+        }
+        return Errors.NONE;
     }
 
     // --- ListOffsets response errors ---

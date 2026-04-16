@@ -203,6 +203,13 @@ class HttpRequestHandler(
         return
       }
 
+      // Consumer lag endpoint not yet implemented
+      if (routeResult.handlerType() == HttpRouter.HandlerType.CONSUMER_LAG) {
+        sendErrorResponse(ctx, HttpResponseStatus.NOT_FOUND,
+          """{"errorCode":3,"errorMessage":"UNKNOWN_TOPIC_OR_PARTITION","detail":"Consumer group lag endpoint not yet implemented"}""")
+        return
+      }
+
       // --- Content-Type validation for POST requests that require JSON body ---
       val handlerType = routeResult.handlerType()
       if (req.method() == io.netty.handler.codec.http.HttpMethod.POST &&
