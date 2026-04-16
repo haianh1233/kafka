@@ -59,6 +59,15 @@
 20. [Implementation Plan](#20-implementation-plan)
 21. [Implementation Concerns](#21-implementation-concerns)
 22. [Comparison with Alternatives](#22-comparison-with-alternatives)
+23. [E2E Testing Strategy](#23-e2e-testing-strategy)
+    - 23.1 Test Infrastructure — Leveraging Existing Kafka Test System
+    - 23.2 WsTestClient — WebSocket Test Harness
+    - 23.3 Unit Tests (No Broker)
+    - 23.4 Integration Tests (Real Broker Cluster)
+    - 23.5 Cross-Protocol Tests
+    - 23.6 Multi-Broker Cluster Tests
+    - 23.7 Message Lifecycle Tests
+    - 23.8 Test Matrix
 
 ---
 
@@ -2654,5 +2663,846 @@ connection count and adding correlation complexity.
 
 ---
 
-*Document version: 0.2 — 2026-04-16*
+## 23. E2E Testing Strategy
+
+### 23.1 Test Infrastructure — Leveraging Existing Kafka Test System
+
+All tests build on the existing Kafka test infrastructure. No new test framework is needed.
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        Test Pyramid                                      │
+│                                                                          │
+│  Layer 1: Unit Tests (no broker, fast)                                   │
+│  ├── RoutingEngine, DirectMatcher, TopicMatcher, HeadersMatcher          │
+│  ├── WsFrameHandler (EmbeddedChannel)                                    │
+│  ├── WsMessageSerializer / Deserializer                                  │
+│  ├── WsCreditManager, WsDeliveryTagTracker                               │
+│  └── Base: JUnit 5 + Mockito (same as HttpRouterTest, HttpProcessorTest) │
+│                                                                          │
+│  Layer 2: Integration Tests (real broker, medium)                        │
+│  ├── Extends HttpIntegrationTestHarness (existing)                       │
+│  ├── WsTestClient (new — thin wrapper around Jetty WS client)            │
+│  ├── Single-broker: exchange routing, publish/subscribe, ack/nack, DLX   │
+│  ├── Multi-broker: produce-anywhere, consume-anywhere, forwarding        │
+│  └── Base: IntegrationTestHarness → KafkaServerTestHarness → QuorumTest  │
+│                                                                          │
+│  Layer 3: Cross-Protocol Tests (real broker, medium)                     │
+│  ├── WS publish → HTTP fetch, HTTP POST → WS deliver                    │
+│  ├── WS publish → Kafka binary consumer                                  │
+│  ├── Kafka binary producer → WS deliver                                  │
+│  └── Base: HttpIntegrationTestHarness + HttpTestClient + WsTestClient    │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key reuse points:**
+
+| Existing Infrastructure | File | What We Reuse |
+|---|---|---|
+| `HttpIntegrationTestHarness` | `http-server/src/test/scala/integration/kafka/http/HttpIntegrationTestHarness.scala` | Broker startup with HTTP listener, topic creation, port allocation |
+| `HttpTestClient` | `http-server/src/test/scala/integration/kafka/http/HttpTestClient.scala` | HTTP produce/consume for cross-protocol tests |
+| `IntegrationTestHarness` | `core/src/test/scala/integration/kafka/api/IntegrationTestHarness.scala` | `createProducer()`, `createConsumer()`, `createAdminClient()` |
+| `KafkaServerTestHarness` | `core/src/test/scala/unit/kafka/integration/KafkaServerTestHarness.scala` | Multi-broker lifecycle, `killBroker()`, `restartDeadBrokers()` |
+| `EmbeddedChannel` (Netty) | Used in `HttpChannelInitializerTest.scala` | Pipeline testing without real sockets |
+| `TestUtils.RandomPort` | `core/src/test/scala/unit/kafka/utils/TestUtils.scala` | Dynamic port allocation |
+
+---
+
+### 23.2 WsTestClient — WebSocket Test Harness
+
+A thin wrapper around the Jetty WebSocket client (already a transitive dependency via the
+Jetty HTTP client used in `HttpTestClient`). Lives alongside `HttpTestClient`:
+
+```
+http-server/src/test/scala/integration/kafka/http/WsTestClient.scala
+```
+
+```scala
+class WsTestClient(httpBaseUrl: String) extends AutoCloseable {
+
+  private val wsClient = new WebSocketClient()
+  wsClient.start()
+
+  private val inbox = new LinkedBlockingQueue[JsonNode]()
+  private var session: Session = _
+
+  // Connect — upgrade HTTP → WebSocket on same port
+  def connect(): Unit = {
+    val wsUri = URI.create(httpBaseUrl.replace("http://", "ws://") + "/v1/ws")
+    session = wsClient.connect(new WsListener(inbox), wsUri).get(5, SECONDS)
+    val connected = waitForType("connected", 5.seconds)
+    require(connected.get("brokerId") != null, "Missing brokerId in connected message")
+  }
+
+  // Send raw JSON frame
+  def send(json: String): Unit = session.getRemote.sendString(json)
+
+  // Wait for a specific message type (drains non-matching into a side queue)
+  def waitForType(messageType: String, timeout: Duration): JsonNode = {
+    val deadline = System.nanoTime() + timeout.toNanos
+    while (System.nanoTime() < deadline) {
+      val msg = inbox.poll(100, MILLISECONDS)
+      if (msg != null && messageType == msg.get("type").asText()) return msg
+      // non-matching messages re-queued for later assertions
+    }
+    fail(s"Timed out waiting for '$messageType' after $timeout")
+  }
+
+  // ---- Convenience methods ----
+
+  def declareExchange(name: String, exchangeType: String = "direct"): JsonNode = {
+    send(s"""{"type":"declare-exchange","id":"de-$name",
+             "exchange":"$name","exchangeType":"$exchangeType"}""")
+    waitForType("exchange-declared", 5.seconds)
+  }
+
+  def declareQueue(name: String, args: Map[String, Any] = Map.empty): JsonNode = {
+    val argsJson = mapper.writeValueAsString(args)
+    send(s"""{"type":"declare-queue","id":"dq-$name",
+             "queue":"$name","arguments":$argsJson}""")
+    waitForType("queue-declared", 5.seconds)
+  }
+
+  def bind(queue: String, exchange: String, routingKey: String): JsonNode = {
+    send(s"""{"type":"bind","id":"b-$queue-$exchange",
+             "queue":"$queue","exchange":"$exchange","routingKey":"$routingKey"}""")
+    waitForType("bound", 5.seconds)
+  }
+
+  def subscribe(queue: String, subId: String, credits: Int = 100,
+                startOffset: String = "earliest", noAck: Boolean = false): JsonNode = {
+    send(s"""{"type":"subscribe","id":"s-$subId","queue":"$queue",
+             "subscriptionId":"$subId","credits":$credits,
+             "startOffset":"$startOffset","noAck":$noAck}""")
+    waitForType("subscribed", 5.seconds)
+  }
+
+  def publish(exchange: String, routingKey: String, body: Any,
+              headers: Map[String, String] = Map.empty, publishId: Long = -1): Unit = {
+    val headersJson = mapper.writeValueAsString(headers)
+    val bodyJson = mapper.writeValueAsString(body)
+    val pidField = if (publishId >= 0) s""","publishId":$publishId""" else ""
+    send(s"""{"type":"publish","exchange":"$exchange","routingKey":"$routingKey",
+             "message":{"body":$bodyJson,"headers":$headersJson}$pidField}""")
+  }
+
+  def waitForDeliver(timeout: Duration = 5.seconds): JsonNode =
+    waitForType("deliver", timeout)
+
+  def ack(subId: String, deliveryTag: Long, multiple: Boolean = false): Unit =
+    send(s"""{"type":"ack","subscriptionId":"$subId",
+             "deliveryTag":$deliveryTag,"multiple":$multiple}""")
+
+  def nack(subId: String, deliveryTag: Long,
+           requeue: Boolean = true, multiple: Boolean = false): Unit =
+    send(s"""{"type":"nack","subscriptionId":"$subId","deliveryTag":$deliveryTag,
+             "requeue":$requeue,"multiple":$multiple}""")
+
+  def enableConfirms(): JsonNode = {
+    send("""{"type":"enable-confirms","id":"ec"}""")
+    waitForType("confirms-enabled", 5.seconds)
+  }
+
+  def grantCredits(subId: String, credits: Int): Unit =
+    send(s"""{"type":"credits","subscriptionId":"$subId","credits":$credits}""")
+
+  def unsubscribe(subId: String): JsonNode = {
+    send(s"""{"type":"unsubscribe","id":"us-$subId","subscriptionId":"$subId"}""")
+    waitForType("unsubscribed", 5.seconds)
+  }
+
+  override def close(): Unit = {
+    if (session != null && session.isOpen) session.close()
+    wsClient.stop()
+  }
+}
+```
+
+---
+
+### 23.3 Unit Tests (No Broker)
+
+Pure logic tests. Fast, no I/O. Follow the same patterns as `HttpRouterTest.java`,
+`HttpProcessorTest.java`, `HttpRequestTranslatorTest.java`.
+
+```
+http-server/src/test/java/kafka/server/http/routing/
+├── DirectMatcherTest.java
+├── TopicMatcherTest.java
+├── FanoutMatcherTest.java
+├── HeadersMatcherTest.java
+├── RoutingEngineTest.java
+└── RoutingMetadataManagerTest.java
+
+http-server/src/test/java/kafka/server/http/ws/
+├── WsFrameHandlerTest.java          — EmbeddedChannel, JSON dispatch
+├── WsMessageSerializerTest.java     — Kafka record → deliver JSON
+├── WsMessageDeserializerTest.java   — publish JSON → Kafka record
+├── WsCreditManagerTest.java         — credit accounting
+├── WsDeliveryTagTrackerTest.java    — tag → (tp, offset) mapping
+└── WsAckHandlerTest.java            — offset commit batching
+```
+
+**Example — RoutingEngineTest:**
+
+```java
+class RoutingEngineTest {
+
+    private RoutingEngine engine;
+
+    @BeforeEach void setUp() {
+        engine = new RoutingEngine();
+        // Pre-declared exchanges are auto-registered
+    }
+
+    // ── Direct exchange ──────────────────────────────────────
+
+    @Test void directExchange_exactMatch() {
+        engine.declareExchange("orders", "direct");
+        engine.declareQueue("q1");
+        engine.bind("orders", "q1", "order.created");
+
+        assertEquals(Set.of("q1"), engine.route("orders", "order.created", Map.of()));
+    }
+
+    @Test void directExchange_noMatch() {
+        engine.declareExchange("orders", "direct");
+        engine.declareQueue("q1");
+        engine.bind("orders", "q1", "order.created");
+
+        assertEquals(Set.of(), engine.route("orders", "order.updated", Map.of()));
+    }
+
+    @Test void directExchange_multipleQueues_sameKey() {
+        engine.declareExchange("orders", "direct");
+        engine.declareQueue("q1");
+        engine.declareQueue("q2");
+        engine.bind("orders", "q1", "order.created");
+        engine.bind("orders", "q2", "order.created");
+
+        assertEquals(Set.of("q1", "q2"), engine.route("orders", "order.created", Map.of()));
+    }
+
+    // ── Topic exchange (wildcard) ────────────────────────────
+
+    @Test void topicExchange_starMatchesSingleWord() {
+        engine.declareExchange("events", "topic");
+        engine.declareQueue("q1");
+        engine.bind("events", "q1", "order.*");
+
+        assertEquals(Set.of("q1"), engine.route("events", "order.created", Map.of()));
+        assertEquals(Set.of(),     engine.route("events", "order.a.b", Map.of()));
+    }
+
+    @Test void topicExchange_hashMatchesZeroOrMore() {
+        engine.declareExchange("events", "topic");
+        engine.declareQueue("q1");
+        engine.bind("events", "q1", "order.#");
+
+        assertEquals(Set.of("q1"), engine.route("events", "order", Map.of()));
+        assertEquals(Set.of("q1"), engine.route("events", "order.created", Map.of()));
+        assertEquals(Set.of("q1"), engine.route("events", "order.a.b.c", Map.of()));
+        assertEquals(Set.of(),     engine.route("events", "payment.done", Map.of()));
+    }
+
+    @Test void topicExchange_hashAlone_matchesEverything() {
+        engine.declareExchange("all", "topic");
+        engine.declareQueue("q1");
+        engine.bind("all", "q1", "#");
+
+        assertEquals(Set.of("q1"), engine.route("all", "anything.at.all", Map.of()));
+        assertEquals(Set.of("q1"), engine.route("all", "", Map.of()));
+    }
+
+    // ── Fanout exchange ──────────────────────────────────────
+
+    @Test void fanoutExchange_allQueuesReceive() {
+        engine.declareExchange("broadcast", "fanout");
+        engine.declareQueue("q1");
+        engine.declareQueue("q2");
+        engine.declareQueue("q3");
+        engine.bind("broadcast", "q1", "");
+        engine.bind("broadcast", "q2", "");
+        engine.bind("broadcast", "q3", "");
+
+        assertEquals(Set.of("q1", "q2", "q3"),
+            engine.route("broadcast", "ignored", Map.of()));
+    }
+
+    // ── Headers exchange ─────────────────────────────────────
+
+    @Test void headersExchange_matchAll() {
+        engine.declareExchange("hdrs", "headers");
+        engine.declareQueue("q1");
+        engine.bind("hdrs", "q1", "", Map.of("x-match","all", "region","us", "tier","premium"));
+
+        assertEquals(Set.of("q1"),
+            engine.route("hdrs", "", Map.of("region","us","tier","premium")));
+        assertEquals(Set.of(),
+            engine.route("hdrs", "", Map.of("region","us","tier","free")));
+    }
+
+    @Test void headersExchange_matchAny() {
+        engine.declareExchange("hdrs", "headers");
+        engine.declareQueue("q1");
+        engine.bind("hdrs", "q1", "", Map.of("x-match","any", "region","us", "tier","premium"));
+
+        assertEquals(Set.of("q1"),
+            engine.route("hdrs", "", Map.of("region","eu","tier","premium")));
+        assertEquals(Set.of(),
+            engine.route("hdrs", "", Map.of("region","eu","tier","free")));
+    }
+
+    // ── Exchange-to-exchange routing ─────────────────────────
+
+    @Test void e2eBinding_recursiveRoute() {
+        engine.declareExchange("source", "topic");
+        engine.declareExchange("sink", "direct");
+        engine.declareQueue("q1");
+        engine.bindExchangeToExchange("source", "sink", "order.*");
+        engine.bind("sink", "q1", "order.created");
+
+        assertEquals(Set.of("q1"),
+            engine.route("source", "order.created", Map.of()));
+    }
+
+    @Test void e2eBinding_cycleDoesNotInfiniteLoop() {
+        engine.declareExchange("a", "fanout");
+        engine.declareExchange("b", "fanout");
+        engine.declareQueue("q1");
+        engine.bindExchangeToExchange("a", "b", "");
+        engine.bindExchangeToExchange("b", "a", "");  // cycle
+        engine.bind("b", "q1", "");
+
+        // Must return without hanging — cycle guard prevents infinite recursion
+        assertEquals(Set.of("q1"), engine.route("a", "", Map.of()));
+    }
+
+    // ── Default exchange ─────────────────────────────────────
+
+    @Test void defaultExchange_routesByQueueName() {
+        engine.declareQueue("my-queue");
+
+        assertEquals(Set.of("my-queue"), engine.route("", "my-queue", Map.of()));
+    }
+
+    // ── Unbind ───────────────────────────────────────────────
+
+    @Test void unbind_removesRouting() {
+        engine.declareExchange("ex", "direct");
+        engine.declareQueue("q1");
+        engine.bind("ex", "q1", "key");
+        assertEquals(Set.of("q1"), engine.route("ex", "key", Map.of()));
+
+        engine.unbind("ex", "q1", "key");
+        assertEquals(Set.of(), engine.route("ex", "key", Map.of()));
+    }
+}
+```
+
+**Example — WsFrameHandlerTest (EmbeddedChannel):**
+
+```java
+class WsFrameHandlerTest {
+
+    @Test void upgradeRequest_switchesPipeline() {
+        EmbeddedChannel ch = new EmbeddedChannel(
+            new HttpServerCodec(),
+            new HttpObjectAggregator(65536),
+            new WsUpgradeOrHttpHandler(/* mocked dependencies */));
+
+        // Simulate WebSocket upgrade request
+        FullHttpRequest upgrade = new DefaultFullHttpRequest(HTTP_1_1, GET, "/v1/ws");
+        upgrade.headers().set(HttpHeaderNames.HOST, "localhost");
+        upgrade.headers().set(HttpHeaderNames.UPGRADE, "websocket");
+        upgrade.headers().set(HttpHeaderNames.CONNECTION, "Upgrade");
+        upgrade.headers().set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+        upgrade.headers().set("Sec-WebSocket-Version", "13");
+
+        ch.writeInbound(upgrade);
+
+        // Verify 101 response written
+        Object outbound = ch.readOutbound();
+        // After upgrade, pipeline should contain WsFrameHandler
+        assertNotNull(ch.pipeline().get(WsFrameHandler.class));
+    }
+
+    @Test void nonUpgradeRequest_passesThrough() {
+        // Standard HTTP request should be forwarded to next handler, not upgraded
+    }
+}
+```
+
+---
+
+### 23.4 Integration Tests (Real Broker Cluster)
+
+Extend `HttpIntegrationTestHarness` — it already starts a broker with an HTTP listener.
+WebSocket upgrades on the same port. Follow the patterns from `HttpProduceIntegrationTest`,
+`HttpConsumeIntegrationTest`, `HttpForwardingIntegrationTest`.
+
+```
+http-server/src/test/scala/integration/kafka/http/
+├── (existing tests unchanged)
+├── WsPublishSubscribeIntegrationTest.scala
+├── WsExchangeRoutingIntegrationTest.scala
+├── WsAckNackIntegrationTest.scala
+├── WsDlxIntegrationTest.scala
+├── WsCreditsFlowControlIntegrationTest.scala
+├── WsCompetingConsumersIntegrationTest.scala
+├── WsClusterForwardingIntegrationTest.scala
+├── WsCrossProtocolIntegrationTest.scala
+├── WsQueueLifecycleIntegrationTest.scala
+├── WsPublisherConfirmsIntegrationTest.scala
+├── WsRestApiIntegrationTest.scala
+└── WsSecurityIntegrationTest.scala
+```
+
+**Example — WsPublishSubscribeIntegrationTest:**
+
+```scala
+class WsPublishSubscribeIntegrationTest extends HttpIntegrationTestHarness {
+
+  private var ws: WsTestClient = _
+
+  @BeforeEach
+  override def setUp(testInfo: TestInfo): Unit = {
+    super.setUp(testInfo)
+    ws = new WsTestClient(httpUrl(0))
+    ws.connect()
+  }
+
+  @AfterEach
+  override def tearDown(): Unit = {
+    ws.close()
+    super.tearDown()
+  }
+
+  @Test
+  @Timeout(30)
+  def testDirectExchange_publishAndConsume(): Unit = {
+    // Setup routing
+    ws.declareExchange("orders", "direct")
+    ws.declareQueue("order-events")
+    ws.bind("order-events", "orders", "order.created")
+
+    // Subscribe
+    ws.subscribe("order-events", "sub-1", credits = 10, startOffset = "earliest")
+
+    // Publish
+    ws.publish("orders", "order.created", Map("orderId" -> "123", "amount" -> 42.0))
+
+    // Receive
+    val deliver = ws.waitForDeliver(5.seconds)
+    assertEquals("deliver", deliver.get("type").asText())
+    assertEquals("sub-1", deliver.get("subscriptionId").asText())
+    assertEquals("orders", deliver.get("exchange").asText())
+    assertEquals("order.created", deliver.get("routingKey").asText())
+    assertEquals("123", deliver.at("/message/body/orderId").asText())
+    val tag = deliver.get("deliveryTag").asLong()
+
+    // ACK
+    ws.ack("sub-1", tag)
+    // Verify offset committed by re-subscribing — should get no messages
+    ws.unsubscribe("sub-1")
+    ws.subscribe("order-events", "sub-2", credits = 10, startOffset = "latest")
+    // No deliver expected (already consumed)
+  }
+
+  @Test
+  @Timeout(30)
+  def testTopicExchange_wildcardRouting(): Unit = {
+    ws.declareExchange("events", "topic")
+    ws.declareQueue("all-orders")
+    ws.declareQueue("created-only")
+    ws.bind("all-orders", "events", "order.#")
+    ws.bind("created-only", "events", "order.created")
+
+    ws.subscribe("all-orders", "sub-all", credits = 10, startOffset = "earliest")
+    ws.subscribe("created-only", "sub-created", credits = 10, startOffset = "earliest")
+
+    // This message matches both bindings
+    ws.publish("events", "order.created", "msg1")
+    val d1 = ws.waitForDeliver()
+    val d2 = ws.waitForDeliver()
+    val subs = Set(d1.get("subscriptionId").asText(), d2.get("subscriptionId").asText())
+    assertEquals(Set("sub-all", "sub-created"), subs)
+
+    // This message matches only order.# (not order.created)
+    ws.publish("events", "order.updated", "msg2")
+    val d3 = ws.waitForDeliver()
+    assertEquals("sub-all", d3.get("subscriptionId").asText())
+  }
+
+  @Test
+  @Timeout(30)
+  def testFanoutExchange_allSubscribersReceive(): Unit = {
+    ws.declareExchange("broadcast", "fanout")
+    ws.declareQueue("svc-a")
+    ws.declareQueue("svc-b")
+    ws.bind("svc-a", "broadcast", "")
+    ws.bind("svc-b", "broadcast", "")
+
+    ws.subscribe("svc-a", "sub-a", credits = 10, startOffset = "earliest")
+    ws.subscribe("svc-b", "sub-b", credits = 10, startOffset = "earliest")
+
+    ws.publish("broadcast", "ignored-key", "hello")
+
+    val d1 = ws.waitForDeliver()
+    val d2 = ws.waitForDeliver()
+    val subs = Set(d1.get("subscriptionId").asText(), d2.get("subscriptionId").asText())
+    assertEquals(Set("sub-a", "sub-b"), subs)
+  }
+
+  @Test
+  @Timeout(30)
+  def testHeadersExchange_matchAll(): Unit = {
+    ws.declareExchange("hdrs", "headers")
+    ws.declareQueue("priority-us")
+    ws.bind("priority-us", "hdrs", "",
+            Map("x-match" -> "all", "priority" -> "high", "region" -> "us"))
+
+    ws.subscribe("priority-us", "sub-1", credits = 10, startOffset = "earliest")
+
+    // Match: both headers present
+    ws.publish("hdrs", "", "match",
+               headers = Map("priority" -> "high", "region" -> "us"))
+    val d1 = ws.waitForDeliver()
+    assertNotNull(d1)
+
+    // No match: wrong region
+    ws.publish("hdrs", "", "no-match",
+               headers = Map("priority" -> "high", "region" -> "eu"))
+    // Should NOT receive a deliver — wait briefly and confirm empty
+    assertNull(ws.inbox.poll(1, SECONDS))
+  }
+
+  @Test
+  @Timeout(30)
+  def testDefaultExchange_routeByQueueName(): Unit = {
+    ws.declareQueue("inbox")
+    ws.subscribe("inbox", "sub-1", credits = 10, startOffset = "earliest")
+
+    // Default exchange routes by queue name
+    ws.publish("", "inbox", "direct-to-queue")
+
+    val d = ws.waitForDeliver()
+    assertEquals("inbox", d.get("routingKey").asText())
+  }
+}
+```
+
+---
+
+### 23.5 Cross-Protocol Tests
+
+Verify messages flow between WebSocket, HTTP REST, and Kafka binary clients:
+
+```scala
+class WsCrossProtocolIntegrationTest extends HttpIntegrationTestHarness {
+
+  private var ws: WsTestClient = _
+  private var http: HttpTestClient = _
+
+  @BeforeEach
+  override def setUp(testInfo: TestInfo): Unit = {
+    super.setUp(testInfo)
+    ws = new WsTestClient(httpUrl(0))
+    ws.connect()
+    http = new HttpTestClient()
+  }
+
+  @Test
+  @Timeout(30)
+  def testWsPublish_httpConsume(): Unit = {
+    ws.declareExchange("events", "direct")
+    ws.declareQueue("orders")
+    ws.bind("orders", "events", "order.new")
+
+    ws.publish("events", "order.new", Map("id" -> 1))
+
+    // Consume via HTTP poll on the backing Kafka topic
+    val response = http.consume(httpUrl(0), "ws.orders",
+      Seq(FetchPartitionSpec(0, 0)), maxWaitMs = 5000)
+    assertEquals(200, response.status)
+    assertTrue(response.body.get("partitions").get(0).get("records").size() > 0)
+  }
+
+  @Test
+  @Timeout(30)
+  def testHttpPublish_wsConsume(): Unit = {
+    ws.declareQueue("inbox")
+    ws.subscribe("inbox", "sub-1", credits = 10, startOffset = "earliest")
+
+    // Produce directly to the backing topic via HTTP
+    val response = http.produce(httpUrl(0), "ws.inbox",
+      Seq(ProduceRecord(value = Some(StringValue("from-http")))))
+    assertEquals(200, response.status)
+
+    // WS subscriber receives it
+    val d = ws.waitForDeliver()
+    assertNotNull(d)
+  }
+
+  @Test
+  @Timeout(30)
+  def testKafkaProducer_wsConsume(): Unit = {
+    ws.declareQueue("from-kafka")
+    ws.subscribe("from-kafka", "sub-1", credits = 10, startOffset = "earliest")
+
+    // Produce via Kafka binary producer
+    val producer = createProducer[Array[Byte], Array[Byte]]()
+    producer.send(new ProducerRecord("ws.from-kafka", "key".getBytes, "value".getBytes)).get()
+    producer.flush()
+
+    val d = ws.waitForDeliver()
+    assertNotNull(d)
+  }
+}
+```
+
+---
+
+### 23.6 Multi-Broker Cluster Tests
+
+Verify produce-anywhere / consume-anywhere across brokers:
+
+```scala
+class WsClusterForwardingIntegrationTest extends HttpIntegrationTestHarness {
+
+  override def brokerCount: Int = 3
+
+  @Test
+  @Timeout(60)
+  def testPublishOnBroker0_consumeOnBroker2(): Unit = {
+    val publisher = new WsTestClient(httpUrl(0))
+    val subscriber = new WsTestClient(httpUrl(2))
+    publisher.connect()
+    subscriber.connect()
+
+    try {
+      // Declare on broker 0 — visible cluster-wide via __ws_routing_metadata
+      publisher.declareExchange("events", "fanout")
+      publisher.declareQueue("inbox")
+      publisher.bind("inbox", "events", "")
+
+      // Subscribe on broker 2
+      subscriber.subscribe("inbox", "sub-1", credits = 10, startOffset = "earliest")
+
+      // Publish on broker 0
+      publisher.publish("events", "", Map("msg" -> "cross-broker"))
+
+      // Receive on broker 2 (forwarding handles partition leader routing)
+      val d = subscriber.waitForDeliver(10.seconds)
+      assertNotNull(d)
+      assertEquals("cross-broker", d.at("/message/body/msg").asText())
+
+      subscriber.ack("sub-1", d.get("deliveryTag").asLong())
+    } finally {
+      publisher.close()
+      subscriber.close()
+    }
+  }
+
+  @Test
+  @Timeout(60)
+  def testCompetingConsumers_acrossBrokers(): Unit = {
+    val ws0 = new WsTestClient(httpUrl(0))
+    val ws1 = new WsTestClient(httpUrl(1))
+    val ws2 = new WsTestClient(httpUrl(2))
+    ws0.connect(); ws1.connect(); ws2.connect()
+
+    try {
+      // Create multi-partition queue for load balancing
+      ws0.declareQueue("shared-work")  // auto-creates ws.shared-work topic
+
+      // All three subscribe to same queue → form consumer group ws.shared-work
+      ws0.subscribe("shared-work", "sub-0", credits = 100, startOffset = "earliest")
+      ws1.subscribe("shared-work", "sub-1", credits = 100, startOffset = "earliest")
+      ws2.subscribe("shared-work", "sub-2", credits = 100, startOffset = "earliest")
+
+      // Publish 30 messages
+      for (i <- 0 until 30) {
+        ws0.publish("", "shared-work", Map("seq" -> i))
+      }
+
+      // Collect delivers across all 3 clients (partition assignment distributes them)
+      val allDelivers = new java.util.concurrent.ConcurrentLinkedQueue[JsonNode]()
+      // ... collect with timeout, verify all 30 delivered exactly once across the 3 clients
+    } finally {
+      ws0.close(); ws1.close(); ws2.close()
+    }
+  }
+}
+```
+
+---
+
+### 23.7 Message Lifecycle Tests
+
+```scala
+class WsAckNackIntegrationTest extends HttpIntegrationTestHarness {
+
+  @Test
+  @Timeout(30)
+  def testNackWithRequeue_redelivers(): Unit = {
+    ws.declareQueue("q1")
+    ws.subscribe("q1", "sub-1", credits = 10, startOffset = "earliest")
+    ws.publish("", "q1", "retry-me")
+
+    val d1 = ws.waitForDeliver()
+    assertFalse(d1.get("redelivered").asBoolean())
+    ws.nack("sub-1", d1.get("deliveryTag").asLong(), requeue = true)
+
+    // Message redelivered with redelivered=true
+    val d2 = ws.waitForDeliver()
+    assertTrue(d2.get("redelivered").asBoolean())
+    ws.ack("sub-1", d2.get("deliveryTag").asLong())
+  }
+
+  @Test
+  @Timeout(30)
+  def testNackWithoutRequeue_deadLetters(): Unit = {
+    ws.declareExchange("dlx", "direct")
+    ws.declareQueue("dlq")
+    ws.bind("dlq", "dlx", "dead.orders")
+    ws.declareQueue("orders", args = Map(
+      "x-dead-letter-exchange" -> "dlx",
+      "x-dead-letter-routing-key" -> "dead.orders"))
+
+    ws.subscribe("orders", "sub-orders", credits = 10, startOffset = "earliest")
+    ws.subscribe("dlq", "sub-dlq", credits = 10, startOffset = "earliest")
+
+    ws.publish("", "orders", "poison-msg")
+
+    val d = ws.waitForDeliver()
+    assertEquals("sub-orders", d.get("subscriptionId").asText())
+    ws.nack("sub-orders", d.get("deliveryTag").asLong(), requeue = false)
+
+    // Message appears on DLQ
+    val dlxMsg = ws.waitForDeliver()
+    assertEquals("sub-dlq", dlxMsg.get("subscriptionId").asText())
+    assertEquals("dead.orders", dlxMsg.get("routingKey").asText())
+  }
+
+  @Test
+  @Timeout(30)
+  def testCredits_pauseAndResume(): Unit = {
+    ws.declareQueue("cred-q")
+    ws.subscribe("cred-q", "sub-1", credits = 2, startOffset = "earliest")
+
+    ws.publish("", "cred-q", "msg1")
+    ws.publish("", "cred-q", "msg2")
+    ws.publish("", "cred-q", "msg3")
+
+    // First 2 delivered (credits = 2)
+    val d1 = ws.waitForDeliver()
+    val d2 = ws.waitForDeliver()
+
+    // Third message NOT delivered — credits exhausted
+    assertNull(ws.inbox.poll(1, SECONDS))
+
+    // Grant more credits
+    ws.grantCredits("sub-1", 5)
+
+    // Third message now delivered
+    val d3 = ws.waitForDeliver()
+    assertNotNull(d3)
+  }
+
+  @Test
+  @Timeout(30)
+  def testPublisherConfirms(): Unit = {
+    ws.enableConfirms()
+    ws.declareQueue("confirmed-q")
+    ws.subscribe("confirmed-q", "sub-1", credits = 10, startOffset = "earliest")
+
+    ws.publish("", "confirmed-q", "confirmed-msg", publishId = 1)
+
+    val confirm = ws.waitForType("published", 5.seconds)
+    assertEquals(1, confirm.get("publishId").asLong())
+  }
+
+  @Test
+  @Timeout(30)
+  def testMandatoryPublish_noRoute_returnsMessage(): Unit = {
+    ws.declareExchange("ex", "direct")
+    // No bindings — message is unroutable
+
+    ws.send("""{"type":"publish","exchange":"ex","routingKey":"nowhere",
+               "mandatory":true,"message":{"body":"lost"},"publishId":1}""")
+
+    val returned = ws.waitForType("returned", 5.seconds)
+    assertEquals(312, returned.get("replyCode").asInt())
+    assertEquals("NO_ROUTE", returned.get("replyText").asText())
+  }
+}
+```
+
+```scala
+class WsQueueLifecycleIntegrationTest extends HttpIntegrationTestHarness {
+
+  @Test
+  @Timeout(30)
+  def testAutoDeleteQueue_deletedOnLastUnsubscribe(): Unit = {
+    ws.send("""{"type":"declare-queue","id":"dq","queue":"temp-q","autoDelete":true}""")
+    ws.waitForType("queue-declared", 5.seconds)
+    ws.subscribe("temp-q", "sub-1", credits = 10)
+    ws.unsubscribe("sub-1")
+
+    // Queue should be auto-deleted — re-subscribe should fail
+    ws.send("""{"type":"subscribe","id":"s2","queue":"temp-q","subscriptionId":"sub-2"}""")
+    val err = ws.waitForType("error", 5.seconds)
+    assertEquals("QUEUE_NOT_FOUND", err.get("errorCode").asText())
+  }
+
+  @Test
+  @Timeout(30)
+  def testExclusiveQueue_rejectsSecondSubscriber(): Unit = {
+    ws.declareQueue("excl-q")
+    ws.subscribe("excl-q", "sub-1", exclusive = true)
+
+    val ws2 = new WsTestClient(httpUrl(0))
+    ws2.connect()
+    ws2.send("""{"type":"subscribe","id":"s2","queue":"excl-q",
+                "subscriptionId":"sub-2","exclusive":false}""")
+    val err = ws2.waitForType("error", 5.seconds)
+    assertEquals("EXCLUSIVE_CONSUMER", err.get("errorCode").asText())
+    ws2.close()
+  }
+}
+```
+
+---
+
+### 23.8 Test Matrix
+
+| Test Category | Harness | Broker Count | Key Scenarios |
+|---|---|---|---|
+| **Routing engine logic** | Unit (no broker) | 0 | All 4 exchange types, wildcard edge cases, e2e bindings, cycle guard, unbind |
+| **Frame parsing** | Unit (EmbeddedChannel) | 0 | WS upgrade, JSON dispatch, malformed frames, oversized frames |
+| **Serialization** | Unit (no broker) | 0 | publish JSON → Kafka record, Kafka record → deliver JSON, header round-trip |
+| **Credit manager** | Unit (no broker) | 0 | Grant, consume, exhausted → paused, replenish → resumed |
+| **Publish → deliver** | Integration | 1 | Direct, topic, fanout, headers exchange round-trip |
+| **ACK / NACK / requeue** | Integration | 1 | Ack commits offset, nack+requeue redelivers, nack→DLX |
+| **Credits / flow control** | Integration | 1 | Credits exhausted → delivery paused → grant → resumed |
+| **Publisher confirms** | Integration | 1 | Enable confirms, published/publish-failed responses |
+| **Mandatory return** | Integration | 1 | Unroutable message → returned frame |
+| **Competing consumers** | Integration | 1 | 2 WS clients on same queue → partition split |
+| **Exclusive consumer** | Integration | 1 | Second subscriber rejected |
+| **Queue lifecycle** | Integration | 1 | Auto-delete, exclusive, declare idempotency |
+| **REST API** | Integration | 1 | PUT/GET/DELETE exchanges, queues, bindings |
+| **Cluster forwarding** | Integration | 3 | Publish on B0, consume on B2 |
+| **Metadata propagation** | Integration | 3 | Declare on B0, subscribe on B1 |
+| **Cross-protocol: WS→HTTP** | Integration | 1 | WS publish → HTTP fetch on backing topic |
+| **Cross-protocol: HTTP→WS** | Integration | 1 | HTTP POST to backing topic → WS deliver |
+| **Cross-protocol: Kafka→WS** | Integration | 1 | Kafka binary produce → WS deliver |
+| **Security** | Integration | 1 | Auth on upgrade, ACL on publish/subscribe |
+| **DLX chain** | Integration | 1 | Nack → DLX → DLQ subscriber, x-death headers |
+| **Message TTL** | Integration | 1 | Expired messages skipped, expired → DLX |
+| **Poison message** | Integration | 1 | Redelivery count exceeded → auto-DLX |
+
+---
+
+*Document version: 0.3 — 2026-04-16*
 *Branch: feature/http-protocol*
