@@ -14,61 +14,52 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// Time: Created - TASK-A.01
+// Time: Created - TASK-F.05
 package org.apache.kafka.common.security.auth;
 
 import java.net.InetAddress;
 import java.security.cert.X509Certificate;
-import java.util.Objects;
+import java.util.Optional;
 
 /**
- * Authentication context for HTTP and HTTPS listeners.
- * <p>
- * Carries HTTP-specific authentication data extracted from the incoming request:
- * bearer tokens, basic auth credentials, and mTLS peer certificates. A configured
- * {@link org.apache.kafka.common.security.auth.KafkaPrincipalBuilder} uses this
- * context to derive the {@link KafkaPrincipal} for authorization.
+ * Authentication context for HTTP requests.
  *
- * @see PlaintextAuthenticationContext
- * @see SslAuthenticationContext
- * @see SaslAuthenticationContext
+ * Carries all possible authentication data extracted from the HTTP request:
+ * <ul>
+ *   <li>Client certificates (mTLS over HTTPS)</li>
+ *   <li>Bearer token (Authorization: Bearer header)</li>
+ *   <li>Basic credentials (Authorization: Basic header)</li>
+ *   <li>Client IP address (always present)</li>
+ * </ul>
+ *
+ * A configured {@link KafkaPrincipalBuilder} inspects this context to determine the principal.
+ * The default builder handles mTLS certificates and falls back to ANONYMOUS. Custom builders
+ * handle Bearer and Basic auth.
+ *
+ * Placed in the {@code clients} module alongside other {@link AuthenticationContext} implementations
+ * to avoid circular dependencies between {@code http-server} and {@code clients}.
+ *
+ * @see AuthenticationContext
+ * @see org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder
  */
 public class HttpAuthenticationContext implements AuthenticationContext {
 
     private final InetAddress clientAddress;
-    private final String listenerName;
     private final SecurityProtocol securityProtocol;
-    private final String bearerToken;
-    private final String basicCredentials;
     private final X509Certificate[] peerCertificates;
+    private final String bearerToken;
+    private final String basicUsername;
+    private final String basicPassword;
+    private final String listenerName;
 
-    /**
-     * Construct a new HttpAuthenticationContext.
-     *
-     * @param clientAddress    IP address of the HTTP client (must not be null)
-     * @param listenerName     name of the Kafka listener (must not be null)
-     * @param securityProtocol must be {@link SecurityProtocol#HTTP} or {@link SecurityProtocol#HTTPS}
-     * @param bearerToken      value from {@code Authorization: Bearer <token>} header, or null
-     * @param basicCredentials decoded value from {@code Authorization: Basic <b64>} header, or null
-     * @param peerCertificates client certificates from TLS handshake (HTTPS + mTLS), or null
-     */
-    public HttpAuthenticationContext(
-            InetAddress clientAddress,
-            String listenerName,
-            SecurityProtocol securityProtocol,
-            String bearerToken,
-            String basicCredentials,
-            X509Certificate[] peerCertificates) {
-        this.clientAddress = Objects.requireNonNull(clientAddress, "clientAddress must not be null");
-        this.listenerName = Objects.requireNonNull(listenerName, "listenerName must not be null");
-        if (!securityProtocol.isHttp()) {
-            throw new IllegalArgumentException(
-                "securityProtocol must be HTTP or HTTPS, got " + securityProtocol);
-        }
-        this.securityProtocol = securityProtocol;
-        this.bearerToken = bearerToken;
-        this.basicCredentials = basicCredentials;
-        this.peerCertificates = peerCertificates;
+    private HttpAuthenticationContext(Builder builder) {
+        this.clientAddress = builder.clientAddress;
+        this.securityProtocol = builder.securityProtocol;
+        this.peerCertificates = builder.peerCertificates;
+        this.bearerToken = builder.bearerToken;
+        this.basicUsername = builder.basicUsername;
+        this.basicPassword = builder.basicPassword;
+        this.listenerName = builder.listenerName;
     }
 
     @Override
@@ -87,27 +78,88 @@ public class HttpAuthenticationContext implements AuthenticationContext {
     }
 
     /**
-     * Returns the bearer token from the {@code Authorization: Bearer <token>} header,
-     * or {@code null} if no bearer token was present.
+     * Client certificates from mTLS handshake.
+     * Present only when listener uses HTTPS and client presents a certificate.
      */
-    public String bearerToken() {
-        return bearerToken;
+    public Optional<X509Certificate[]> peerCertificates() {
+        return Optional.ofNullable(peerCertificates);
     }
 
     /**
-     * Returns the decoded credentials from the {@code Authorization: Basic <b64>} header,
-     * or {@code null} if no basic auth header was present. Format: {@code "username:password"}.
+     * Bearer token from Authorization header.
+     * Present only when the request has "Authorization: Bearer ..." header.
      */
-    public String basicCredentials() {
-        return basicCredentials;
+    public Optional<String> bearerToken() {
+        return Optional.ofNullable(bearerToken);
     }
 
     /**
-     * Returns the client's X.509 certificate chain from the TLS handshake,
-     * or {@code null} if no client certificates were presented (no mTLS).
-     * The first element is the leaf (client) certificate.
+     * Basic auth username.
+     * Present only when the request has "Authorization: Basic ..." header.
      */
-    public X509Certificate[] peerCertificates() {
-        return peerCertificates;
+    public Optional<String> basicUsername() {
+        return Optional.ofNullable(basicUsername);
+    }
+
+    /**
+     * Basic auth password.
+     * Present only when the request has "Authorization: Basic ..." header.
+     */
+    public Optional<String> basicPassword() {
+        return Optional.ofNullable(basicPassword);
+    }
+
+    /**
+     * Whether this context has any authentication credentials.
+     */
+    public boolean hasCredentials() {
+        return peerCertificates != null || bearerToken != null || basicUsername != null;
+    }
+
+    public static class Builder {
+        private InetAddress clientAddress;
+        private SecurityProtocol securityProtocol = SecurityProtocol.PLAINTEXT;
+        private X509Certificate[] peerCertificates;
+        private String bearerToken;
+        private String basicUsername;
+        private String basicPassword;
+        private String listenerName = "HTTP";
+
+        public Builder clientAddress(InetAddress clientAddress) {
+            this.clientAddress = clientAddress;
+            return this;
+        }
+
+        public Builder securityProtocol(SecurityProtocol securityProtocol) {
+            this.securityProtocol = securityProtocol;
+            return this;
+        }
+
+        public Builder peerCertificates(X509Certificate[] certs) {
+            this.peerCertificates = certs;
+            return this;
+        }
+
+        public Builder bearerToken(String token) {
+            this.bearerToken = token;
+            return this;
+        }
+
+        public Builder basicCredentials(String username, String password) {
+            this.basicUsername = username;
+            this.basicPassword = password;
+            return this;
+        }
+
+        public Builder listenerName(String listenerName) {
+            this.listenerName = listenerName;
+            return this;
+        }
+
+        public HttpAuthenticationContext build() {
+            if (clientAddress == null)
+                throw new IllegalArgumentException("clientAddress is required");
+            return new HttpAuthenticationContext(this);
+        }
     }
 }

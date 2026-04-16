@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// Time: Update - TASK-A.01
+// Time: Updated - TASK-F.05
 package org.apache.kafka.common.security.authenticator;
 
 import org.apache.kafka.common.KafkaException;
@@ -29,7 +29,6 @@ import org.apache.kafka.common.security.auth.KafkaPrincipal;
 import org.apache.kafka.common.security.auth.KafkaPrincipalBuilder;
 import org.apache.kafka.common.security.auth.PlaintextAuthenticationContext;
 import org.apache.kafka.common.security.auth.SaslAuthenticationContext;
-import org.apache.kafka.common.security.auth.SecurityProtocol;
 import org.apache.kafka.common.security.auth.SslAuthenticationContext;
 import org.apache.kafka.common.security.kerberos.KerberosName;
 import org.apache.kafka.common.security.kerberos.KerberosShortNamer;
@@ -38,6 +37,7 @@ import org.apache.kafka.common.security.ssl.SslPrincipalMapper;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.security.Principal;
+import java.security.cert.X509Certificate;
 
 import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLSession;
@@ -85,15 +85,18 @@ public class DefaultKafkaPrincipalBuilder implements KafkaPrincipalBuilder {
             else
                 return new KafkaPrincipal(KafkaPrincipal.USER_TYPE, saslServer.getAuthorizationID());
         } else if (context instanceof HttpAuthenticationContext) {
+            // Handle HTTP authentication context -- TASK-F.05
+            // mTLS: extract principal from client certificate using the same SSL principal mapper
             HttpAuthenticationContext httpContext = (HttpAuthenticationContext) context;
-            // HTTPS with mTLS: extract principal from the leaf client certificate
-            if (httpContext.securityProtocol() == SecurityProtocol.HTTPS
-                    && httpContext.peerCertificates() != null
-                    && httpContext.peerCertificates().length > 0) {
-                return applySslPrincipalMapper(
-                    httpContext.peerCertificates()[0].getSubjectX500Principal());
+            if (httpContext.peerCertificates().isPresent()) {
+                X509Certificate[] certs = httpContext.peerCertificates().get();
+                if (certs.length > 0) {
+                    Principal leafPrincipal = certs[0].getSubjectX500Principal();
+                    return applySslPrincipalMapper(leafPrincipal);
+                }
             }
-            // HTTP without TLS, or HTTPS without client cert: anonymous
+            // Bearer and Basic auth require custom KafkaPrincipalBuilder implementations.
+            // DefaultKafkaPrincipalBuilder returns ANONYMOUS for these.
             return KafkaPrincipal.ANONYMOUS;
         } else {
             throw new IllegalArgumentException("Unhandled authentication context type: " + context.getClass().getName());

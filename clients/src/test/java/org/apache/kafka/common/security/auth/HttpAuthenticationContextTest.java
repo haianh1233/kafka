@@ -14,101 +14,161 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// Time: Created - TASK-A.01
+// Time: Created - TASK-F.05
 package org.apache.kafka.common.security.auth;
+
+import org.apache.kafka.test.TestSslUtils;
 
 import org.junit.jupiter.api.Test;
 
 import java.net.InetAddress;
-import java.net.UnknownHostException;
+import java.security.KeyPair;
 import java.security.cert.X509Certificate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.mockito.Mockito.mock;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class HttpAuthenticationContextTest {
 
     @Test
-    void testBasicConstructionHttp() throws UnknownHostException {
-        InetAddress addr = InetAddress.getByName("127.0.0.1");
-        HttpAuthenticationContext ctx = new HttpAuthenticationContext(
-            addr, "HTTP", SecurityProtocol.HTTP, null, null, null);
+    void testAnonymousContext() throws Exception {
+        HttpAuthenticationContext ctx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getLoopbackAddress())
+            .securityProtocol(SecurityProtocol.PLAINTEXT)
+            .build();
 
-        assertEquals(SecurityProtocol.HTTP, ctx.securityProtocol());
-        assertEquals(addr, ctx.clientAddress());
+        assertFalse(ctx.hasCredentials());
+        assertTrue(ctx.peerCertificates().isEmpty());
+        assertTrue(ctx.bearerToken().isEmpty());
+        assertTrue(ctx.basicUsername().isEmpty());
+        assertTrue(ctx.basicPassword().isEmpty());
+        assertEquals(SecurityProtocol.PLAINTEXT, ctx.securityProtocol());
+        assertEquals(InetAddress.getLoopbackAddress(), ctx.clientAddress());
+    }
+
+    @Test
+    void testBearerTokenContext() throws Exception {
+        HttpAuthenticationContext ctx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getLoopbackAddress())
+            .securityProtocol(SecurityProtocol.SSL)
+            .bearerToken("eyJhbGciOiJSUzI1NiJ9.test.sig")
+            .build();
+
+        assertTrue(ctx.hasCredentials());
+        assertTrue(ctx.bearerToken().isPresent());
+        assertEquals("eyJhbGciOiJSUzI1NiJ9.test.sig", ctx.bearerToken().get());
+        assertTrue(ctx.peerCertificates().isEmpty());
+        assertTrue(ctx.basicUsername().isEmpty());
+    }
+
+    @Test
+    void testBasicAuthContext() throws Exception {
+        HttpAuthenticationContext ctx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getLoopbackAddress())
+            .securityProtocol(SecurityProtocol.SSL)
+            .basicCredentials("admin", "secret")
+            .build();
+
+        assertTrue(ctx.hasCredentials());
+        assertTrue(ctx.basicUsername().isPresent());
+        assertEquals("admin", ctx.basicUsername().get());
+        assertTrue(ctx.basicPassword().isPresent());
+        assertEquals("secret", ctx.basicPassword().get());
+        assertTrue(ctx.peerCertificates().isEmpty());
+        assertTrue(ctx.bearerToken().isEmpty());
+    }
+
+    @Test
+    void testMtlsContext() throws Exception {
+        X509Certificate[] certs = createTestCertificates();
+
+        HttpAuthenticationContext ctx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getLoopbackAddress())
+            .securityProtocol(SecurityProtocol.SSL)
+            .peerCertificates(certs)
+            .build();
+
+        assertTrue(ctx.hasCredentials());
+        assertTrue(ctx.peerCertificates().isPresent());
+        assertEquals(1, ctx.peerCertificates().get().length);
+        assertTrue(ctx.bearerToken().isEmpty());
+        assertTrue(ctx.basicUsername().isEmpty());
+    }
+
+    @Test
+    void testBuilderRequiresClientAddress() {
+        assertThrows(IllegalArgumentException.class, () ->
+            new HttpAuthenticationContext.Builder()
+                .securityProtocol(SecurityProtocol.PLAINTEXT)
+                .build()
+        );
+    }
+
+    @Test
+    void testDefaultSecurityProtocol() throws Exception {
+        HttpAuthenticationContext ctx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getLoopbackAddress())
+            .build();
+
+        assertEquals(SecurityProtocol.PLAINTEXT, ctx.securityProtocol());
+    }
+
+    @Test
+    void testDefaultListenerName() throws Exception {
+        HttpAuthenticationContext ctx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getLoopbackAddress())
+            .build();
+
         assertEquals("HTTP", ctx.listenerName());
-        assertNull(ctx.bearerToken());
-        assertNull(ctx.basicCredentials());
-        assertNull(ctx.peerCertificates());
     }
 
     @Test
-    void testBasicConstructionHttps() throws UnknownHostException {
-        InetAddress addr = InetAddress.getByName("192.168.1.1");
-        X509Certificate[] certs = new X509Certificate[]{mock(X509Certificate.class)};
-        HttpAuthenticationContext ctx = new HttpAuthenticationContext(
-            addr, "HTTPS", SecurityProtocol.HTTPS,
-            "my-bearer-token", null, certs);
+    void testCustomListenerName() throws Exception {
+        HttpAuthenticationContext ctx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getLoopbackAddress())
+            .listenerName("HTTPS_EXTERNAL")
+            .build();
 
-        assertEquals(SecurityProtocol.HTTPS, ctx.securityProtocol());
-        assertEquals(addr, ctx.clientAddress());
-        assertEquals("HTTPS", ctx.listenerName());
-        assertEquals("my-bearer-token", ctx.bearerToken());
-        assertNull(ctx.basicCredentials());
-        assertNotNull(ctx.peerCertificates());
-        assertArrayEquals(certs, ctx.peerCertificates());
+        assertEquals("HTTPS_EXTERNAL", ctx.listenerName());
     }
 
     @Test
-    void testBasicCredentials() throws UnknownHostException {
-        InetAddress addr = InetAddress.getByName("10.0.0.1");
-        HttpAuthenticationContext ctx = new HttpAuthenticationContext(
-            addr, "HTTP", SecurityProtocol.HTTP,
-            null, "user:password", null);
+    void testHasCredentialsWithOnlyPeerCertificates() throws Exception {
+        X509Certificate[] certs = createTestCertificates();
 
-        assertEquals("user:password", ctx.basicCredentials());
-        assertNull(ctx.bearerToken());
+        HttpAuthenticationContext ctx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getLoopbackAddress())
+            .peerCertificates(certs)
+            .build();
+
+        assertTrue(ctx.hasCredentials());
     }
 
     @Test
-    void testRejectsNonHttpSecurityProtocol() throws UnknownHostException {
-        InetAddress addr = InetAddress.getByName("127.0.0.1");
-        assertThrows(IllegalArgumentException.class, () ->
-            new HttpAuthenticationContext(
-                addr, "PLAINTEXT", SecurityProtocol.PLAINTEXT,
-                null, null, null));
-        assertThrows(IllegalArgumentException.class, () ->
-            new HttpAuthenticationContext(
-                addr, "SSL", SecurityProtocol.SSL,
-                null, null, null));
-        assertThrows(IllegalArgumentException.class, () ->
-            new HttpAuthenticationContext(
-                addr, "SASL_PLAINTEXT", SecurityProtocol.SASL_PLAINTEXT,
-                null, null, null));
-        assertThrows(IllegalArgumentException.class, () ->
-            new HttpAuthenticationContext(
-                addr, "SASL_SSL", SecurityProtocol.SASL_SSL,
-                null, null, null));
+    void testHasCredentialsWithOnlyBearerToken() throws Exception {
+        HttpAuthenticationContext ctx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getLoopbackAddress())
+            .bearerToken("some-token")
+            .build();
+
+        assertTrue(ctx.hasCredentials());
     }
 
     @Test
-    void testRejectsNullClientAddress() {
-        assertThrows(NullPointerException.class, () ->
-            new HttpAuthenticationContext(
-                null, "HTTP", SecurityProtocol.HTTP,
-                null, null, null));
+    void testHasCredentialsWithOnlyBasicAuth() throws Exception {
+        HttpAuthenticationContext ctx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getLoopbackAddress())
+            .basicCredentials("user", "pass")
+            .build();
+
+        assertTrue(ctx.hasCredentials());
     }
 
-    @Test
-    void testRejectsNullListenerName() throws UnknownHostException {
-        InetAddress addr = InetAddress.getByName("127.0.0.1");
-        assertThrows(NullPointerException.class, () ->
-            new HttpAuthenticationContext(
-                addr, null, SecurityProtocol.HTTP,
-                null, null, null));
+    private X509Certificate[] createTestCertificates() throws Exception {
+        KeyPair keyPair = TestSslUtils.generateKeyPair("RSA");
+        X509Certificate cert = TestSslUtils.generateCertificate("CN=testclient", keyPair, 365, "SHA256withRSA");
+        return new X509Certificate[]{cert};
     }
 }
