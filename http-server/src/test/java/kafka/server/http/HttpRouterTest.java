@@ -89,6 +89,18 @@ class HttpRouterTest {
     }
 
     @Test
+    void route_openapiSpec_returnsOpenApiSpecHandler() {
+        var result = router.route(HttpMethod.GET, "/v1/openapi.yaml");
+        assertEquals(HttpRouter.HandlerType.OPENAPI_SPEC, result.handlerType());
+    }
+
+    @Test
+    void route_openapiSpec_wrongMethod_throws() {
+        assertThrows(InvalidRequestException.class,
+            () -> router.route(HttpMethod.POST, "/v1/openapi.yaml"));
+    }
+
+    @Test
     void route_unknownPath_throws() {
         assertThrows(InvalidRequestException.class,
             () -> router.route(HttpMethod.GET, "/v1/unknown"));

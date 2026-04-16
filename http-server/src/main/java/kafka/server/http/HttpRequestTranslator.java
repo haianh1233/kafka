@@ -153,6 +153,8 @@ public final class HttpRequestTranslator {
                 "Offset commit/fetch requests use dedicated translation methods, not the generic translate()");
             case HEALTH -> throw new InvalidRequestException(
                 "HEALTH requests should be handled directly, not translated");
+            case OPENAPI_SPEC -> throw new InvalidRequestException(
+                "OPENAPI_SPEC requests should be handled directly, not translated");
         };
     }
 

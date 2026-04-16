@@ -45,6 +45,7 @@ import java.util.regex.Pattern;
  *   POST /v1/consumer-groups/{g}/offsets -> COMMIT_OFFSETS
  *   GET  /v1/consumer-groups/{g}/offsets -> FETCH_OFFSETS
  *   GET  /v1/health                     -> HEALTH
+ *   GET  /v1/openapi.yaml              -> OPENAPI_SPEC
  */
 public final class HttpRouter {
 
@@ -58,7 +59,8 @@ public final class HttpRouter {
         CONSUMER_LAG,
         COMMIT_OFFSETS,
         FETCH_OFFSETS,
-        HEALTH
+        HEALTH,
+        OPENAPI_SPEC
     }
 
     // --- Route result record ---
@@ -104,6 +106,10 @@ public final class HttpRouter {
     // Matches: /v1/health
     private static final Pattern HEALTH_PATTERN =
         Pattern.compile("^/v1/health$");
+
+    // Matches: /v1/openapi.yaml
+    private static final Pattern OPENAPI_SPEC_PATTERN =
+        Pattern.compile("^/v1/openapi\\.yaml$");
 
     // --- Client ID validation ---
     private static final Pattern CLIENT_ID_PATTERN =
@@ -226,7 +232,7 @@ public final class HttpRouter {
     }
 
     /**
-     * Matches utility routes: HEALTH.
+     * Matches utility routes: HEALTH, OPENAPI_SPEC.
      */
     private RouteResult matchUtilityRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
         Matcher matcher = HEALTH_PATTERN.matcher(path);
@@ -234,6 +240,13 @@ public final class HttpRouter {
             requireMethod(method, HttpMethod.GET, path);
             return new RouteResult(HandlerType.HEALTH, null, null, null, queryParams);
         }
+
+        matcher = OPENAPI_SPEC_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.GET, path);
+            return new RouteResult(HandlerType.OPENAPI_SPEC, null, null, null, queryParams);
+        }
+
         return null;
     }
 
