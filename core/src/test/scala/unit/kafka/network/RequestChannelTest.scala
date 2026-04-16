@@ -33,7 +33,7 @@ import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.AlterConfigsRequest._
 import org.apache.kafka.common.requests._
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, KafkaPrincipalSerde, SecurityProtocol}
-import org.apache.kafka.common.utils.{SecurityUtils, Utils}
+import org.apache.kafka.common.utils.{MockTime, SecurityUtils, Utils}
 import org.apache.kafka.network.RequestConvertToJson
 import org.apache.kafka.network.metrics.RequestChannelMetrics
 import org.apache.kafka.test
@@ -285,6 +285,126 @@ class RequestChannelTest {
     } catch {
       case _: IOException => false
     }
+  }
+
+  // --- tryEnqueue() tests (TASK-A.03) ---
+
+  @Test
+  def testTryEnqueueSuccess(): Unit = {
+    val channel = new RequestChannel(
+      queueSize = 5,
+      new MockTime(),
+      requestChannelMetrics
+    )
+    try {
+      val req = buildMinimalRequest()
+      val result = channel.tryEnqueue(req)
+      assertTrue(result, "tryEnqueue should return true when queue has space")
+
+      // Verify the request is in the queue by receiving it
+      val received = channel.receiveRequest(timeout = 1000)
+      assertNotNull(received, "Should receive the enqueued request")
+    } finally {
+      channel.shutdown()
+    }
+  }
+
+  @Test
+  def testTryEnqueueReturnsFalseWhenQueueFull(): Unit = {
+    val channel = new RequestChannel(
+      queueSize = 1,
+      new MockTime(),
+      requestChannelMetrics
+    )
+    try {
+      // Fill the queue
+      val req1 = buildMinimalRequest()
+      val firstResult = channel.tryEnqueue(req1)
+      assertTrue(firstResult, "First tryEnqueue should succeed")
+
+      // Second enqueue should fail (queue full)
+      val req2 = buildMinimalRequest()
+      val secondResult = channel.tryEnqueue(req2)
+      assertFalse(secondResult, "tryEnqueue should return false when queue is full")
+    } finally {
+      channel.shutdown()
+    }
+  }
+
+  @Test
+  def testTryEnqueueDoesNotBlock(): Unit = {
+    val channel = new RequestChannel(
+      queueSize = 1,
+      new MockTime(),
+      requestChannelMetrics
+    )
+    try {
+      // Fill the queue
+      val req1 = buildMinimalRequest()
+      channel.tryEnqueue(req1)
+
+      // tryEnqueue on full queue should return immediately
+      val startNanos = System.nanoTime()
+      val req2 = buildMinimalRequest()
+      val result = channel.tryEnqueue(req2)
+      val elapsedMs = (System.nanoTime() - startNanos) / 1_000_000
+
+      assertFalse(result, "tryEnqueue should return false on full queue")
+      assertTrue(elapsedMs < 100, s"tryEnqueue should not block; took ${elapsedMs}ms")
+    } finally {
+      channel.shutdown()
+    }
+  }
+
+  @Test
+  def testTryEnqueueAfterDrain(): Unit = {
+    val channel = new RequestChannel(
+      queueSize = 1,
+      new MockTime(),
+      requestChannelMetrics
+    )
+    try {
+      val req1 = buildMinimalRequest()
+      assertTrue(channel.tryEnqueue(req1))
+
+      // Queue is full
+      val req2 = buildMinimalRequest()
+      assertFalse(channel.tryEnqueue(req2))
+
+      // Drain one request
+      channel.receiveRequest(timeout = 1000)
+
+      // Now there should be space
+      val req3 = buildMinimalRequest()
+      assertTrue(channel.tryEnqueue(req3), "tryEnqueue should succeed after draining")
+    } finally {
+      channel.shutdown()
+    }
+  }
+
+  private def buildMinimalRequest(): RequestChannel.Request = {
+    val metadataReq = new MetadataRequest.Builder(java.util.Collections.emptyList[String](), true).build()
+    val buffer = metadataReq.serializeWithHeader(
+      new RequestHeader(metadataReq.apiKey, metadataReq.version, "test-client", 0)
+    )
+    val requestContext = new RequestContext(
+      RequestHeader.parse(buffer),
+      "test-connection",
+      InetAddress.getLoopbackAddress,
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "user"),
+      ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT),
+      SecurityProtocol.PLAINTEXT,
+      ClientInformation.EMPTY,
+      false
+    )
+    new RequestChannel.Request(
+      processor = 0,
+      context = requestContext,
+      startTimeNanos = System.nanoTime(),
+      memoryPool = MemoryPool.NONE,
+      buffer = buffer,
+      metrics = requestChannelMetrics
+    )
   }
 
   def request(req: AbstractRequest): RequestChannel.Request = {
