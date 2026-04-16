@@ -5,75 +5,26 @@
 1. [Overview](#1-overview)
 2. [Goals & Non-Goals](#2-goals--non-goals)
 3. [Core Design Principles](#3-core-design-principles)
-   - 3.1 Cluster Transparency — Produce Anywhere, Consume Anywhere
-   - 3.2 Queue as Logical View of a Topic
-   - 3.3 Exchange Routing — Full AMQP Semantics
-   - 3.4 Message Lifecycle Management
 4. [Architecture Overview](#4-architecture-overview)
 5. [WebSocket API Specification](#5-websocket-api-specification)
-   - 5.1 Connection Lifecycle
-   - 5.2 Control Messages (Client → Broker)
-   - 5.3 Data Messages (Broker → Client)
-   - 5.4 Exchange Operations
-   - 5.5 Queue Operations
-   - 5.6 Binding Operations
-   - 5.7 Publish (Client → Broker → Routing → Queues)
-   - 5.8 Subscribe / Unsubscribe
-   - 5.9 Acknowledgements (ACK / NACK)
-   - 5.10 Flow Control (Credits)
-6. [HTTP REST Management API](#5-http-rest-management-api)
-   - 5.1 Overview & Health
-   - 5.2 Virtual Host Management
-   - 5.3 Exchange Management
-   - 5.4 Queue Management (Declare, Get, List, Delete, Purge, Update Settings)
-   - 5.5 Binding Management
-   - 5.6 Connection Management (List, Details, Force-Close)
-   - 5.7 Consumer Management (List, Force-Cancel)
-   - 5.8 Message Operations via REST (Publish, Get, Ack, Nack)
-   - 5.9 Complete REST Endpoint Summary
+6. [HTTP REST Management API](#6-http-rest-management-api)
 7. [Routing Engine](#7-routing-engine)
-   - 7.1 Direct Exchange
-   - 7.2 Topic Exchange (Wildcard)
-   - 7.3 Fanout Exchange
-   - 7.4 Headers Exchange
-   - 7.5 Exchange-to-Exchange Routing
-   - 7.6 Default Exchange
 8. [Produce Path (WebSocket)](#8-produce-path-websocket)
 9. [Consume Path (WebSocket Push)](#9-consume-path-websocket-push)
-10. [Broker-to-Broker Forwarding — Produce & Consume Anywhere](#10-broker-to-broker-forwarding--produce--consume-anywhere)
+10. [Broker-to-Broker Forwarding](#10-broker-to-broker-forwarding--produce--consume-anywhere)
 11. [Queue: The Logical View](#11-queue-the-logical-view)
-    - 11.1 Queue-to-Topic Mapping
-    - 11.2 Queue Policies and Kafka Topic Configuration
-    - 11.3 Queue Lifecycle (Auto-Create, Auto-Delete, Exclusive, Durable)
-    - 11.4 Competing Consumers on a Queue
-    - 11.5 Queue Depth and Observability
 12. [Message Lifecycle](#12-message-lifecycle)
-    - 12.1 Publish → Route → Enqueue → Deliver → ACK (Happy Path)
-    - 12.2 NACK with Requeue — Redelivery
-    - 12.3 NACK without Requeue — Dead-Letter Exchange (DLX)
-    - 12.4 Message TTL — Per-Queue and Per-Message Expiration
-    - 12.5 Priority Delivery
-    - 12.6 Poison Message Protection
-    - 12.7 Message Deduplication
 13. [Routing-to-Kafka Mapping](#13-routing-to-kafka-mapping)
 14. [Metadata Storage](#14-metadata-storage)
 15. [Integration with Existing Infrastructure](#15-integration-with-existing-infrastructure)
 16. [Module Changes: `http-server`](#16-module-changes-http-server)
 17. [Configuration](#17-configuration)
 18. [Error Handling](#18-error-handling)
-19. [Security](#19-security)
+19. [Security — Authentication, Authorization & Quotas](#19-security)
 20. [Implementation Plan](#20-implementation-plan)
 21. [Implementation Concerns](#21-implementation-concerns)
 22. [Comparison with Alternatives](#22-comparison-with-alternatives)
 23. [E2E Testing Strategy](#23-e2e-testing-strategy)
-    - 23.1 Test Infrastructure — Leveraging Existing Kafka Test System
-    - 23.2 WsTestClient — WebSocket Test Harness
-    - 23.3 Unit Tests (No Broker)
-    - 23.4 Integration Tests (Real Broker Cluster)
-    - 23.5 Cross-Protocol Tests
-    - 23.6 Multi-Broker Cluster Tests
-    - 23.7 Message Lifecycle Tests
-    - 23.8 Test Matrix
 
 ---
 
@@ -165,6 +116,13 @@ via WebSocket subscription. Or manage routing via REST, subscribe via WebSocket.
 - `Basic.Recover` (redeliver all unacked) — disconnect and reconnect achieves the same effect
 - `noWait` flags — JSON protocol always sends responses for client correlation
 - `immediate` flag on publish — deprecated in AMQP, removed by RabbitMQ 3.0
+- Consumer priority (`x-priority` on subscribe) — Kafka partition assignment distributes
+  partitions, not individual messages; priority consumers don't map to this model
+- Single Active Consumer (`x-single-active-consumer`) — use `exclusive: true` for
+  single-consumer semantics, or rely on Kafka's single-partition assignment
+- `x-overflow: "drop-head"` — Kafka's log-based storage does not support arbitrary message
+  deletion from the head; only `reject-publish` is supported for `x-max-length`
+- Lazy queues (`x-queue-mode=lazy`) — Kafka's storage model writes to disk by default
 
 ---
 
@@ -495,7 +453,7 @@ Netty workers and `KafkaRequestHandler` threads — neither is ever blocked by c
 
 ---
 
-## 4. WebSocket API Specification
+## 5. WebSocket API Specification
 
 ### 4.1 Connection Lifecycle
 
@@ -607,6 +565,9 @@ correlation. If omitted, the response has no `id`.
 | `get-ok` | Pull message response (has message) | |
 | `get-empty` | Pull message response (no message) | |
 | `queue-purged` | Purge response | Includes purged message count |
+| `exchange-deleted` | Exchange delete response | |
+| `queue-deleted` | Queue delete response | |
+| `confirms-enabled` | Confirm mode enabled | Response to `enable-confirms` |
 
 ---
 
@@ -1202,7 +1163,7 @@ auto-acks but respects the credit window.
 
 ---
 
-## 5. HTTP REST Management API
+## 6. HTTP REST Management API
 
 A complete management API for all AMQP routing operations. Every operation available via
 WebSocket control frames is also available via REST — plus additional inspection and
@@ -1815,7 +1776,7 @@ When `ackMode: "manual"`, the returned `deliveryTag` must be acked via:
 
 ---
 
-## 6. Routing Engine
+## 7. Routing Engine
 
 The routing engine resolves `(exchange, routingKey, headers)` → `Set<String> matchedQueues`.
 It is an in-memory data structure backed by the `__ws_routing_metadata` topic and follows
@@ -2037,7 +1998,7 @@ via the `returned` frame. The alternate exchange is tried **before** the mandato
 
 ---
 
-## 7. Produce Path (WebSocket)
+## 8. Produce Path (WebSocket)
 
 ### 7.1 End-to-end: WebSocket publish → exchange routing → Kafka
 
@@ -2147,7 +2108,7 @@ exchange AND queue. Each parameter narrows the result set.
 
 ---
 
-## 8. Consume Path (WebSocket Push)
+## 9. Consume Path (WebSocket Push)
 
 ### 8.1 End-to-end: subscribe → fetch loop → deliver
 
@@ -2294,28 +2255,10 @@ from Kafka record headers (§10.3) and Kafka-native fields (`partition`, `offset
 
 ---
 
-## 9. Broker-to-Broker Forwarding
+## 10. Broker-to-Broker Forwarding — Produce & Consume Anywhere
 
 WebSocket publish and consume **reuse the existing `ProduceForwardManager` and
 `FetchForwardManager`** from the HTTP module. No new forwarding infrastructure is needed.
-
-The flow is identical to HTTP forwarding (see `http-protocol-design.md` §7):
-
-```
-WS publish → exchange routing → queue topics → per-topic leader lookup
-  → LOCAL: ReplicaManager.appendRecords()
-  → REMOTE: ProduceForwardManager.forward(leaderId, entries, acks, timeout)
-  → CompletableFuture.allOf().handleAsync(wsAsyncExecutor)
-
-WS consume → fetch loop → per-partition leader lookup
-  → LOCAL: ReplicaManager.fetchMessages()
-  → REMOTE: FetchForwardManager.forward(leaderId, fetchSpecs, maxWait, ...)
-  → CompletableFuture.allOf().handleAsync(wsAsyncExecutor)
-```
-
----
-
-## 10. Broker-to-Broker Forwarding — Produce & Consume Anywhere
 
 See §3.1 for the design principle. This section details the mechanics.
 
@@ -2730,6 +2673,13 @@ Client B (subscriber)           Broker                     DLQ Consumer
 routing engine. This means DLX messages can be routed to multiple queues via bindings, just
 like any other publish.
 
+**Atomicity invariant:** DLX produce MUST complete **before** the original message's offset
+is committed. Sequence: (1) produce to DLX topic, (2) await produce ack, (3) commit original
+offset. If the broker crashes after step 1 but before step 3, the message appears in both
+the original queue (redelivered) and the DLQ (duplicate). This is consistent with
+at-least-once semantics. If the broker crashes before step 1, the NACK is lost and the
+message is redelivered to the original consumer — no data loss.
+
 **`x-death` header accumulates:** If a message is dead-lettered multiple times (e.g.,
 DLQ → processed → NACK → DLX again), the `x-death` array gains additional entries,
 creating an audit trail:
@@ -2903,11 +2853,40 @@ ack(subscriptionId="sub-1", deliveryTag=5, multiple=true)
 Batch commit optimization: offsets are flushed every `ws.ack.commit.interval.ms`
 (default 1000ms), on unsubscribe, and on WebSocket close.
 
+**Offset commit with gaps (correctness invariant).** When `multiple=true` ACK encounters
+a gap (a NACKed-with-requeue tag within the range), the offset commit advances only to
+the **lowest uncommitted offset** per partition:
+
+```
+Delivered: tag=1 (offset=40), tag=2 (offset=41), tag=3 (offset=42),
+           tag=4 (offset=43), tag=5 (offset=44)
+
+Client NACKs tag=3 with requeue=true (offset 42 not committed)
+Client ACKs tag=5 with multiple=true
+
+Offset commit: tp0 → 42 (NOT 45!)
+  Tags 1,2 → committed (offsets 40,41 < 42)
+  Tag 3 → gap (offset 42, requeued, not committed)
+  Tags 4,5 → acked in memory, but offsets 43,44 NOT committed yet
+  
+After tag=3 is redelivered and acked:
+  Offset commit: tp0 → 45 (gap filled, safe to advance past all 5)
+```
+
+The broker maintains a per-partition **ack bitmap** (not just the highest tag). Only
+contiguous acked offsets from the low watermark are committed. This prevents a `multiple`
+ACK from skipping over a requeued message.
+
+**Crash recovery window.** If the broker crashes, up to `ws.ack.commit.interval.ms` worth
+of ACKed messages may be redelivered. At high throughput this could be thousands of messages.
+Operators requiring minimal redelivery should lower this value (e.g., 100ms) at the cost of
+more frequent offset commits.
+
 ---
 
 ## 14. Metadata Storage
 
-### 11.1 `__ws_routing_metadata` topic
+### 14.1 `__ws_routing_metadata` topic
 
 A single compacted Kafka topic stores all routing metadata:
 
@@ -2928,7 +2907,7 @@ Record value:
   null value = tombstone (entity deleted)
 ```
 
-### 11.2 In-memory cache
+### 14.2 In-memory cache
 
 `WsRoutingMetadataManager` maintains concurrent in-memory structures:
 
@@ -2943,14 +2922,14 @@ All mutations:
 1. Write to `__ws_routing_metadata` (durable)
 2. Apply to in-memory cache (immediate)
 
-### 11.3 Startup replay
+### 14.3 Startup replay
 
 On broker startup, `WsRoutingMetadataManager` replays `__ws_routing_metadata` from offset 0
 to high watermark, rebuilding the in-memory cache. The WebSocket endpoint does not accept
 connections until replay is complete (same pattern as `GroupCoordinator` replaying
 `__consumer_offsets`).
 
-### 11.4 Cross-broker consistency
+### 14.4 Cross-broker consistency
 
 All brokers replay the same `__ws_routing_metadata` topic. Exchange/queue/binding
 declarations on one broker are visible on all brokers after replication lag (typically <100ms
@@ -2958,7 +2937,7 @@ in a healthy cluster). Declarations are idempotent (compacted key deduplication)
 
 ---
 
-## 12. Integration with Existing Infrastructure
+## 15. Integration with Existing Infrastructure
 
 ### 12.1 WebSocket upgrade in HttpChannelInitializer
 
@@ -3086,7 +3065,7 @@ use the same forwarding infrastructure.
 
 ---
 
-## 13. Module Changes: `http-server`
+## 16. Module Changes: `http-server`
 
 All WebSocket code lives in the existing `http-server` module. No new Gradle subproject.
 
@@ -3155,7 +3134,7 @@ http-server/src/test/java/kafka/server/http/
 
 ---
 
-## 14. Configuration
+## 17. Configuration
 
 New properties (in addition to existing HTTP config from `http-protocol-design.md` §10):
 
@@ -3183,13 +3162,18 @@ New properties (in addition to existing HTTP config from `http-protocol-design.m
 | `ws.dedup.cache.size` | `10000` | Max entries in dedup cache per exchange |
 | `ws.dedup.cache.ttl.ms` | `60000` | Dedup cache entry TTL |
 | `ws.max.connections.per.broker` | `10000` | Max concurrent WS connections per broker. Excess rejected with close code 4429. |
-| `ws.metadata.startup.timeout.ms` | `30000` | Max time to wait for `__ws_routing_metadata` replay before starting. If timeout expires, broker starts with default exchanges only and logs a warning. |
+| `ws.max.exchanges.per.vhost` | `1000` | Max exchanges per virtual host |
+| `ws.max.queues.per.vhost` | `10000` | Max queues per virtual host (each creates a Kafka topic) |
+| `ws.max.bindings.per.exchange` | `10000` | Max bindings per exchange |
+| `ws.max.control.messages.per.second` | `50` | Control message rate limit per connection |
+| `ws.consumer.ack.timeout.ms` | `300000` (5 min) | Auto-requeue unacked messages after this duration |
+| `ws.metadata.startup.timeout.ms` | `30000` | Max time to wait for `__ws_routing_metadata` replay. If timeout expires, broker starts with default exchanges only and logs a warning. |
 
 No new listener configuration needed — WebSocket runs on the same HTTP listener port.
 
 ---
 
-## 15. Error Handling
+## 18. Error Handling
 
 ### 15.1 Error frame format
 
@@ -3220,6 +3204,10 @@ No new listener configuration needed — WebSocket runs on the same HTTP listene
 | `NO_ROUTE` | Mandatory publish, no matching queues | publish (→ `returned` frame) |
 | `QUOTA_EXCEEDED` | Throttle limit reached | publish, subscribe |
 | `NOT_ENOUGH_REPLICAS` | ISR below minimum | publish |
+| `STORAGE_ERROR` | Broker disk full or log dir failure | publish |
+| `RECORD_TOO_LARGE` | Message exceeds `message.max.bytes` after routing overhead | publish |
+| `RESOURCE_LIMIT_EXCEEDED` | Max exchanges/queues/bindings reached | declare-exchange, declare-queue, bind |
+| `ACK_TIMEOUT` | Delivery tag not acked within timeout | (broker-initiated, requeues message) |
 | `INTERNAL_ERROR` | Unexpected broker error | Any |
 | `CONNECTION_FORCED` | Broker shutting down | (close frame, not error frame) |
 
@@ -3238,7 +3226,7 @@ No new listener configuration needed — WebSocket runs on the same HTTP listene
 
 ---
 
-## 16. Security
+## 19. Security
 
 ### 16.1 Authentication
 
@@ -3266,15 +3254,61 @@ All subsequent operations on this WebSocket use the same principal.
 | `delete-queue` | `TOPIC:ws.{queue}` | `DELETE` |
 | `bind` / `unbind` | `TOPIC:ws.{queue}` | `ALTER` |
 
-### 16.3 Per-message authorization on publish
+### 19.3 Per-message authorization on publish
 
 When a single `publish` routes to multiple queues (fanout), the broker checks `WRITE`
 permission on **each** target queue's backing topic. If any check fails, the publish fails
 entirely (no partial routing).
 
+### 19.4 Quotas and Throttling
+
+WebSocket clients are subject to Kafka's `ClientQuotaManager`. The `clientId` is derived
+from the `X-Kafka-Client-ID` header on the upgrade request (or `"ws-client"` default).
+
+| Quota type | How it applies |
+|---|---|
+| **Produce byte-rate** | Applied per `ProduceRequest` through `KafkaApis` — same as HTTP |
+| **Fetch byte-rate** | Applied per `FetchRequest` in `WsConsumerFetchLoop` |
+| **Request rate** | Each WS control message (declare/bind/etc.) counts as one request |
+
+**Throttle response:** When a quota is exceeded, the broker sends:
+
+```json
+{ "type": "error", "errorCode": "QUOTA_EXCEEDED", "retryAfterMs": 500 }
+```
+
+For subscriptions, the `WsConsumerFetchLoop` pauses for `throttleTimeMs` before the next
+fetch iteration. The client sees a gap in delivery but does not receive an error.
+
+### 19.5 Resource Limits
+
+| Config | Default | Description |
+|---|---|---|
+| `ws.max.connections.per.broker` | `10000` | Max concurrent WS connections |
+| `ws.max.exchanges.per.vhost` | `1000` | Max exchanges per vhost |
+| `ws.max.queues.per.vhost` | `10000` | Max queues per vhost (each creates a Kafka topic) |
+| `ws.max.bindings.per.exchange` | `10000` | Max bindings per exchange |
+| `ws.max.control.messages.per.second` | `50` | Control message rate limit per connection |
+
+Exceeding any limit returns `RESOURCE_LIMIT_EXCEEDED` error. Rate limit returns
+`QUOTA_EXCEEDED` with `retryAfterMs`.
+
+### 19.6 ACK Timeout
+
+If a consumer holds a message without ACKing for longer than `ws.consumer.ack.timeout.ms`
+(default 300000 / 5 minutes), the broker NACKs the message on the consumer's behalf with
+`requeue: true` and sends a warning frame:
+
+```json
+{ "type": "error", "errorCode": "ACK_TIMEOUT", "deliveryTag": 42,
+  "errorMessage": "Delivery tag 42 timed out after 300000ms, requeued" }
+```
+
+This prevents indefinite message holding by slow or stuck consumers.
+
 ---
 
-## 17. Implementation Plan
+## 20. Implementation Plan
 
 ### Phase 1 — WebSocket upgrade + basic publish/subscribe (direct exchange only)
 
@@ -3334,7 +3368,7 @@ entirely (no partial routing).
 
 ---
 
-## 18. Implementation Concerns
+## 21. Implementation Concerns
 
 ### 18.1 CRITICAL — WsConsumerFetchLoop must not block Netty or handler threads
 
@@ -3452,7 +3486,7 @@ resets the idle timer on every frame received (including pong frames).
 
 ---
 
-## 19. Comparison with Alternatives
+## 22. Comparison with Alternatives
 
 ### 19.1 Why WebSocket + JSON instead of native AMQP 0-9-1
 
@@ -3497,7 +3531,7 @@ connection count and adding correlation complexity.
 
 ---
 
-## 23. E2E Testing Strategy
+## 23. E2E Testing Strategy (unchanged numbering)
 
 ### 23.1 Test Infrastructure — Leveraging Existing Kafka Test System
 
@@ -4338,5 +4372,5 @@ class WsQueueLifecycleIntegrationTest extends HttpIntegrationTestHarness {
 
 ---
 
-*Document version: 0.6 — 2026-04-16*
+*Document version: 0.7 — 2026-04-16*
 *Branch: feature/http-protocol*
