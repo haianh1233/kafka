@@ -34,6 +34,7 @@ import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
 import org.apache.kafka.common.record.internal._
 import org.apache.kafka.common.requests._
+import org.apache.kafka.common.requests.{FetchMetadata => JFetchMetadata}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, KafkaPrincipalSerde, SecurityProtocol}
 import org.apache.kafka.common.utils.{SecurityUtils, Utils}
 import org.apache.kafka.coordinator.group.{GroupConfigManager, GroupCoordinator}
@@ -43,7 +44,8 @@ import org.apache.kafka.image.{MetadataDelta, MetadataImage, MetadataProvenance}
 import org.apache.kafka.metadata.{ConfigRepository, KRaftMetadataCache, MockConfigRepository}
 import org.apache.kafka.network.metrics.RequestChannelMetrics
 import org.apache.kafka.raft.{KRaftConfigs, QuorumConfig}
-import org.apache.kafka.server.{ClientMetricsManager, FetchManager, SimpleApiVersionManager}
+import org.apache.kafka.server.{ClientMetricsManager, FetchManager, FetchSessionCacheShard, SimpleApiVersionManager}
+import org.apache.kafka.server.FetchContext.FullFetchContext
 import org.apache.kafka.server.authorizer.{AuthorizationResult, Authorizer}
 import org.apache.kafka.server.common.{FinalizedFeatures, KRaftVersion, MetadataVersion, RequestLocal}
 import org.apache.kafka.server.quota.{ClientQuotaManager, ControllerMutationQuotaManager, ReplicationQuotaManager}
@@ -69,9 +71,9 @@ import scala.jdk.CollectionConverters._
  * tests self-contained. Follows the same mock pattern as KafkaApisTest.
  *
  * Tests cover:
- * - PRODUCE/FETCH dispatch branching on securityProtocol.isHttp
- * - handleHttpProduceRequest: auth, local append, leader-not-available
- * - handleHttpConsumeRequest: maxWaitMs clamping, local fetch
+ * - PRODUCE/FETCH with HTTP SecurityProtocol route through standard handlers
+ * - handleProduceRequest: auth, local append via handleProduceAppend, not-leader
+ * - handleFetchRequest: maxWaitMs clamping for HTTP, local fetch via fetchMessages
  */
 class KafkaApisHttpTest extends Logging {
 
@@ -254,11 +256,27 @@ class KafkaApisHttpTest extends Logging {
       -1, -1, maxWait, 1, fetchData).build()
   }
 
+  // -------------------------------------------------------------------
+  // Helper: set up fetchManager mock so standard handleFetchRequest works
+  // -------------------------------------------------------------------
+  private def setupFetchManagerMock(topicName: String, topicId: Uuid): Unit = {
+    val tidp = new TopicIdPartition(topicId, new TopicPartition(topicName, 0))
+    val fetchData = util.Map.of(tidp, new FetchRequest.PartitionData(topicId, 0, 0, 1024 * 1024, Optional.empty()))
+    val fetchContext = new FullFetchContext(time, new FetchSessionCacheShard(1000, 100, Int.MaxValue, 0), fetchData, false, false)
+    when(fetchManager.newContext(
+      any[Short],
+      any[JFetchMetadata],
+      any[Boolean],
+      any[util.Map[TopicIdPartition, FetchRequest.PartitionData]],
+      any[util.List[TopicIdPartition]],
+      any[util.Map[Uuid, String]])).thenReturn(fetchContext)
+  }
+
   // ===================================================================
-  // Test 1: PRODUCE + HTTP -> handleHttpProduceRequest
+  // Test 1: PRODUCE + HTTP -> standard handleProduceRequest
   // ===================================================================
   @Test
-  def testProduceWithHttpProtocolRoutesToHttpHandler(): Unit = {
+  def testProduceWithHttpProtocolRoutesToStandardHandler(): Unit = {
     kafkaApis = createKafkaApis()
     val topicId = Uuid.randomUuid()
     setupLocalLeaderMetadataCache("test-topic", 1, 2, topicId)
@@ -271,20 +289,21 @@ class KafkaApisHttpTest extends Logging {
 
     kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
 
-    // Verify replicaManager.appendRecords was called (HTTP produce path)
-    verify(replicaManager).appendRecords(
+    // Verify replicaManager.handleProduceAppend was called (standard produce path)
+    verify(replicaManager).handleProduceAppend(
       anyLong(), anyShort(), anyBoolean(), any(), any(), any(),
-      any(), any(), any(), any())
+      any(), any(), any())
   }
 
   // ===================================================================
-  // Test 2: FETCH + HTTP -> handleHttpConsumeRequest
+  // Test 2: FETCH + HTTP -> standard handleFetchRequest
   // ===================================================================
   @Test
-  def testFetchWithHttpProtocolRoutesToHttpConsumeHandler(): Unit = {
+  def testFetchWithHttpProtocolRoutesToStandardHandler(): Unit = {
     kafkaApis = createKafkaApis()
     val topicId = Uuid.randomUuid()
     setupLocalLeaderMetadataCache("test-topic", 1, 2, topicId)
+    setupFetchManagerMock("test-topic", topicId)
 
     val fetchRequest = buildFetchRequest("test-topic", topicId)
     val request = buildRequest(fetchRequest) // default SecurityProtocol.HTTP
@@ -294,7 +313,7 @@ class KafkaApisHttpTest extends Logging {
 
     kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
 
-    // Verify replicaManager.fetchMessages was called (HTTP consume path)
+    // Verify replicaManager.fetchMessages was called (standard fetch path)
     verify(replicaManager).fetchMessages(any(), any(), any(), any())
   }
 
@@ -359,7 +378,7 @@ class KafkaApisHttpTest extends Logging {
   }
 
   // ===================================================================
-  // Test 5: HTTP PRODUCE with local leader -> appendRecords called
+  // Test 5: HTTP PRODUCE with local leader -> handleProduceAppend called
   // ===================================================================
   @Test
   def testHttpProduceLocalLeaderAppends(): Unit = {
@@ -376,17 +395,18 @@ class KafkaApisHttpTest extends Logging {
 
     kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
 
-    // Verify appendRecords was called on the local leader
-    verify(replicaManager).appendRecords(
+    // Verify handleProduceAppend was called on the local leader (standard path)
+    verify(replicaManager).handleProduceAppend(
       anyLong(), anyShort(), anyBoolean(), any(), any(), any(),
-      any(), any(), any(), any())
+      any(), any(), any())
   }
 
   // ===================================================================
-  // Test 6: HTTP PRODUCE, not leader -> response sent (not appendRecords)
+  // Test 6: HTTP PRODUCE, not leader -> handleProduceAppend still called
+  // (replica manager handles NOT_LEADER_OR_FOLLOWER internally)
   // ===================================================================
   @Test
-  def testHttpProduceNotLeaderReturnsLeaderNotAvailable(): Unit = {
+  def testHttpProduceNotLeaderRoutesToStandardHandler(): Unit = {
     kafkaApis = createKafkaApis()
     val topicId = Uuid.randomUuid()
 
@@ -419,21 +439,16 @@ class KafkaApisHttpTest extends Logging {
 
     kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
 
-    // With no produceForwardManager wired, remote partitions get LEADER_NOT_AVAILABLE.
-    // The response should be sent directly (appendRecords should NOT be called).
-    val capturedResponse: ArgumentCaptor[AbstractResponse] =
-      ArgumentCaptor.forClass(classOf[AbstractResponse])
-    verify(requestChannel).sendResponse(
-      ArgumentMatchers.eq(request), capturedResponse.capture(), any())
-
-    // appendRecords should not be called for a partition where this broker is not the leader
-    verify(replicaManager, never()).appendRecords(
+    // Standard handler always calls handleProduceAppend; the replica manager
+    // internally returns NOT_LEADER_OR_FOLLOWER for partitions this broker
+    // does not lead.
+    verify(replicaManager).handleProduceAppend(
       anyLong(), anyShort(), anyBoolean(), any(), any(), any(),
-      any(), any(), any(), any())
+      any(), any(), any())
   }
 
   // ===================================================================
-  // Test 7: HTTP CONSUME maxWaitMs is clamped
+  // Test 7: HTTP CONSUME maxWaitMs is clamped in standard handler
   // ===================================================================
   @Test
   def testHttpConsumeMaxWaitMsClamped(): Unit = {
@@ -443,6 +458,7 @@ class KafkaApisHttpTest extends Logging {
     ))
     val topicId = Uuid.randomUuid()
     setupLocalLeaderMetadataCache("test-topic", 1, 2, topicId)
+    setupFetchManagerMock("test-topic", topicId)
 
     // Client requests 30s maxWait, but config caps at 5s
     val fetchRequest = buildFetchRequest("test-topic", topicId, maxWait = 30000)
@@ -470,6 +486,7 @@ class KafkaApisHttpTest extends Logging {
     kafkaApis = createKafkaApis()
     val topicId = Uuid.randomUuid()
     setupLocalLeaderMetadataCache("test-topic", 1, 2, topicId)
+    setupFetchManagerMock("test-topic", topicId)
 
     val fetchRequest = buildFetchRequest("test-topic", topicId)
     val request = buildRequest(fetchRequest, SecurityProtocol.HTTP)
@@ -479,7 +496,7 @@ class KafkaApisHttpTest extends Logging {
 
     kafkaApis.handle(request, RequestLocal.withThreadConfinedCaching)
 
-    // Verify fetchMessages was called on the local leader
+    // Verify fetchMessages was called on the local leader (standard path)
     verify(replicaManager).fetchMessages(any(), any(), any(), any())
   }
 }
