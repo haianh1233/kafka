@@ -1,6 +1,6 @@
 <!DOCTYPE import-control PUBLIC
-        "-//Puppy Crawl//DTD Import Control 1.1//EN"
-        "http://www.puppycrawl.com/dtds/import_control_1_1.dtd">
+    "-//Checkstyle//DTD ImportControl Configuration 1.4//EN"
+    "https://checkstyle.sourceforge.io/dtds/import_control_1_4.dtd">
 <!--
  Licensed to the Apache Software Foundation (ASF) under one or more
  contributor license agreements.  See the NOTICE file distributed with
@@ -20,15 +20,33 @@
 
 <import-control pkg="kafka.server.http">
 
-    <!-- common library dependencies -->
-    <allow pkg="java" />
-    <allow pkg="org.slf4j" />
-    <allow pkg="org.junit" />
-    <allow pkg="org.mockito" />
+  <!-- common library dependencies -->
+  <allow pkg="java" />
+  <allow pkg="javax.management" />
+  <allow pkg="org.slf4j" />
+  <allow pkg="org.junit" />
+  <allow pkg="org.opentest4j" />
+  <allow pkg="org.mockito" />
+  <allow pkg="java.security" />
 
-    <!-- kafka common classes -->
-    <allow pkg="org.apache.kafka.common" />
-    <allow pkg="org.apache.kafka.clients" />
-    <allow pkg="org.apache.kafka.server" />
+  <!-- Netty dependencies -->
+  <allow pkg="io.netty" />
+
+  <!-- Jackson for JSON serialization -->
+  <allow pkg="com.fasterxml.jackson" />
+
+  <!-- Kafka core (RequestChannel, etc.) -->
+  <allow pkg="kafka.network" />
+  <allow pkg="kafka.server" />
+  <allow pkg="kafka.utils" />
+
+  <!-- Kafka common/clients -->
+  <allow pkg="org.apache.kafka.common" />
+  <allow pkg="org.apache.kafka.server" />
+  <allow pkg="org.apache.kafka.network" />
+  <allow pkg="org.apache.kafka.clients" />
+
+  <!-- Scala interop -->
+  <allow pkg="scala" />
 
 </import-control>
