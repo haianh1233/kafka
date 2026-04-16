@@ -92,8 +92,8 @@ public final class HttpResponseSerializer {
     static final String TYPE_STRING = "STRING";
     static final String TYPE_BINARY = "BINARY";
 
-    // --- HTTP 207 Multi-Status (not in Netty's HttpResponseStatus by default) ---
-    static final HttpResponseStatus MULTI_STATUS = HttpResponseStatus.valueOf(207);
+    // --- HTTP 207 Multi-Status -- delegates to HttpErrorMapper ---
+    static final HttpResponseStatus MULTI_STATUS = HttpErrorMapper.MULTI_STATUS;
 
     private HttpResponseSerializer() {} // utility class
 
@@ -526,76 +526,31 @@ public final class HttpResponseSerializer {
 
     /**
      * Maps a Kafka Errors enum value to an HTTP status code.
-     *
-     * NONE -> 200, UNKNOWN_TOPIC_OR_PARTITION -> 404, LEADER_NOT_AVAILABLE -> 503,
-     * NOT_LEADER_OR_FOLLOWER -> 503, MESSAGE_TOO_LARGE -> 413, etc.
+     * Delegates to {@link HttpErrorMapper#httpStatus(Errors)} as the single source of truth.
      *
      * @param error the Kafka error
      * @return corresponding HttpResponseStatus
      */
     static HttpResponseStatus mapErrorToHttpStatus(Errors error) {
-        switch (error) {
-            case NONE:
-                return HttpResponseStatus.OK;
-            case UNKNOWN_TOPIC_OR_PARTITION:
-                return HttpResponseStatus.NOT_FOUND;
-            case LEADER_NOT_AVAILABLE:
-            case NOT_LEADER_OR_FOLLOWER:
-            case NOT_ENOUGH_REPLICAS:
-            case NOT_ENOUGH_REPLICAS_AFTER_APPEND:
-                return HttpResponseStatus.SERVICE_UNAVAILABLE;
-            case MESSAGE_TOO_LARGE:
-            case RECORD_LIST_TOO_LARGE:
-                return HttpResponseStatus.REQUEST_ENTITY_TOO_LARGE;
-            case TOPIC_AUTHORIZATION_FAILED:
-            case CLUSTER_AUTHORIZATION_FAILED:
-                return HttpResponseStatus.FORBIDDEN;
-            case INVALID_REQUEST:
-            case INVALID_TOPIC_EXCEPTION:
-                return HttpResponseStatus.BAD_REQUEST;
-            case REQUEST_TIMED_OUT:
-                return HttpResponseStatus.GATEWAY_TIMEOUT;
-            case THROTTLING_QUOTA_EXCEEDED:
-                return HttpResponseStatus.TOO_MANY_REQUESTS;
-            case KAFKA_STORAGE_ERROR:
-            default:
-                return HttpResponseStatus.INTERNAL_SERVER_ERROR;
-        }
+        return HttpErrorMapper.httpStatus(error);
     }
 
     /**
      * Returns the Retry-After header value in seconds for retriable errors.
      * Returns -1 for non-retriable errors (no Retry-After header needed).
-     *
-     * LEADER_NOT_AVAILABLE, NOT_LEADER_OR_FOLLOWER -> 1
-     * NOT_ENOUGH_REPLICAS, NOT_ENOUGH_REPLICAS_AFTER_APPEND -> 5
-     * REQUEST_TIMED_OUT -> 1
-     * THROTTLING_QUOTA_EXCEEDED -> computed from throttleTimeMs (default 1)
-     * All others -> -1
+     * Delegates to {@link HttpErrorMapper#retryAfterSeconds(Errors)} as the single source of truth.
      */
     static int retryAfterSeconds(Errors error) {
-        switch (error) {
-            case LEADER_NOT_AVAILABLE:
-            case NOT_LEADER_OR_FOLLOWER:
-            case REQUEST_TIMED_OUT:
-                return 1;
-            case NOT_ENOUGH_REPLICAS:
-            case NOT_ENOUGH_REPLICAS_AFTER_APPEND:
-                return 5;
-            case THROTTLING_QUOTA_EXCEEDED:
-                return 1; // default when throttleTimeMs not provided
-            default:
-                return -1;
-        }
+        return HttpErrorMapper.retryAfterSeconds(error).orElse(-1);
     }
 
     /**
      * Overload for THROTTLING_QUOTA_EXCEEDED that takes the throttle time.
-     * Returns Math.max(1, (int) Math.ceil(throttleTimeMs / 1000.0))
+     * Delegates to {@link HttpErrorMapper#throttleRetryAfter(long)}.
      */
     static int retryAfterSeconds(Errors error, int throttleTimeMs) {
         if (error == Errors.THROTTLING_QUOTA_EXCEEDED) {
-            return Math.max(1, (int) Math.ceil(throttleTimeMs / 1000.0));
+            return Math.max(1, HttpErrorMapper.throttleRetryAfter(throttleTimeMs));
         }
         return retryAfterSeconds(error);
     }

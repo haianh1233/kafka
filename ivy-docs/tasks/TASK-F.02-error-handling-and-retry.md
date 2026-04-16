@@ -675,29 +675,36 @@ class ForwardingRetryHandlerTest {
 
 ## Learning
 
-_To be filled by the executing agent._
+- Netty's `HttpResponseStatus.valueOf(413)` and `HttpResponseStatus.REQUEST_ENTITY_TOO_LARGE` are the same object; using `valueOf(413)` is cleaner in an `EnumMap`-based mapping.
+- The `MetadataCache.getLeaderAndIsr()` returns `Optional<LeaderAndIsr>` in the Java interface, which is the correct entry point for looking up partition leaders during retry re-bucketing.
+- `CompletableFuture.orTimeout()` combined with `.exceptionally()` provides a clean way to bound retry duration without blocking the caller thread.
+- The task file specified `HttpResponseSerializer.scala` but the actual implementation is `HttpResponseSerializer.java` -- the Scala version was only in an earlier worktree.
 
 ## Limitations
 
-_To be filled by the executing agent._
+- `ForwardingRetryHandler` does a single retry pass (max 1). If the leader changes again during the retry, the error is returned to the client.
+- The `lookupLeader` in `ForwardingRetryHandler` returns -1 for unknown leaders, which will cause `ProduceForwardManager.forward()` to fail with `BrokerNotFoundException`. This is by design -- the error propagates to the client as a 503.
+- Integration tests for retry-after-leader-change are not included in this task since they require a multi-broker test harness (deferred to TASK-E.04).
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- `HttpResponseSerializer` was refactored to delegate `mapErrorToHttpStatus()`, `retryAfterSeconds()`, and `MULTI_STATUS` to `HttpErrorMapper` as the single source of truth. All existing tests continue to pass.
+- Fixed pre-existing checkstyle violations in `HttpRequestTranslatorOffsetsTest.java` (unused import, text block indentation) and `HttpResponseSerializerOffsetsTest.java` (unused import) that were blocking the test task.
+- The retry logic in `KafkaApis.retryFailedPartitions()` (from TASK-D.03) already handles the Scala-side retry. `ForwardingRetryHandler` provides the same capability as a reusable Java utility that can be called from either the Scala or Java layer.
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] `HttpErrorMapper` maps all Kafka errors from design doc section 5.5 to correct HTTP statuses
-- [ ] `Retry-After` header is set on 429, 503, 504 responses
-- [ ] Forwarding retry occurs on `NOT_LEADER_OR_FOLLOWER` with max 1 retry
-- [ ] Forwarding retry is bounded by `http.internal.forwarding.timeout.ms`
-- [ ] Non-retriable errors are not retried
-- [ ] Multi-partition requests return 207 on mixed success/failure
-- [ ] Single-partition requests return the direct error status
-- [ ] All unit tests pass (HttpErrorMapper, ForwardingRetryHandler)
-- [ ] Integration tests confirm retry after leader change
+- [x] `HttpErrorMapper` maps all Kafka errors from design doc section 5.5 to correct HTTP statuses
+- [x] `Retry-After` header is set on 429, 503, 504 responses
+- [x] Forwarding retry occurs on `NOT_LEADER_OR_FOLLOWER` with max 1 retry
+- [x] Forwarding retry is bounded by `http.internal.forwarding.timeout.ms`
+- [x] Non-retriable errors are not retried
+- [x] Multi-partition requests return 207 on mixed success/failure
+- [x] Single-partition requests return the direct error status
+- [x] All unit tests pass (HttpErrorMapper, ForwardingRetryHandler)
+- [ ] Integration tests confirm retry after leader change (deferred to TASK-E.04)
 
 ---
 
@@ -705,8 +712,8 @@ _To be filled by the executing agent._
 
 | File | Status |
 |------|--------|
-| `http-server/src/main/java/kafka/server/http/HttpErrorMapper.java` | |
-| `http-server/src/main/java/kafka/server/http/ForwardingRetryHandler.java` | |
-| `http-server/src/main/scala/kafka/server/http/HttpResponseSerializer.scala` | |
-| `http-server/src/test/java/kafka/server/http/HttpErrorMapperTest.java` | |
-| `http-server/src/test/java/kafka/server/http/ForwardingRetryHandlerTest.java` | |
+| `http-server/src/main/java/kafka/server/http/HttpErrorMapper.java` | Created |
+| `http-server/src/main/java/kafka/server/http/ForwardingRetryHandler.java` | Created |
+| `http-server/src/main/java/kafka/server/http/HttpResponseSerializer.java` | Modified (delegates to HttpErrorMapper) |
+| `http-server/src/test/java/kafka/server/http/HttpErrorMapperTest.java` | Created |
+| `http-server/src/test/java/kafka/server/http/ForwardingRetryHandlerTest.java` | Created |

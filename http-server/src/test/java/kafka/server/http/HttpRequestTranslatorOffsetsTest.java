@@ -27,8 +27,6 @@ import org.apache.kafka.common.requests.OffsetCommitRequest;
 import org.apache.kafka.common.requests.OffsetFetchRequest;
 import org.junit.jupiter.api.Test;
 
-import java.nio.ByteBuffer;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -41,11 +39,11 @@ class HttpRequestTranslatorOffsetsTest {
     @Test
     void translateCommitOffsets_validRequest_buildsCorrectData() throws Exception {
         JsonNode json = MAPPER.readTree("""
-            {"offsets":[
-                {"topic":"orders","partition":0,"offset":150,"metadata":""},
-                {"topic":"orders","partition":1,"offset":88}
-            ]}
-        """);
+                {"offsets":[
+                    {"topic":"orders","partition":0,"offset":150,"metadata":""},
+                    {"topic":"orders","partition":1,"offset":88}
+                ]}
+                """);
 
         HttpRequestTranslator.OffsetCommitTranslationResult result =
             HttpRequestTranslator.translateCommitOffsets("my-group", json);
@@ -66,11 +64,11 @@ class HttpRequestTranslatorOffsetsTest {
     @Test
     void translateCommitOffsets_multipleTopics_groupsByTopic() throws Exception {
         JsonNode json = MAPPER.readTree("""
-            {"offsets":[
-                {"topic":"orders","partition":0,"offset":100},
-                {"topic":"payments","partition":0,"offset":200}
-            ]}
-        """);
+                {"offsets":[
+                    {"topic":"orders","partition":0,"offset":100},
+                    {"topic":"payments","partition":0,"offset":200}
+                ]}
+                """);
 
         HttpRequestTranslator.OffsetCommitTranslationResult result =
             HttpRequestTranslator.translateCommitOffsets("my-group", json);
