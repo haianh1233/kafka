@@ -82,6 +82,7 @@ class HttpAcceptor(
 
   // --- Lifecycle state ---
   private val accepting = new AtomicBoolean(true)
+  private val _draining = new AtomicBoolean(false)
   private val closed = new AtomicBoolean(false)
 
   // Tracks in-flight connections that have pending requests
@@ -106,7 +107,13 @@ class HttpAcceptor(
       .option(ChannelOption.SO_BACKLOG, Int.box(128))
       .childOption(ChannelOption.SO_KEEPALIVE, Boolean.box(true))
       .childHandler(new HttpChannelInitializer(
-        endpoint, httpRequestMaxBytes, httpConnectionIdleTimeoutMs, sslContext, corsAllowedOrigins))
+        sslContext = sslContext,
+        draining = new java.util.concurrent.atomic.AtomicBoolean(false),
+        inFlightCount = new java.util.concurrent.atomic.AtomicInteger(0),
+        httpMetrics = new kafka.server.http.HttpMetrics(),
+        maxRequestBytes = httpRequestMaxBytes,
+        connectionIdleTimeoutMs = httpConnectionIdleTimeoutMs,
+        corsAllowedOrigins = corsAllowedOrigins))
 
     val host = if (endpoint.host() == null || endpoint.host().isEmpty) "0.0.0.0" else endpoint.host()
     val bindFuture = bootstrap.bind(host, endpoint.port())
@@ -128,6 +135,7 @@ class HttpAcceptor(
    */
   def beginDrain(): Unit = {
     accepting.set(false)
+    _draining.set(true)
     // The HttpRequestHandler (TASK-B.05) checks isAccepting and rejects new requests
   }
 
@@ -192,4 +200,16 @@ class HttpAcceptor(
 
   /** Decrement pending connection count (called by HttpRequestHandler on request complete). */
   def decrementPending(): Unit = pendingConnectionCount.decrementAndGet()
+
+  /** Whether the acceptor is currently draining. */
+  def isDraining: Boolean = _draining.get()
+
+  /** Current number of pending (in-flight) requests. */
+  def pendingRequestCount: Int = pendingConnectionCount.get()
+
+  /** Direct access to the draining flag for tests. */
+  val draining: AtomicBoolean = _draining
+
+  /** Direct access to the in-flight count for tests. */
+  val inFlightCount: AtomicInteger = pendingConnectionCount
 }

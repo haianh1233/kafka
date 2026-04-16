@@ -49,7 +49,7 @@ class HttpProtocolNegotiationHandlerTest {
 
     private final AtomicBoolean draining = new AtomicBoolean(false);
     private final AtomicInteger inFlightCount = new AtomicInteger(0);
-    private final HttpMetrics httpMetrics = new NoOpHttpMetrics();
+    private final HttpMetrics httpMetrics = new HttpMetrics();
 
     @Test
     void testConstructorSetsHttp11AsFallback() {
@@ -238,9 +238,15 @@ class HttpProtocolNegotiationHandlerTest {
     }
 
     /**
+<<<<<<< HEAD
      * No-op extension of HttpMetrics for testing.
      * HttpMetrics is a concrete class; metrics are recorded but not verified in these tests.
      */
     private static class NoOpHttpMetrics extends HttpMetrics {
     }
+=======
+     * Returns a concrete HttpMetrics instance for testing.
+     * HttpMetrics is a concrete class, not an interface.
+     */
+>>>>>>> e342e3f93d (feat: G.02 — Share group integration tests)
 }

@@ -1665,6 +1665,10 @@ project(':http-server') {
 
     testImplementation libs.mockitoCore
     testImplementation libs.junitJupiter
+    testImplementation libs.jacksonDataformatYaml
+    testImplementation(libs.jettyClient) {
+      exclude group: 'org.slf4j', module: 'slf4j-api'
+    }
     testImplementation testLog4j2Libs
 
     testRuntimeOnly runtimeTestLibs

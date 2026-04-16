@@ -56,9 +56,7 @@ class HttpGracefulShutdownTest {
 
     val handler = new HttpRequestHandler(
       principalBuilder,
-      SecurityProtocol.HTTP,
-      draining,
-      inFlightCount
+      SecurityProtocol.HTTP
     )
 
     // Use handler directly without HTTP codec to avoid EmbeddedSocketAddress issues
