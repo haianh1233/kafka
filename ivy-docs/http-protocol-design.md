@@ -9,6 +9,8 @@
    - 4.1 Produce
    - 4.2 Consume
    - 4.3 Additional Operations (Metadata, Offsets, Lag, Health)
+   - 4.4 Consumer Group Offsets (Phase 3)
+   - 4.5 Share Group Consume (Phase 4)
 5. [Produce Path](#5-produce-path)
 6. [Consume Path](#6-consume-path)
 7. [Broker-to-Broker Internal Forwarding](#7-broker-to-broker-internal-forwarding)
@@ -19,6 +21,7 @@
 12. [Security](#12-security)
 13. [Implementation Plan](#13-implementation-plan)
 14. [Implementation Concerns](#14-implementation-concerns)
+15. [Comparison with Confluent REST Proxy](#15-comparison-with-confluent-rest-proxy)
 
 ---
 
@@ -58,6 +61,7 @@ This document describes the design for adding native HTTP protocol support to Ap
 - HTTP/2 push (future work)
 - Schema Registry integration (out of scope; let clients handle serialization)
 - Admin operations over HTTP (topic creation, ACL management) — phase 2
+- Consumer group membership, rebalancing, or heartbeat over HTTP (see §15 for rationale)
 - Replacing the Kafka binary protocol
 
 ---
@@ -93,8 +97,12 @@ This document describes the design for adding native HTTP protocol support to Ap
 │                              │                                            │
 │                   ┌──────────▼───────────────────────────────────────┐   │
 │                   │                    KafkaApis                     │   │
-│                   │   handleHttpProduceRequest()                     │   │
-│                   │   handleHttpConsumeRequest()                     │   │
+│                   │  if (securityProtocol == HTTP/HTTPS):            │   │
+│                   │    handleHttpProduceRequest()                    │   │
+│                   │    handleHttpConsumeRequest()                    │   │
+│                   │  else:                                           │   │
+│                   │    handleProduceRequest()   (existing, unchanged)│   │
+│                   │    handleFetchRequest()     (existing, unchanged)│   │
 │                   └───────┬───────────────────────┬──────────────────┘   │
 │                           │                       │                       │
 │               MetadataCache lookup          is this broker leader?        │
@@ -117,6 +125,32 @@ HTTP requests and binary-protocol requests share the **same `RequestChannel` que
 reuses all existing quota, metrics, and throttling hooks, and keeps the footprint minimal.
 If priority separation is ever needed, a dedicated queue can be introduced later without
 changing the HTTP layer.
+
+**Dispatch model.** No new `ApiKeys` are introduced. HTTP endpoints map to existing ApiKeys
+(`PRODUCE`, `FETCH`, `METADATA`, etc.), so they enter `KafkaApis.handle()` through the
+standard dispatch table. However, `PRODUCE` and `FETCH` from HTTP require forwarding logic
+that does not exist in the binary-protocol handlers (`handleProduceRequest`,
+`handleFetchRequest`). `KafkaApis.handle()` dispatches to **dedicated HTTP handler methods**
+(`handleHttpProduceRequest`, `handleHttpConsumeRequest`) when
+`request.context.securityProtocol == HTTP || HTTPS`. All other ApiKeys (METADATA,
+LIST_OFFSETS, OFFSET_FETCH, OFFSET_COMMIT, etc.) reuse existing handlers unchanged —
+the response is serialized to JSON in the `HttpProcessor` response path (§8.6), not in
+`KafkaApis`.
+
+```scala
+// KafkaApis.handle() — dispatch addition (no changes to existing cases):
+case ApiKeys.PRODUCE =>
+  if (request.context.securityProtocol.isHttp)
+    handleHttpProduceRequest(request)   // fan-out + forwarding (§5)
+  else
+    handleProduceRequest(request)       // existing binary handler (unchanged)
+
+case ApiKeys.FETCH =>
+  if (request.context.securityProtocol.isHttp)
+    handleHttpConsumeRequest(request)   // fan-out + forwarding (§6)
+  else
+    handleFetchRequest(request)         // existing binary handler (unchanged)
+```
 
 ### Thread Model
 
@@ -429,6 +463,11 @@ Both calls are made concurrently via `CompletableFuture`. Lag = logEndOffset −
 computed in `HttpResponseSerializer` before serializing the JSON. Authorization (`DESCRIBE` on
 group + `READ` on each topic partition) is enforced inside the existing handlers.
 
+**Approximation note:** Because the two underlying queries are concurrent, they may reflect
+slightly different points in time. If the consumer is actively committing offsets, lag values
+may be approximate. The serializer clamps lag to `max(0, logEndOffset - committedOffset)` to
+avoid negative values from sampling skew.
+
 ---
 
 #### 4.3.4 Health Check — `GET /v1/health`
@@ -459,7 +498,192 @@ val state: BrokerState = lifecycleManager.state
 }
 ```
 
-Served from `MetadataCache.getAllTopics()`. No I/O.
+Routed through `KafkaApis.handleTopicMetadataRequest()` with an empty topics list (which
+returns all topics). The existing handler filters results by `DESCRIBE` authorization on each
+topic — unauthorized topics are excluded from the response. This reuses the same authorization
+path as the binary METADATA request, so no new broker logic is needed.
+
+**Important:** This endpoint must NOT bypass authorization by reading `MetadataCache.getAllTopics()`
+directly. Always route through the METADATA request path to ensure consistent access control.
+
+---
+
+### 4.4 Consumer Group Offsets (Phase 3)
+
+These endpoints let HTTP clients store and retrieve committed offsets in Kafka's
+`__consumer_offsets` topic without joining a consumer group. This gives clients crash
+recovery, `kafka-consumer-groups.sh` visibility, and consumer lag monitoring — without
+the server-side session state that makes REST Proxy's consumer model fragile (see §15).
+
+---
+
+#### 4.4.1 Commit Offsets — `POST /v1/consumer-groups/{group}/offsets`
+
+```
+POST /v1/consumer-groups/checkout-consumer/offsets
+```
+
+```json
+{
+  "offsets": [
+    { "topic": "orders", "partition": 0, "offset": 150, "metadata": "" },
+    { "topic": "orders", "partition": 1, "offset": 88,  "metadata": "" }
+  ]
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `offsets` | array | required | Offsets to commit |
+| `offsets[].topic` | string | required | Topic name |
+| `offsets[].partition` | int | required | Partition id |
+| `offsets[].offset` | long | required | Offset to commit (next offset to read, not last consumed) |
+| `offsets[].metadata` | string | `""` | Optional metadata string stored with the offset |
+
+#### Response (200 OK)
+
+```json
+{
+  "offsets": [
+    { "topic": "orders", "partition": 0, "offset": 150, "errorCode": 0 },
+    { "topic": "orders", "partition": 1, "offset": 88,  "errorCode": 0 }
+  ]
+}
+```
+
+**Kafka API used:** `OFFSET_COMMIT` (ApiKey id=8)
+
+`HttpRequestTranslator` builds an `OffsetCommitRequest` with `groupId` from the URL path,
+`memberId = ""` and `generationId = -1` (simple consumer mode — no group membership
+required). Routed through `KafkaApis.handleOffsetCommitRequest()` →
+`GroupCoordinator.commitOffsets()`. Authorization: `READ` on group + `READ` on each topic.
+
+Using `generationId = -1` (simple consumer) means these commits work without joining the
+group. The offsets are stored in `__consumer_offsets` and visible to `kafka-consumer-groups.sh`,
+`OFFSET_FETCH`, and the lag endpoint (§4.3.3).
+
+---
+
+#### 4.4.2 Fetch Committed Offsets — `GET /v1/consumer-groups/{group}/offsets`
+
+```
+GET /v1/consumer-groups/checkout-consumer/offsets?topic=orders
+```
+
+```json
+{
+  "group": "checkout-consumer",
+  "offsets": [
+    { "topic": "orders", "partition": 0, "offset": 150, "metadata": "" },
+    { "topic": "orders", "partition": 1, "offset": 88,  "metadata": "" }
+  ]
+}
+```
+
+| Query param | Type | Default | Description |
+|---|---|---|---|
+| `topic` | string | optional | Filter by topic. If omitted, returns offsets for all topics in the group. |
+
+**Kafka API used:** `OFFSET_FETCH` (ApiKey id=9)
+
+Routed through `KafkaApis.handleOffsetFetchRequest()` → `GroupCoordinator.fetchOffsets()`.
+Authorization: `DESCRIBE` on group + `READ` on each topic.
+
+**Typical client recovery pattern:**
+
+```
+// On startup, fetch last committed offsets:
+offsets = GET /v1/consumer-groups/my-group/offsets?topic=orders
+
+// Resume consuming from committed positions:
+loop:
+    response = POST /v1/topics/orders/records:fetch
+               { partitions: offsets.entries(), maxWaitMs: 5000 }
+    process(response)
+    advance offsets
+    // Periodically commit:
+    POST /v1/consumer-groups/my-group/offsets { offsets: [...] }
+```
+
+---
+
+### 4.5 Share Group Consume (Phase 4)
+
+Share groups (KIP-932) allow multiple consumers to read from the same partitions with
+server-side acknowledgement tracking. This model fits HTTP better than classic consumer
+groups because there is no rebalancing protocol — the coordinator handles partition
+assignment, and clients acknowledge records individually.
+
+---
+
+#### 4.5.1 Share Group Poll — `POST /v1/share-groups/{group}/records`
+
+```
+POST /v1/share-groups/my-share-group/records
+```
+
+```json
+{
+  "topics": ["orders"],
+  "maxRecords": 100,
+  "maxWaitMs": 5000
+}
+```
+
+#### Response (200 OK)
+
+```json
+{
+  "records": [
+    {
+      "topic": "orders",
+      "partition": 0,
+      "offset": 42,
+      "key": { "type": "STRING", "data": "order-123" },
+      "value": { "type": "JSON", "data": { "amount": 42.0 } },
+      "acquireId": "acq-abc123"
+    }
+  ]
+}
+```
+
+**Kafka API used:** `SHARE_FETCH` (ApiKey id=78)
+
+The `acquireId` is a server-generated token the client uses to acknowledge or release the
+record. Records not acknowledged within the share group's timeout are automatically
+re-delivered to another consumer.
+
+---
+
+#### 4.5.2 Share Group Acknowledge — `POST /v1/share-groups/{group}/acknowledge`
+
+```json
+{
+  "acknowledgements": [
+    { "acquireId": "acq-abc123", "type": "ACCEPT" },
+    { "acquireId": "acq-def456", "type": "REJECT" }
+  ]
+}
+```
+
+| `type` | Meaning |
+|---|---|
+| `ACCEPT` | Record processed successfully — do not re-deliver |
+| `REJECT` | Record processing failed — re-deliver to another consumer |
+| `RELEASE` | Release without processing — re-deliver immediately |
+
+**Kafka API used:** `SHARE_ACKNOWLEDGE` (ApiKey id=79)
+
+**Why share groups fit HTTP.** Unlike classic consumer groups:
+- No JOIN_GROUP / SYNC_GROUP / HEARTBEAT protocol needed
+- No server-side session or rebalancing
+- Multiple HTTP clients can consume the same partitions concurrently
+- Acknowledgement is idempotent (safe for HTTP retries)
+- The coordinator tracks delivery state, not the client
+
+**Phase 4 scope:** This section is a design sketch. Full specification (error handling,
+timeout configuration, acknowledgement batching, share group configuration) will be added
+when implementation begins.
 
 ---
 
@@ -612,7 +836,7 @@ for each record in batch:
         partition = batchStickyPartition                              // same for all keyless
                                                                        // records in this request
 
-batchStickyPartition = roundRobinCounter.getAndIncrement() % partitionCount
+batchStickyPartition = (roundRobinCounter.getAndIncrement() & 0x7fffffff) % partitionCount
 ```
 
 Rules:
@@ -620,7 +844,8 @@ Rules:
   same key always lands on the same partition.
 - Keyless records: all records in **the same HTTP request** land on the same partition
   (batch-sticky). The sticky partition advances per request via an `AtomicInteger` counter on
-  the topic, giving balanced distribution across requests.
+  the topic, giving balanced distribution across requests. The counter is masked with
+  `& 0x7fffffff` before modulo to avoid negative results on `Integer.MAX_VALUE` overflow.
 - The assigned partition is always echoed back in the response `offsets[].partition` field so
   the client knows where the record landed.
 
@@ -818,7 +1043,28 @@ response. The HTTP consume path always fetches from the leader (or forwards to t
 Rack-aware reads can be introduced in phase 3 by forwarding to the preferred replica instead
 of the leader when the consumer's `FetchRequest` carries client rack information.
 
-### 6.6 End-to-end: Consume with maxWaitMs cap and delayed fetch
+### 6.7 Consume response memory and serialization cost
+
+Binary `FetchResponse` contains `MemoryRecords` — compressed record batches in Kafka's
+internal format. For JSON serialization the HTTP layer must decompress, iterate individual
+records, decode keys/values (§14.7 algorithm), and serialize to JSON (including base64 for
+binary values). This is CPU-intensive: a 1 MB compressed batch may expand to 5 MB of JSON.
+
+**Memory budget.** Each in-flight consume response allocates a full JSON buffer via Netty.
+With 100 concurrent HTTP consumers × 10 MB `maxBytes` = up to 1 GB of response buffers.
+
+**Mitigations (phase 1):**
+- `http.request.max.bytes` default 10 MB caps individual responses
+- `effectiveMaxWaitMs` cap (§6.1) limits how long buffers are held
+
+**Phase 2+ considerations:**
+- Add `http.consume.max.bytes` (default 1 MB) as a separate, lower cap for consume responses
+  independent of the binary protocol's `maxBytes`
+- Evaluate chunked transfer encoding or streaming JSON (one JSON object per partition, flushed
+  incrementally) for responses > 1 MB
+- Add `http.consume.max.records.per.partition` to limit decompression/serialization per partition
+
+### 6.8 End-to-end: Consume with maxWaitMs cap and delayed fetch
 
 Client requests `maxWaitMs:30000` but broker cap is `http.consume.max.wait.ms=5000`.
 P2 has no new data → hits `DelayedFetch` purgatory, fires at t=3200ms.
@@ -890,7 +1136,7 @@ HTTP Client          Broker 3                                         Broker 1
      │◄──────────────────│                                                 │
 ```
 
-### 6.7 End-to-end: Cap expires, no data (empty poll)
+### 6.9 End-to-end: Cap expires, no data (empty poll)
 
 P2 still has no data when the 5 s cap expires.
 Broker returns immediately with `records: []` — client polls again.
@@ -1056,6 +1302,20 @@ public class ProduceForwardManager implements Closeable {
         return thread.enqueue(entries, requiredAcks, timeoutMs);
     }
 
+    /**
+     * Periodic cleanup: remove threads for brokers no longer alive or whose
+     * address changed. Called from a scheduled task every 60 s.
+     */
+    public void cleanupStaleThreads() {
+        threads.forEach((brokerId, thread) -> {
+            Optional<Node> current = metadataCache.getAliveBrokerNode(brokerId, interBrokerListenerName);
+            if (current.isEmpty() || !current.get().equals(thread.destination())) {
+                threads.remove(brokerId);
+                thread.initiateShutdown();
+            }
+        });
+    }
+
     @Override
     public void close() {
         threads.values().forEach(ProduceForwardThread::initiateShutdown);
@@ -1120,17 +1380,90 @@ is B the leader for P?
 A single HTTP request may result in **mixed** results: some partitions served locally, others
 forwarded. The broker always returns a unified HTTP response.
 
+### 7.6 `FetchForwardThread` / `FetchForwardManager` — class design
+
+The fetch forwarding path mirrors produce forwarding (§7.2–7.3) with these differences:
+
+```java
+// http-server/src/main/java/kafka/server/http/FetchForwardThread.java
+
+public class FetchForwardThread extends InterBrokerSendThread {
+
+    private final BlockingQueue<PendingFetch> pendingQueue;
+
+    public CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> enqueue(
+            Map<TopicIdPartition, FetchRequest.PartitionData> fetchSpecs,
+            int maxWaitMs, int minBytes, int maxBytes) {
+        CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> future = new CompletableFuture<>();
+        PendingFetch pending = new PendingFetch(fetchSpecs, maxWaitMs, minBytes, maxBytes, future);
+        if (!pendingQueue.offer(pending)) {
+            future.completeExceptionally(
+                new KafkaException("Fetch forward queue full for broker " + destination().id()));
+        }
+        wakeup();
+        return future;
+    }
+
+    @Override
+    public Collection<RequestAndCompletionHandler> generateRequests() {
+        List<PendingFetch> batch = new ArrayList<>();
+        pendingQueue.drainTo(batch);
+
+        return batch.stream().map(pending -> {
+            FetchRequest.Builder request = FetchRequest.Builder.forConsumer(
+                pending.maxVersion,
+                pending.maxWaitMs,
+                pending.minBytes,
+                pending.fetchSpecs
+            ).setMaxBytes(pending.maxBytes);
+
+            RequestCompletionHandler handler = response -> {
+                if (response.disconnected()) {
+                    pending.future.completeExceptionally(
+                        new DisconnectException("Lost connection to broker " + destination().id()));
+                } else {
+                    FetchResponse fetchResponse = (FetchResponse) response.responseBody();
+                    pending.future.complete(parseFetchPartitionData(fetchResponse));
+                }
+            };
+
+            return new RequestAndCompletionHandler(
+                time.milliseconds(), destination(), request, handler);
+        }).collect(toList());
+    }
+}
+```
+
+**Key difference from produce forwarding:** The `maxWaitMs` budget must be passed through to
+the remote broker's `FetchRequest` so that the remote broker's `DelayedFetch` purgatory
+operates within the same time budget. The receiving broker's own purgatory waits up to
+`effectiveMaxWaitMs` — if data arrives before the deadline, the future completes early.
+
+`FetchForwardManager` follows the same structure as `ProduceForwardManager` (§7.3), including
+bounded queues (§14.6) and periodic stale-thread cleanup. `FetchForwardThread` instances are
+created per remote broker on demand and evicted when idle.
+
 ---
 
 ## 8. Integration with Existing Kafka Infrastructure
 
 ### 8.1 New security protocol: `HTTP`
 
-Add `HTTP` to `SecurityProtocol` enum (id = 4):
+Add `HTTP` and `HTTPS` to `SecurityProtocol` enum (ids 4 and 5):
 
 ```java
 // clients/src/main/java/org/apache/kafka/common/security/auth/SecurityProtocol.java
-HTTP(4, "HTTP");
+// Existing: PLAINTEXT(0), SSL(1), SASL_PLAINTEXT(2), SASL_SSL(3)
+HTTP(4, "HTTP"),
+HTTPS(5, "HTTPS");
+```
+
+`HTTPS` is a distinct enum value (like `SSL` vs `PLAINTEXT`) rather than a flag on `HTTP`.
+This preserves the existing `listener.security.protocol.map` convention where each listener
+name maps to exactly one `SecurityProtocol`. Add a helper method for dispatch:
+
+```java
+public boolean isHttp() { return this == HTTP || this == HTTPS; }
 ```
 
 `listener.security.protocol.map` example:
@@ -1212,12 +1545,17 @@ class HttpChannelInitializer(config: KafkaConfig, requestChannel: RequestChannel
       pipeline.addLast("ssl", sslContext.newHandler(ch.alloc()))
     // HTTP/1.1 codec
     pipeline.addLast("http-codec",      new HttpServerCodec())
-    // Aggregate chunked requests into FullHttpRequest (max 64 MB)
-    pipeline.addLast("http-aggregator", new HttpObjectAggregator(config.httpMaxRequestSize))
+    // Aggregate chunked requests into FullHttpRequest
+    pipeline.addLast("http-aggregator", new HttpObjectAggregator(config.httpRequestMaxBytes))
     // Compression support (optional)
     pipeline.addLast("compressor",      new HttpContentCompressor())
+    // Idle connection timeout (§14.11)
+    pipeline.addLast("idle-handler",    new IdleStateHandler(
+      0, 0, config.httpConnectionIdleTimeoutMs, MILLISECONDS))
+    pipeline.addLast("idle-closer",     new IdleStateCloseHandler())
     // Our handler: translate HTTP → RequestChannel
-    pipeline.addLast("kafka-handler",   new HttpRequestHandler(requestChannel, config, ...))
+    pipeline.addLast("kafka-handler",   new HttpRequestHandler(
+      requestChannel, httpProcessor, principalBuilder, config, ...))
   }
 }
 ```
@@ -1226,17 +1564,24 @@ class HttpChannelInitializer(config: KafkaConfig, requestChannel: RequestChannel
 
 The handler translates each HTTP request into a standard Kafka protocol request object and
 places it on `RequestChannel`. No new `ApiKeys` are introduced — every HTTP endpoint maps to
-an existing wire-protocol request type, so `KafkaApis.handle()` routes it without modification.
+an existing wire-protocol request type. `KafkaApis.handle()` dispatches `PRODUCE` and `FETCH`
+to dedicated HTTP handler methods when `securityProtocol.isHttp` (see §3 dispatch model).
+All other ApiKeys reuse existing handlers unchanged; the `HttpProcessor` (§8.6) handles
+JSON serialization on the response path.
 
-| HTTP endpoint | Kafka ApiKey | Request type |
-|---|---|---|
-| `POST /v1/topics/{t}/records` | `PRODUCE` (0) | `ProduceRequest` |
-| `POST /v1/topics/{t}/records:fetch` | `FETCH` (1) | `FetchRequest` |
-| `GET /v1/topics/{t}` | `METADATA` (3) | `MetadataRequest` |
-| `GET /v1/topics/{t}/partitions/{p}/offsets` | `LIST_OFFSETS` (2) | `ListOffsetsRequest` |
-| `GET /v1/consumer-groups/{g}/lags` | `OFFSET_FETCH` (9) + `LIST_OFFSETS` (2) | two requests, merged |
-| `GET /v1/topics` | `METADATA` (3) | `MetadataRequest` (empty topics → all) |
-| `GET /v1/health` | — | direct `BrokerServer.lifecycleManager.state` read, no `RequestChannel` |
+| HTTP endpoint | Kafka ApiKey | Request type | Phase |
+|---|---|---|---|
+| `POST /v1/topics/{t}/records` | `PRODUCE` (0) | `ProduceRequest` | 1 |
+| `POST /v1/topics/{t}/records:fetch` | `FETCH` (1) | `FetchRequest` | 1 |
+| `GET /v1/topics/{t}` | `METADATA` (3) | `MetadataRequest` | 2 |
+| `GET /v1/topics/{t}/partitions/{p}/offsets` | `LIST_OFFSETS` (2) | `ListOffsetsRequest` | 2 |
+| `GET /v1/consumer-groups/{g}/lags` | `OFFSET_FETCH` (9) + `LIST_OFFSETS` (2) | two requests, merged | 2 |
+| `GET /v1/topics` | `METADATA` (3) | `MetadataRequest` (empty topics → all) | 2 |
+| `GET /v1/health` | — | direct `BrokerServer.lifecycleManager.state` read | 1 |
+| `POST /v1/consumer-groups/{g}/offsets` | `OFFSET_COMMIT` (8) | `OffsetCommitRequest` | 3 |
+| `GET /v1/consumer-groups/{g}/offsets` | `OFFSET_FETCH` (9) | `OffsetFetchRequest` | 3 |
+| `POST /v1/share-groups/{g}/records` | `SHARE_FETCH` (78) | `ShareFetchRequest` | 4 |
+| `POST /v1/share-groups/{g}/acknowledge` | `SHARE_ACKNOWLEDGE` (79) | `ShareAcknowledgeRequest` | 4 |
 
 ```scala
 // http-server/src/main/scala/kafka/network/HttpRequestHandler.scala
@@ -1271,7 +1616,7 @@ class HttpRequestHandler(
       fromPrivilegedListener = false
     )
 
-    // 3. Stash Netty ctx keyed by correlationId for the response write-back
+    // 3. Build Kafka request — connectionId is Netty channel ID (§14.2)
     val kafkaRequest = new RequestChannel.Request(
       processor      = HTTP_PROCESSOR_ID,
       context        = requestContext,
@@ -1281,10 +1626,17 @@ class HttpRequestHandler(
       metrics        = requestChannel.metrics,
       envelope       = None
     )
-    pendingRequests.put(kafkaRequest.context.correlationId, ctx)
 
-    // 4. Hand off to KafkaRequestHandler thread pool — identical path to binary protocol
-    requestChannel.sendRequest(kafkaRequest)
+    // 4. Stash Netty ctx for response write-back (§14.2: keyed by connectionId, not correlationId)
+    pendingCtx = ctx
+    ctx.channel().closeFuture().addListener { (_: ChannelFuture) => pendingCtx = null }
+
+    // 5. Non-blocking enqueue (§14.3: use tryEnqueue, never blocking put)
+    if (!requestChannel.tryEnqueue(kafkaRequest)) {
+      sendQueueFullResponse(ctx)   // HTTP 503 + Retry-After: 1
+      pendingCtx = null
+      return
+    }
   }
 }
 ```
@@ -1302,15 +1654,77 @@ requestChannel.addProcessor(httpProcessor)   // httpProcessor.id == HTTP_PROCESS
 `processors.get(response.processor).enqueueResponse(response)` →
 the Netty worker thread dequeues and writes the JSON response to the socket.
 
-### 8.6 Response path
+### 8.6 Response path — `HttpProcessor`
 
 `KafkaApis` calls `requestChannel.sendResponse(request, response)` as usual — it is entirely
-unaware that the request came from HTTP. `HttpResponseSerializer` runs in the Netty worker thread
-when dequeuing the response:
+unaware that the request came from HTTP. The response must flow back from `RequestChannel`
+to the correct Netty channel. The binary `Processor` (SocketServer.scala) has a
+`responseQueue: LinkedBlockingDeque` polled in its NIO thread. HTTP needs an equivalent.
 
-1. Match response type to HTTP endpoint (by correlationId → original URI)
-2. Serialize `AbstractResponse` → JSON (e.g. `MetadataResponse` → topic metadata JSON)
-3. Write `FullHttpResponse` through the `ChannelHandlerContext` stashed in step 8.5
+**`HttpProcessor`** bridges `RequestChannel` responses to Netty:
+
+```java
+// http-server/src/main/java/kafka/server/http/HttpProcessor.java
+
+public class HttpProcessor {
+
+    private final int id;    // registered with RequestChannel.addProcessor()
+    private final LinkedBlockingDeque<RequestChannel.Response> responseQueue =
+        new LinkedBlockingDeque<>();
+    private final ConcurrentHashMap<String, ChannelHandlerContext> channels =
+        new ConcurrentHashMap<>();   // connectionId → Netty ctx
+
+    // Called by HttpRequestHandler when a new HTTP request arrives
+    public void registerChannel(String connectionId, ChannelHandlerContext ctx) {
+        channels.put(connectionId, ctx);
+        ctx.channel().closeFuture().addListener(f -> channels.remove(connectionId));
+    }
+
+    // Called by RequestChannel.sendResponse() — same contract as binary Processor
+    public void enqueueResponse(RequestChannel.Response response) {
+        responseQueue.add(response);
+    }
+
+    // Polled by a dedicated response-drainer thread (started in HttpAcceptor.startup())
+    public void processResponses() {
+        List<RequestChannel.Response> batch = new ArrayList<>();
+        responseQueue.drainTo(batch);
+
+        for (RequestChannel.Response response : batch) {
+            String connectionId = response.request().context().connectionId();
+            ChannelHandlerContext ctx = channels.get(connectionId);
+
+            if (response instanceof RequestChannel.SendResponse sendResp) {
+                if (ctx != null && ctx.channel().isActive()) {
+                    // Serialize Kafka response → JSON and write to Netty channel
+                    AbstractResponse kafkaResponse = sendResp.response();
+                    String originalUri = extractOriginalUri(response.request());
+                    FullHttpResponse httpResponse = HttpResponseSerializer.serialize(
+                        kafkaResponse, originalUri, response.request());
+                    ctx.writeAndFlush(httpResponse);
+                }
+                channels.remove(connectionId);
+            } else if (response instanceof RequestChannel.CloseConnectionResponse) {
+                if (ctx != null) ctx.close();
+                channels.remove(connectionId);
+            }
+            // StartThrottlingResponse / EndThrottlingResponse:
+            // handled differently for HTTP — see §12.3
+        }
+    }
+}
+```
+
+**Response-drainer thread** — a single thread in `httpAsyncExecutor` runs
+`httpProcessor.processResponses()` in a loop (woken by `enqueueResponse` via condition
+signal). This is separate from Netty worker threads and `KafkaRequestHandler` threads.
+
+**Why this works:** `RequestChannel.sendResponse()` looks up the processor by ID, calls
+`processors.get(HTTP_PROCESSOR_ID).enqueueResponse(response)` which is non-blocking
+(`LinkedBlockingDeque.add()`). The drainer thread picks it up, finds the Netty channel
+via `connectionId`, and writes the HTTP response. If the Netty channel closed before the
+response arrived (client disconnect), the `channels.remove()` in the close listener ensures
+the response is silently dropped.
 
 ---
 
@@ -1325,26 +1739,32 @@ kafka/
     ├── build.gradle
     └── src/
         ├── main/
-        │   └── scala/kafka/
-        │       ├── network/
-        │       │   ├── HttpAcceptor.scala
-        │       │   ├── HttpChannelInitializer.scala
-        │       │   └── HttpRequestHandler.scala
-        │       └── server/
-        │           └── http/
-        │               ├── ProduceForwardThread.java
-        │               ├── ProduceForwardManager.java
-        │               ├── FetchForwardThread.java
-        │               ├── FetchForwardManager.java
-        │               ├── HttpRouter.scala
-        │               ├── HttpRequestTranslator.scala
-        │               └── HttpResponseSerializer.scala
+        │   ├── java/kafka/server/http/
+        │   │   ├── ProduceForwardThread.java
+        │   │   ├── ProduceForwardManager.java
+        │   │   ├── FetchForwardThread.java
+        │   │   ├── FetchForwardManager.java
+        │   │   └── HttpProcessor.java
+        │   ├── scala/kafka/
+        │   │   ├── network/
+        │   │   │   ├── HttpAcceptor.scala
+        │   │   │   ├── HttpChannelInitializer.scala
+        │   │   │   └── HttpRequestHandler.scala
+        │   │   └── server/http/
+        │   │       ├── HttpRouter.scala
+        │   │       ├── HttpRequestTranslator.scala
+        │   │       ├── HttpResponseSerializer.scala
+        │   │       └── HttpAuthenticationContext.scala
+        │   └── resources/
+        │       └── openapi.yaml
         └── test/
             └── scala/kafka/
                 ├── network/
                 │   └── HttpAcceptorTest.scala
                 └── server/http/
                     ├── ProduceForwardThreadTest.scala
+                    ├── FetchForwardThreadTest.scala
+                    ├── HttpProcessorTest.scala
                     ├── HttpProduceIntegrationTest.scala
                     └── HttpConsumeIntegrationTest.scala
 ```
@@ -1382,6 +1802,11 @@ New properties added to `KafkaConfig`:
 | `http.internal.forwarding.timeout.ms` | `10000` | Timeout for broker-to-broker forwarding calls |
 | `http.internal.forwarding.retries` | `1` | Max retries per forwarded group on retriable errors (leader change, connection failure) |
 | `http.cors.allowed.origins` | `""` (disabled) | Comma-separated CORS allowed origins (`*` for all) |
+| `http.connection.idle.timeout.ms` | `60000` (60 s) | Close idle HTTP keep-alive connections after this duration. Netty's `IdleStateHandler` fires the timeout. Default matches common load-balancer idle timeouts (AWS ALB = 60 s). |
+| `http.consume.max.bytes` | `1048576` (1 MB) | Max total response bytes for consume responses. Separate from binary protocol's `maxBytes` to control JSON serialization memory (§6.7). |
+| `http.shutdown.drain.ms` | `2000` | Drain window during graceful shutdown (§14.8) |
+| `http.internal.forwarding.queue.size` | `10000` | Bounded queue capacity per forward thread (§14.6) |
+| `num.http.async.threads` | `4` | Thread pool for async future completion (§14.1) |
 
 Listener registration (no new config needed beyond standard listener machinery):
 
@@ -1397,23 +1822,27 @@ advertised.listeners=PLAINTEXT://broker1.example.com:9092,HTTP://broker1.example
 
 ### 11.1 HTTP status code mapping
 
-| Kafka Error | HTTP Status | Notes |
-|---|---|---|
-| `NONE` | 200 OK | |
-| `UNKNOWN_TOPIC_OR_PARTITION` | 404 Not Found | |
-| `LEADER_NOT_AVAILABLE` | 503 Service Unavailable | `Retry-After: 1` |
-| `NOT_LEADER_OR_FOLLOWER` | 503 Service Unavailable | forwarding failed after retry |
-| `MESSAGE_TOO_LARGE` | 413 Payload Too Large | |
-| `RECORD_LIST_TOO_LARGE` | 413 Payload Too Large | |
-| `TOPIC_AUTHORIZATION_FAILED` | 403 Forbidden | |
-| `CLUSTER_AUTHORIZATION_FAILED` | 403 Forbidden | |
-| `INVALID_REQUEST` | 400 Bad Request | JSON parse error or bad field value |
-| `INVALID_TOPIC_EXCEPTION` | 400 Bad Request | |
-| `NOT_ENOUGH_REPLICAS` | 503 Service Unavailable | ISR below minimum |
-| `NOT_ENOUGH_REPLICAS_AFTER_APPEND` | 503 Service Unavailable | |
-| `REQUEST_TIMED_OUT` | 504 Gateway Timeout | |
-| `KAFKA_STORAGE_ERROR` | 500 Internal Server Error | |
-| Everything else | 500 Internal Server Error | |
+| Kafka Error | HTTP Status | `Retry-After` | Notes |
+|---|---|---|---|
+| `NONE` | 200 OK | — | |
+| `UNKNOWN_TOPIC_OR_PARTITION` | 404 Not Found | — | |
+| `LEADER_NOT_AVAILABLE` | 503 Service Unavailable | `1` | Transient — leader election in progress |
+| `NOT_LEADER_OR_FOLLOWER` | 503 Service Unavailable | `1` | Forwarding failed after retry |
+| `MESSAGE_TOO_LARGE` | 413 Payload Too Large | — | Not retriable |
+| `RECORD_LIST_TOO_LARGE` | 413 Payload Too Large | — | Not retriable |
+| `TOPIC_AUTHORIZATION_FAILED` | 403 Forbidden | — | Not retriable |
+| `CLUSTER_AUTHORIZATION_FAILED` | 403 Forbidden | — | Not retriable |
+| `INVALID_REQUEST` | 400 Bad Request | — | JSON parse error or bad field value |
+| `INVALID_TOPIC_EXCEPTION` | 400 Bad Request | — | Not retriable |
+| `NOT_ENOUGH_REPLICAS` | 503 Service Unavailable | `5` | ISR below minimum — recovery takes longer |
+| `NOT_ENOUGH_REPLICAS_AFTER_APPEND` | 503 Service Unavailable | `5` | ISR shrank after append |
+| `REQUEST_TIMED_OUT` | 504 Gateway Timeout | `1` | |
+| `THROTTLING_QUOTA_EXCEEDED` | 429 Too Many Requests | `ceil(throttleTimeMs/1000)` | §12.3 |
+| `KAFKA_STORAGE_ERROR` | 500 Internal Server Error | — | Not retriable |
+| Everything else | 500 Internal Server Error | — | |
+
+**`Retry-After` policy:** Every 429, 503, and 504 response includes a `Retry-After` header
+(seconds). Clients should respect this value. 4xx errors other than 429 are not retriable.
 
 ### 11.2 Partial failure on multi-partition requests
 
@@ -1471,13 +1900,31 @@ No changes to the authorization layer are needed.
 ### 12.3 Quota enforcement
 
 The existing `ClientQuotaManager` is keyed on `(clientId, user)`. HTTP requests set `clientId`
-from the `X-Kafka-Client-ID` header (or `"http-client"` as default). Throttling responses:
+from the `X-Kafka-Client-ID` header (or `"http-client"` as default). The `clientId` is
+validated (§14.4) and passed to `ClientQuotaManager.maybeRecordAndGetThrottleTimeMs()`.
+
+**Throttle response adaptation.** The binary protocol's throttle mechanism (`StartThrottlingResponse`
+→ mute channel → delay → `EndThrottlingResponse` → unmute) assumes a long-lived connection
+where the broker can silently hold the response. HTTP is request/response: there is no channel
+to mute between requests.
+
+The `HttpProcessor` (§8.6) intercepts throttle responses:
+
+| Binary response | HTTP behavior |
+|---|---|
+| `StartThrottlingResponse` | Convert to immediate HTTP **429 Too Many Requests** with `Retry-After: ceil(throttleTimeMs / 1000)` and JSON body |
+| `EndThrottlingResponse` | Ignored (no-op — HTTP has no mute/unmute) |
+| `SendResponse` with `throttleTimeMs > 0` | Include `throttleTimeMs` in JSON body + set `Retry-After` header |
 
 ```json
-{ "errorCode": 89, "errorMessage": "REQUEST_TIMED_OUT", "throttleTimeMs": 500 }
+{
+  "errorCode": 89,
+  "errorMessage": "THROTTLING_QUOTA_EXCEEDED",
+  "throttleTimeMs": 500
+}
 ```
 
-HTTP status 429 with `Retry-After: 1` header.
+HTTP status **429** with `Retry-After: 1` header.
 
 ---
 
@@ -1485,37 +1932,55 @@ HTTP status 429 with `Retry-After: 1` header.
 
 ### Phase 1 — HTTP listener + core data plane
 
-1. Add `HTTP` / `HTTPS` to `SecurityProtocol` enum
+1. Add `HTTP(4)` / `HTTPS(5)` to `SecurityProtocol` enum with `isHttp()` helper
 2. Create `http-server` Gradle submodule with Netty dependency
 3. Implement `HttpAcceptor`, `HttpChannelInitializer`, `HttpRequestHandler`
-4. Wire `HttpAcceptor` into `SocketServer.createDataPlaneAcceptorAndProcessors()`
-5. Implement `HttpRouter` (URI → handler routing)
-6. Implement `HttpRequestTranslator` (JSON body → `ProduceRequest` / `FetchRequest`)
-7. Implement `HttpResponseSerializer` (Kafka response → JSON)
-8. Add new config properties to `KafkaConfig`
-9. `GET /v1/health` — health check (zero dependency, needed by load balancers from day 1)
-10. Integration test: single-partition produce/consume on a local broker (leader path only)
+4. Implement `HttpProcessor` — response routing bridge between `RequestChannel` and Netty (§8.6)
+5. Wire `HttpAcceptor` into `SocketServer.createDataPlaneAcceptorAndProcessors()`
+6. Add dispatch branch in `KafkaApis.handle()` for `securityProtocol.isHttp` (§3)
+7. Implement `HttpRouter` (URI → handler routing)
+8. Implement `HttpRequestTranslator` (JSON body → `ProduceRequest` / `FetchRequest`)
+9. Implement `HttpResponseSerializer` (Kafka response → JSON)
+10. Implement `HttpAuthenticationContext` (§12.1) — extends `AuthenticationContext`
+11. Add new config properties to `KafkaConfig` (§10)
+12. Add `RequestChannel.tryEnqueue()` method (§14.3)
+13. `GET /v1/health` — health check (zero dependency, needed by load balancers from day 1)
+14. Idle connection management via Netty `IdleStateHandler` (§14.11)
+15. Request tracing: `X-Kafka-Request-ID` header (§14.10)
+16. Integration test: single-partition produce/consume on a local broker (leader path only)
 
 ### Phase 2 — Forwarding + observability operations
 
-11. Implement `ProduceForwardThread` / `FetchForwardThread` (subclass `InterBrokerSendThread`)
-12. Implement `ProduceForwardManager` / `FetchForwardManager`
-13. Add forwarding logic to `handleHttpProduceRequest` / `handleHttpConsumeRequest`
-14. Fan-out + aggregation for multi-partition consume with `effectiveMaxWaitMs` cap
-15. `GET /v1/topics` — list topics (from `MetadataCache`)
-16. `GET /v1/topics/{topic}` — topic metadata with partition/leader/ISR info
-17. `GET /v1/topics/{topic}/partitions/{partition}/offsets` — list offsets
-18. `GET /v1/consumer-groups/{group}/lags` — committed offset + log-end offset + lag
-19. Integration tests: produce/consume/metadata hitting a follower broker
+17. Implement `ProduceForwardThread` / `FetchForwardThread` (subclass `InterBrokerSendThread`) with bounded queues (§14.6)
+18. Implement `ProduceForwardManager` / `FetchForwardManager` with stale-thread cleanup (§7.3)
+19. Add forwarding logic to `handleHttpProduceRequest` / `handleHttpConsumeRequest`
+20. Fan-out + aggregation for multi-partition consume with `effectiveMaxWaitMs` cap
+21. `GET /v1/topics` — list topics (routed through METADATA for authorization filtering)
+22. `GET /v1/topics/{topic}` — topic metadata with partition/leader/ISR info
+23. `GET /v1/topics/{topic}/partitions/{partition}/offsets` — list offsets
+24. `GET /v1/consumer-groups/{group}/lags` — committed offset + log-end offset + lag
+25. HTTP quota throttle adaptation: `StartThrottlingResponse` → HTTP 429 (§12.3)
+26. OpenAPI 3.0 spec file at `http-server/src/main/resources/openapi.yaml` (§14.12)
+27. Integration tests: produce/consume/metadata hitting a follower broker
 
-### Phase 3 — Robustness, security & polish
+### Phase 3 — Robustness, security, consumer offsets & polish
 
-20. Full produce edge case handling: §5.5 error tables, forwarding retry on leader change
-21. Metrics: `http.produce.request.rate`, `http.consume.request.rate`, `http.forward.request.rate`, `http.forward.error.rate`, `http.metadata.request.rate`
-22. CORS support (`http.cors.allowed.origins`)
-23. mTLS / Bearer token / Basic Auth wiring into `KafkaPrincipal`
-24. HTTP/2 upgrade via Netty `ApplicationProtocolNegotiationHandler` (ALPN)
-25. Performance benchmarking (produce/consume throughput and latency under load)
+28. `POST /v1/consumer-groups/{group}/offsets` — commit offsets (§4.4.1)
+29. `GET /v1/consumer-groups/{group}/offsets` — fetch committed offsets (§4.4.2)
+30. Full produce edge case handling: §5.5 error tables, forwarding retry on leader change
+31. Metrics: `http.produce.request.rate`, `http.consume.request.rate`, `http.forward.request.rate`, `http.forward.error.rate`, `http.metadata.request.rate`, `http.queue.full.rate`
+32. CORS support (`http.cors.allowed.origins`)
+33. mTLS / Bearer token / Basic Auth wiring into `KafkaPrincipal`
+34. Graceful shutdown drain integration (§14.8)
+35. HTTP/2 upgrade via Netty `ApplicationProtocolNegotiationHandler` (ALPN)
+36. Performance benchmarking (produce/consume throughput and latency under load)
+
+### Phase 4 — Share group consume (future)
+
+37. `POST /v1/share-groups/{group}/records` — share group poll (§4.5.1)
+38. `POST /v1/share-groups/{group}/acknowledge` — acknowledge records (§4.5.2)
+39. Full share group error handling, timeout configuration, acknowledgement batching
+40. Integration tests: multi-consumer share group over HTTP
 
 ## 14. Implementation Concerns
 
@@ -1937,5 +2402,145 @@ aggregate (binary + HTTP).
 
 ---
 
-*Document version: 0.5 — 2026-04-16*
+### 14.10 MEDIUM — Request tracing: `X-Kafka-Request-ID` header
+
+HTTP APIs need a request ID for correlating client requests through the broker forwarding
+chain. Without it, debugging latency or errors across HTTP client → broker → forwarded
+broker requires timestamp-based log correlation, which is fragile.
+
+**Implementation:**
+
+```java
+// HttpRequestHandler — generate or accept request ID
+String requestId = req.headers().get("X-Request-ID");
+if (requestId == null || requestId.length() > 64) {
+    requestId = UUID.randomUUID().toString();
+}
+
+// Store on RequestContext (or as a record header on the request)
+// Return in response
+httpResponse.headers().set("X-Kafka-Request-ID", requestId);
+```
+
+**Propagation:** The request ID flows through:
+1. HTTP request → `HttpRequestHandler` (generate/accept)
+2. `RequestContext` (stored as client information or custom field)
+3. `ProduceForwardThread` / `FetchForwardThread` (logged, not forwarded in binary protocol)
+4. HTTP response → `X-Kafka-Request-ID` header
+5. Broker request log (existing `RequestChannel.Request.requestLog` JSON includes it)
+
+Clients that pass `X-Request-ID` get it echoed back. Clients that don't receive a
+broker-generated UUID. Log entries include the request ID for `grep`-based correlation.
+
+---
+
+### 14.11 MEDIUM — HTTP keep-alive and idle connection management
+
+HTTP/1.1 defaults to `Connection: keep-alive`. Without idle timeout management, keep-alive
+connections accumulate and consume Netty worker thread capacity.
+
+**Integration with Netty's `IdleStateHandler`:**
+
+```scala
+// HttpChannelInitializer — add idle detection before the Kafka handler
+pipeline.addLast("idle-handler",
+  new IdleStateHandler(0, 0, config.httpConnectionIdleTimeoutMs, MILLISECONDS))
+pipeline.addLast("idle-closer", new ChannelDuplexHandler() {
+  override def userEventTriggered(ctx: ChannelHandlerContext, evt: Any): Unit = evt match {
+    case _: IdleStateEvent => ctx.close()
+    case _ => super.userEventTriggered(ctx, evt)
+  }
+})
+```
+
+**Response headers:** All HTTP responses include:
+- `Connection: keep-alive`
+- `Keep-Alive: timeout=<http.connection.idle.timeout.ms / 1000>`
+
+New metric: `http.idle.connections.closed.rate` — tracks how often idle connections are
+reclaimed. A high rate suggests clients are not reusing connections efficiently.
+
+---
+
+### 14.12 LOW — OpenAPI specification
+
+The JSON request/response formats are defined as prose examples in §4. For a protocol
+targeting polyglot clients (the stated motivation in §1), a machine-readable spec enables
+client code generation across languages.
+
+**Deliverable:** An OpenAPI 3.0 spec file at `http-server/src/main/resources/openapi.yaml`
+covering all endpoints in §4. Optionally served at `GET /v1/openapi.yaml` for client tooling
+discovery. This is a phase 2 deliverable — the prose spec is sufficient for phase 1
+implementation.
+
+---
+
+## 15. Comparison with Confluent REST Proxy
+
+This section explains why the HTTP protocol design is deliberately stateless for consume, and
+how it differs from Confluent REST Proxy's stateful consumer model.
+
+### 15.1 REST Proxy's stateful consumer approach
+
+Confluent REST Proxy maintains **server-side state for each consumer instance**:
+
+```
+POST   /consumers/{group}                              → create instance (server-side state)
+POST   /consumers/{group}/instances/{id}/subscription   → subscribe to topics
+GET    /consumers/{group}/instances/{id}/records         → poll for records
+DELETE /consumers/{group}/instances/{id}                 → destroy instance
+```
+
+The proxy runs a full `KafkaConsumer` internally for each instance — group membership,
+rebalancing, offset commits, and session timeouts are all handled server-side. The instance
+is **pinned to a specific proxy server** (the returned base URL includes the host), so all
+subsequent requests must hit the same server or receive 404.
+
+### 15.2 Why this design does not replicate REST Proxy's consumer groups
+
+| Concern | REST Proxy approach | Problem |
+|---|---|---|
+| **Server affinity** | Instance pinned to one proxy | Defeats load balancing; proxy crash loses all consumer state |
+| **Session management** | Server tracks heartbeats, timeouts | HTTP is stateless; server-side sessions add complexity and failure modes |
+| **Rebalancing over HTTP** | Transparent to client | Rebalance during a poll blocks the HTTP response; clients see unpredictable latency spikes |
+| **Scalability** | One `KafkaConsumer` per instance per proxy | Memory-bound; each consumer holds fetch buffers, group state, network connections |
+
+The stateful model is inherently fragile over HTTP. REST Proxy's own documentation warns
+about instance affinity and timeout tuning, and operators frequently report issues with
+consumer instance leaks and rebalance storms.
+
+### 15.3 What this design offers instead
+
+**Phase 1–2: Stateless fetch with explicit partition + offset**
+
+```
+POST /v1/topics/{topic}/records:fetch
+{ "partitions": [{ "partition": 0, "offset": 100 }], "maxWaitMs": 5000 }
+```
+
+The client owns its offset state. This is the right model for:
+- Polyglot producers and simple consumers (dashboards, monitoring, cURL, mobile)
+- Clients that already manage offsets externally (Flink, Spark, custom pipelines)
+- Tail-read / debug use cases
+
+**Phase 3: Server-side offset management (without group membership)**
+
+Two new endpoints give HTTP clients the ability to store and retrieve offsets in Kafka's
+`__consumer_offsets` topic without joining a consumer group:
+
+### 15.4 Phased consumer capability roadmap
+
+| Phase | Capability | What client gets |
+|---|---|---|
+| 1–2 | Stateless fetch (§4.2) | Explicit partition + offset polling |
+| 3 | Offset commit/fetch (§4.4) | Server-side offset storage, `kafka-consumer-groups.sh` visibility, crash recovery |
+| 4 | Share group consume (§4.5) | Load-balanced consumption without client-side partition assignment |
+
+This progression gives HTTP clients increasing capability without ever requiring the
+fragile server-side session state that makes REST Proxy's consumer model operationally
+difficult.
+
+---
+
+*Document version: 0.6 — 2026-04-16*
 *Branch: feature/http-protocol*
