@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Time: Update - TASK-A.01
 package org.apache.kafka.common.security.authenticator;
 
 import org.apache.kafka.common.KafkaException;
@@ -23,10 +24,12 @@ import org.apache.kafka.common.message.DefaultPrincipalData;
 import org.apache.kafka.common.protocol.ByteBufferAccessor;
 import org.apache.kafka.common.protocol.MessageUtil;
 import org.apache.kafka.common.security.auth.AuthenticationContext;
+import org.apache.kafka.common.security.auth.HttpAuthenticationContext;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
 import org.apache.kafka.common.security.auth.KafkaPrincipalBuilder;
 import org.apache.kafka.common.security.auth.PlaintextAuthenticationContext;
 import org.apache.kafka.common.security.auth.SaslAuthenticationContext;
+import org.apache.kafka.common.security.auth.SecurityProtocol;
 import org.apache.kafka.common.security.auth.SslAuthenticationContext;
 import org.apache.kafka.common.security.kerberos.KerberosName;
 import org.apache.kafka.common.security.kerberos.KerberosShortNamer;
@@ -81,6 +84,17 @@ public class DefaultKafkaPrincipalBuilder implements KafkaPrincipalBuilder {
                 return applyKerberosShortNamer(saslServer.getAuthorizationID());
             else
                 return new KafkaPrincipal(KafkaPrincipal.USER_TYPE, saslServer.getAuthorizationID());
+        } else if (context instanceof HttpAuthenticationContext) {
+            HttpAuthenticationContext httpContext = (HttpAuthenticationContext) context;
+            // HTTPS with mTLS: extract principal from the leaf client certificate
+            if (httpContext.securityProtocol() == SecurityProtocol.HTTPS
+                    && httpContext.peerCertificates() != null
+                    && httpContext.peerCertificates().length > 0) {
+                return applySslPrincipalMapper(
+                    httpContext.peerCertificates()[0].getSubjectX500Principal());
+            }
+            // HTTP without TLS, or HTTPS without client cert: anonymous
+            return KafkaPrincipal.ANONYMOUS;
         } else {
             throw new IllegalArgumentException("Unhandled authentication context type: " + context.getClass().getName());
         }

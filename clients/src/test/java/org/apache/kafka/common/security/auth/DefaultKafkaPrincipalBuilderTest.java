@@ -26,6 +26,7 @@ import org.junit.jupiter.api.Test;
 
 import java.net.InetAddress;
 import java.security.Principal;
+import java.security.cert.X509Certificate;
 
 import javax.net.ssl.SSLSession;
 import javax.security.auth.x500.X500Principal;
@@ -178,6 +179,63 @@ public class DefaultKafkaPrincipalBuilderTest {
         verify(server, atLeastOnce()).getMechanismName();
         verify(server, atLeastOnce()).getAuthorizationID();
         verify(kerberosShortNamer, atLeastOnce()).shortName(any());
+    }
+
+    @Test
+    public void testBuildFromHttpContextReturnsAnonymous() throws Exception {
+        DefaultKafkaPrincipalBuilder builder = new DefaultKafkaPrincipalBuilder(null, null);
+        HttpAuthenticationContext httpCtx = new HttpAuthenticationContext(
+            InetAddress.getByName("127.0.0.1"),
+            "HTTP",
+            SecurityProtocol.HTTP,
+            null, null, null);
+        KafkaPrincipal principal = builder.build(httpCtx);
+        assertEquals(KafkaPrincipal.ANONYMOUS, principal);
+    }
+
+    @Test
+    public void testBuildFromHttpsContextWithoutCertsReturnsAnonymous() throws Exception {
+        DefaultKafkaPrincipalBuilder builder = new DefaultKafkaPrincipalBuilder(null, null);
+        HttpAuthenticationContext httpsCtx = new HttpAuthenticationContext(
+            InetAddress.getByName("127.0.0.1"),
+            "HTTPS",
+            SecurityProtocol.HTTPS,
+            "some-token", null, null);  // bearer token but no certs
+        KafkaPrincipal principal = builder.build(httpsCtx);
+        assertEquals(KafkaPrincipal.ANONYMOUS, principal);
+    }
+
+    @Test
+    public void testBuildFromHttpsContextWithMtlsCert() throws Exception {
+        // Create a mock X509Certificate with CN=testuser
+        X509Certificate mockCert = mock(X509Certificate.class);
+        X500Principal subject = new X500Principal("CN=testuser,O=TestOrg");
+        when(mockCert.getSubjectX500Principal()).thenReturn(subject);
+
+        DefaultKafkaPrincipalBuilder builder = new DefaultKafkaPrincipalBuilder(
+            null, SslPrincipalMapper.fromRules("DEFAULT"));
+
+        HttpAuthenticationContext httpsCtx = new HttpAuthenticationContext(
+            InetAddress.getByName("127.0.0.1"),
+            "HTTPS",
+            SecurityProtocol.HTTPS,
+            null, null, new X509Certificate[]{mockCert});
+        KafkaPrincipal principal = builder.build(httpsCtx);
+        assertEquals(KafkaPrincipal.USER_TYPE, principal.getPrincipalType());
+        // With DEFAULT rule the full DN is used
+        assertEquals("CN=testuser,O=TestOrg", principal.getName());
+    }
+
+    @Test
+    public void testBuildFromHttpsContextWithEmptyCertArrayReturnsAnonymous() throws Exception {
+        DefaultKafkaPrincipalBuilder builder = new DefaultKafkaPrincipalBuilder(null, null);
+        HttpAuthenticationContext httpsCtx = new HttpAuthenticationContext(
+            InetAddress.getByName("127.0.0.1"),
+            "HTTPS",
+            SecurityProtocol.HTTPS,
+            null, null, new X509Certificate[]{});  // empty array
+        KafkaPrincipal principal = builder.build(httpsCtx);
+        assertEquals(KafkaPrincipal.ANONYMOUS, principal);
     }
 
     private static class DummyPrincipal implements Principal {

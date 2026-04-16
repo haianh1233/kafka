@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Time: Update - TASK-A.01
 package org.apache.kafka.common.security.auth;
 
 import java.util.ArrayList;
@@ -31,7 +32,11 @@ public enum SecurityProtocol {
     /** SASL authenticated, non-encrypted channel */
     SASL_PLAINTEXT(2, "SASL_PLAINTEXT"),
     /** SASL authenticated, SSL channel */
-    SASL_SSL(3, "SASL_SSL");
+    SASL_SSL(3, "SASL_SSL"),
+    /** HTTP channel (no TLS) */
+    HTTP(4, "HTTP"),
+    /** HTTPS channel (TLS) */
+    HTTPS(5, "HTTPS");
 
     private static final Map<Short, SecurityProtocol> CODE_TO_SECURITY_PROTOCOL;
     private static final List<String> NAMES;
@@ -70,6 +75,11 @@ public enum SecurityProtocol {
     /** Case insensitive lookup by protocol name */
     public static SecurityProtocol forName(String name) {
         return SecurityProtocol.valueOf(name.toUpperCase(Locale.ROOT));
+    }
+
+    /** Returns true if this protocol is HTTP or HTTPS. */
+    public boolean isHttp() {
+        return this == HTTP || this == HTTPS;
     }
 
 }
