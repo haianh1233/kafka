@@ -203,6 +203,20 @@ class HttpRequestHandler(
         return
       }
 
+      // --- Content-Type validation for POST requests that require JSON body ---
+      val handlerType = routeResult.handlerType()
+      if (req.method() == io.netty.handler.codec.http.HttpMethod.POST &&
+        (handlerType == HttpRouter.HandlerType.PRODUCE ||
+         handlerType == HttpRouter.HandlerType.FETCH ||
+         handlerType == HttpRouter.HandlerType.COMMIT_OFFSETS)) {
+        val contentType = req.headers().get(HttpHeaderNames.CONTENT_TYPE)
+        if (contentType == null || !contentType.toLowerCase.startsWith("application/json")) {
+          sendErrorResponse(ctx, HttpResponseStatus.UNSUPPORTED_MEDIA_TYPE,
+            s"""{"errorCode":-1,"errorMessage":"Content-Type must be application/json, got: ${escapeJson(if (contentType != null) contentType else "null")}"}""")
+          return
+        }
+      }
+
       // --- Translate the request ---
       val bodyBytes = if (req.content().isReadable) {
         val bytes = new Array[Byte](req.content().readableBytes())
