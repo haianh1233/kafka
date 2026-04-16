@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit
 
 import io.netty.channel.{Channel, ChannelDuplexHandler, ChannelHandlerContext, ChannelInitializer}
 import io.netty.handler.codec.http.{HttpContentCompressor, HttpObjectAggregator, HttpServerCodec}
+import io.netty.handler.codec.http.cors.{CorsConfig, CorsConfigBuilder, CorsHandler}
 import io.netty.handler.ssl.SslContext
 import io.netty.handler.timeout.{IdleStateEvent, IdleStateHandler}
 import kafka.utils.Logging
@@ -32,6 +33,7 @@ import org.apache.kafka.common.Endpoint
  * Pipeline order:
  *   [ssl]           - SslHandler (HTTPS only)
  *   http-codec      - HttpServerCodec (HTTP/1.1 request/response encoding/decoding)
+ *   [cors]          - CorsHandler (CORS support, when configured)
  *   http-aggregator - HttpObjectAggregator (aggregate chunked -> FullHttpRequest)
  *   compressor      - HttpContentCompressor (gzip/deflate response compression)
  *   idle-handler    - IdleStateHandler (detect idle connections)
@@ -44,13 +46,18 @@ import org.apache.kafka.common.Endpoint
  * It will be fully wired in TASK-B.05.
  *
  * // Time: Created - TASK-B.03
+ * // Time: Modified - TASK-F.04 (CORS support)
  */
 class HttpChannelInitializer(
     endpoint: Endpoint,
     httpRequestMaxBytes: Int,
     httpConnectionIdleTimeoutMs: Long,
-    sslContext: Option[SslContext]
+    sslContext: Option[SslContext],
+    corsAllowedOrigins: String = ""
 ) extends ChannelInitializer[Channel] with Logging {
+
+  // Build CORS config once at initialization time, reused for every channel
+  private val corsConfig: Option[CorsConfig] = HttpChannelInitializer.buildCorsConfig(corsAllowedOrigins)
 
   override def initChannel(ch: Channel): Unit = {
     val pipeline = ch.pipeline()
@@ -63,23 +70,99 @@ class HttpChannelInitializer(
     // 2. HTTP/1.1 codec - decodes HTTP frames, encodes responses
     pipeline.addLast("http-codec", new HttpServerCodec())
 
-    // 3. Aggregate chunked requests into FullHttpRequest
+    // 3. CORS handler (if configured) -- must be after codec, before aggregator
+    //    Handles preflight OPTIONS requests and sets Access-Control-* headers
+    corsConfig.foreach { cc =>
+      pipeline.addLast("cors", new CorsHandler(cc))
+    }
+
+    // 4. Aggregate chunked requests into FullHttpRequest
     //    Netty returns 413 automatically if body exceeds limit
     pipeline.addLast("http-aggregator", new HttpObjectAggregator(httpRequestMaxBytes))
 
-    // 4. Response compression (gzip/deflate based on Accept-Encoding)
+    // 5. Response compression (gzip/deflate based on Accept-Encoding)
     pipeline.addLast("compressor", new HttpContentCompressor())
 
-    // 5. Idle connection detection
+    // 6. Idle connection detection
     //    Uses allIdle timeout - fires if no read OR write for the configured duration
     //    IMPORTANT: use the TimeUnit overload, not the seconds-only constructor
     pipeline.addLast("idle-handler",
       new IdleStateHandler(0, 0, httpConnectionIdleTimeoutMs, TimeUnit.MILLISECONDS))
 
-    // 6. Close channel on idle timeout
+    // 7. Close channel on idle timeout
     pipeline.addLast("idle-closer", new IdleStateCloseHandler())
 
     // Note: kafka-handler (HttpRequestHandler) will be added by TASK-B.05
+  }
+}
+
+/**
+ * Companion object for HttpChannelInitializer containing CORS configuration utilities.
+ *
+ * // Time: Created - TASK-F.04
+ */
+object HttpChannelInitializer {
+
+  /**
+   * Parse comma-separated CORS origins from the raw config string.
+   *
+   * @param raw the raw config value from http.cors.allowed.origins
+   * @return array of trimmed, non-empty origin strings; empty array if CORS is disabled
+   */
+  def parseCorsOrigins(raw: String): Array[String] = {
+    if (raw == null || raw.trim.isEmpty) Array.empty
+    else raw.split(",").map(_.trim).filter(_.nonEmpty)
+  }
+
+  /**
+   * Build Netty CorsConfig from the raw CORS origins config string.
+   * Returns None if CORS is not configured (empty origins).
+   *
+   * When origins contains "*", uses CorsConfigBuilder.forAnyOrigin().
+   * Otherwise, uses CorsConfigBuilder.forOrigins() with the specific origin list.
+   *
+   * Configured behavior:
+   *   - Allowed methods: GET, POST, OPTIONS
+   *   - Allowed request headers: Content-Type, Authorization, X-Kafka-Client-ID, X-Request-ID
+   *   - Exposed response headers: X-Kafka-Request-ID, X-Kafka-MaxWait-Applied, Retry-After
+   *   - Max age: 3600 seconds (1 hour preflight cache)
+   *   - Null origin allowed (for file:// and data: URI browsers)
+   *
+   * @param corsAllowedOrigins raw comma-separated origins string
+   * @return Some(CorsConfig) if CORS is enabled, None otherwise
+   */
+  def buildCorsConfig(corsAllowedOrigins: String): Option[CorsConfig] = {
+    val origins = parseCorsOrigins(corsAllowedOrigins)
+    if (origins.isEmpty) return None
+
+    val builder = if (origins.contains("*")) {
+      CorsConfigBuilder.forAnyOrigin()
+    } else {
+      CorsConfigBuilder.forOrigins(origins: _*)
+    }
+
+    Some(
+      builder
+        .allowedRequestMethods(
+          io.netty.handler.codec.http.HttpMethod.GET,
+          io.netty.handler.codec.http.HttpMethod.POST,
+          io.netty.handler.codec.http.HttpMethod.OPTIONS
+        )
+        .allowedRequestHeaders(
+          "Content-Type",
+          "Authorization",
+          "X-Kafka-Client-ID",
+          "X-Request-ID"
+        )
+        .exposeHeaders(
+          "X-Kafka-Request-ID",
+          "X-Kafka-MaxWait-Applied",
+          "Retry-After"
+        )
+        .maxAge(3600) // 1 hour preflight cache
+        .allowNullOrigin() // some browsers send "null" origin for file:// or data: URIs
+        .build()
+    )
   }
 }
 

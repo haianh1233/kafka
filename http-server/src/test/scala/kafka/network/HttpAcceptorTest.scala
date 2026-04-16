@@ -19,7 +19,7 @@ package kafka.network
 
 import java.util.concurrent.TimeUnit
 
-import kafka.server.http.HttpServerConfigs
+import org.apache.kafka.network.{HttpServerConfigs => HttpConfigs}
 import org.apache.kafka.common.Endpoint
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.common.utils.MockTime
@@ -42,9 +42,9 @@ class HttpAcceptorTest {
     val endpoint = new Endpoint("HTTP", SecurityProtocol.HTTP, "localhost", 0)
     acceptor = new HttpAcceptor(
       endpoint,
-      HttpServerConfigs.NUM_HTTP_NETWORK_THREADS_DEFAULT,
-      HttpServerConfigs.HTTP_REQUEST_MAX_BYTES_DEFAULT,
-      HttpServerConfigs.HTTP_CONNECTION_IDLE_TIMEOUT_MS_DEFAULT,
+      HttpConfigs.NUM_HTTP_NETWORK_THREADS_DEFAULT,
+      HttpConfigs.HTTP_REQUEST_MAX_BYTES_DEFAULT,
+      HttpConfigs.HTTP_CONNECTION_IDLE_TIMEOUT_MS_DEFAULT,
       time
     )
   }

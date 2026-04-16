@@ -22,9 +22,9 @@ import javax.net.ssl.KeyManagerFactory
 
 import io.netty.channel.embedded.EmbeddedChannel
 import io.netty.handler.codec.http.{HttpContentCompressor, HttpObjectAggregator, HttpServerCodec}
+import io.netty.handler.codec.http.cors.CorsHandler
 import io.netty.handler.ssl.{SslContext, SslContextBuilder}
 import io.netty.handler.timeout.IdleStateHandler
-import kafka.server.http.HttpServerConfigs
 import org.apache.kafka.common.Endpoint
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.test.TestSslUtils
@@ -41,8 +41,8 @@ import org.junit.jupiter.api.Assertions._
  */
 class HttpChannelInitializerTest {
 
-  private val httpRequestMaxBytes: Int = HttpServerConfigs.HTTP_REQUEST_MAX_BYTES_DEFAULT
-  private val httpConnectionIdleTimeoutMs: Long = HttpServerConfigs.HTTP_CONNECTION_IDLE_TIMEOUT_MS_DEFAULT
+  private val httpRequestMaxBytes: Int = org.apache.kafka.network.HttpServerConfigs.HTTP_REQUEST_MAX_BYTES_DEFAULT
+  private val httpConnectionIdleTimeoutMs: Long = org.apache.kafka.network.HttpServerConfigs.HTTP_CONNECTION_IDLE_TIMEOUT_MS_DEFAULT
   private var httpEndpoint: Endpoint = _
   private var httpsEndpoint: Endpoint = _
 
@@ -55,13 +55,17 @@ class HttpChannelInitializerTest {
   /**
    * Creates an EmbeddedChannel with the pipeline configured by HttpChannelInitializer.
    */
-  private def createChannelWithPipeline(sslContext: Option[SslContext] = None): EmbeddedChannel = {
+  private def createChannelWithPipeline(
+      sslContext: Option[SslContext] = None,
+      corsAllowedOrigins: String = ""
+  ): EmbeddedChannel = {
     val endpoint = if (sslContext.isDefined) httpsEndpoint else httpEndpoint
     val initializer = new HttpChannelInitializer(
       endpoint,
       httpRequestMaxBytes,
       httpConnectionIdleTimeoutMs,
-      sslContext
+      sslContext,
+      corsAllowedOrigins
     )
     new EmbeddedChannel(initializer)
   }
@@ -127,6 +131,63 @@ class HttpChannelInitializerTest {
   }
 
   @Test
+  def initChannel_corsDisabled_noCorsHandler(): Unit = {
+    val channel = createChannelWithPipeline(corsAllowedOrigins = "")
+    try {
+      val handler = channel.pipeline().get("cors")
+      assertNull(handler, "Pipeline should NOT contain 'cors' handler when CORS is disabled")
+    } finally {
+      channel.close()
+    }
+  }
+
+  @Test
+  def initChannel_corsEnabled_addsCorsHandler(): Unit = {
+    val channel = createChannelWithPipeline(corsAllowedOrigins = "https://example.com")
+    try {
+      val handler = channel.pipeline().get("cors")
+      assertNotNull(handler, "Pipeline should contain 'cors' handler when CORS is enabled")
+      assertTrue(handler.isInstanceOf[CorsHandler], "cors should be CorsHandler")
+    } finally {
+      channel.close()
+    }
+  }
+
+  @Test
+  def initChannel_corsEnabled_corsAfterCodecBeforeAggregator(): Unit = {
+    val channel = createChannelWithPipeline(corsAllowedOrigins = "https://example.com")
+    try {
+      val names = new java.util.ArrayList[String]()
+      val iter = channel.pipeline().iterator()
+      while (iter.hasNext) {
+        val entry = iter.next()
+        names.add(entry.getKey)
+      }
+      val codecIdx = names.indexOf("http-codec")
+      val corsIdx = names.indexOf("cors")
+      val aggregatorIdx = names.indexOf("http-aggregator")
+      assertTrue(corsIdx > codecIdx,
+        s"cors ($corsIdx) should come after http-codec ($codecIdx)")
+      assertTrue(corsIdx < aggregatorIdx,
+        s"cors ($corsIdx) should come before http-aggregator ($aggregatorIdx)")
+    } finally {
+      channel.close()
+    }
+  }
+
+  @Test
+  def initChannel_corsWildcard_addsCorsHandler(): Unit = {
+    val channel = createChannelWithPipeline(corsAllowedOrigins = "*")
+    try {
+      val handler = channel.pipeline().get("cors")
+      assertNotNull(handler, "Pipeline should contain 'cors' handler for wildcard origin")
+      assertTrue(handler.isInstanceOf[CorsHandler], "cors should be CorsHandler")
+    } finally {
+      channel.close()
+    }
+  }
+
+  @Test
   def initChannel_httpsEndpoint_addsSslHandler(): Unit = {
     val sslCtx = createTestSslContext()
     val channel = createChannelWithPipeline(Some(sslCtx))
@@ -167,6 +228,29 @@ class HttpChannelInitializerTest {
       val pipelineNames = new java.util.ArrayList[String](names)
       pipelineNames.retainAll(expectedOrder)
       assertEquals(expectedOrder, pipelineNames, "Pipeline handlers should be in the correct order")
+    } finally {
+      channel.close()
+    }
+  }
+
+  @Test
+  def initChannel_pipelineOrderWithCors(): Unit = {
+    val channel = createChannelWithPipeline(corsAllowedOrigins = "https://example.com")
+    try {
+      val names = new java.util.ArrayList[String]()
+      val iter = channel.pipeline().iterator()
+      while (iter.hasNext) {
+        val entry = iter.next()
+        names.add(entry.getKey)
+      }
+      // Verify the order including CORS handler
+      val expectedOrder = java.util.List.of(
+        "http-codec", "cors", "http-aggregator", "compressor", "idle-handler", "idle-closer"
+      )
+      val pipelineNames = new java.util.ArrayList[String](names)
+      pipelineNames.retainAll(expectedOrder)
+      assertEquals(expectedOrder, pipelineNames,
+        "Pipeline handlers should be in the correct order with CORS handler after codec and before aggregator")
     } finally {
       channel.close()
     }

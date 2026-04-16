@@ -54,7 +54,8 @@ class HttpAcceptor(
     numWorkerThreads: Int,
     httpRequestMaxBytes: Int,
     httpConnectionIdleTimeoutMs: Long,
-    time: Time
+    time: Time,
+    corsAllowedOrigins: String = ""
 ) extends Closeable with Logging {
 
   // --- Netty event loop groups ---
@@ -93,7 +94,7 @@ class HttpAcceptor(
       .option(ChannelOption.SO_BACKLOG, Int.box(128))
       .childOption(ChannelOption.SO_KEEPALIVE, Boolean.box(true))
       .childHandler(new HttpChannelInitializer(
-        endpoint, httpRequestMaxBytes, httpConnectionIdleTimeoutMs, sslContext))
+        endpoint, httpRequestMaxBytes, httpConnectionIdleTimeoutMs, sslContext, corsAllowedOrigins))
 
     val host = if (endpoint.host() == null || endpoint.host().isEmpty) "0.0.0.0" else endpoint.host()
     val bindFuture = bootstrap.bind(host, endpoint.port())
