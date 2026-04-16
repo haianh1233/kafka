@@ -21,10 +21,16 @@
    - 5.8 Subscribe / Unsubscribe
    - 5.9 Acknowledgements (ACK / NACK)
    - 5.10 Flow Control (Credits)
-6. [HTTP REST API Extensions](#6-http-rest-api-extensions)
-   - 6.1 Exchange Management
-   - 6.2 Queue Management
-   - 6.3 Binding Management
+6. [HTTP REST Management API](#5-http-rest-management-api)
+   - 5.1 Overview & Health
+   - 5.2 Virtual Host Management
+   - 5.3 Exchange Management
+   - 5.4 Queue Management (Declare, Get, List, Delete, Purge, Update Settings)
+   - 5.5 Binding Management
+   - 5.6 Connection Management (List, Details, Force-Close)
+   - 5.7 Consumer Management (List, Force-Cancel)
+   - 5.8 Message Operations via REST (Publish, Get, Ack, Nack)
+   - 5.9 Complete REST Endpoint Summary
 7. [Routing Engine](#7-routing-engine)
    - 7.1 Direct Exchange
    - 7.2 Topic Exchange (Wildcard)
@@ -496,7 +502,7 @@ Netty workers and `KafkaRequestHandler` threads — neither is ever blocked by c
 #### 4.1.1 WebSocket Upgrade
 
 ```
-GET /v1/ws HTTP/1.1
+GET /v1/ws?vhost=/production HTTP/1.1
 Host: broker1:9094
 Upgrade: websocket
 Connection: Upgrade
@@ -504,6 +510,10 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
 Sec-WebSocket-Version: 13
 Authorization: Bearer <token>          ← optional, same auth as HTTP (§16)
 ```
+
+The optional `vhost` query parameter selects a virtual host (default `/`). Virtual hosts
+provide namespace isolation — exchanges, queues, and bindings in one vhost are invisible
+to other vhosts. See §11.6 for the vhost-to-topic-prefix mapping.
 
 ```
 HTTP/1.1 101 Switching Protocols
@@ -571,6 +581,8 @@ correlation. If omitted, the response has no `id`.
 | `publish` | Publish message to exchange | `published` (if confirms enabled) |
 | `subscribe` | Subscribe to a queue | `subscribed` |
 | `unsubscribe` | Cancel subscription | `unsubscribed` |
+| `get` | Pull one message from a queue | `get-ok` or `get-empty` |
+| `purge-queue` | Remove all messages from a queue | `queue-purged` |
 | `ack` | Acknowledge delivered message(s) | (none) |
 | `nack` | Negative-acknowledge message(s) | (none) |
 | `credits` | Grant delivery credits | (none) |
@@ -590,6 +602,10 @@ correlation. If omitted, the response has no `id`.
 | `queue-declared` | Queue declare response | |
 | `bound` / `unbound` | Binding response | |
 | `subscribed` / `unsubscribed` | Subscription response | |
+| `subscription-cancelled` | Server-initiated cancel | Queue deleted, exclusive eviction, etc. |
+| `get-ok` | Pull message response (has message) | |
+| `get-empty` | Pull message response (no message) | |
+| `queue-purged` | Purge response | Includes purged message count |
 
 ---
 
@@ -625,10 +641,16 @@ Response:
 | `exchangeType` | `"direct"` \| `"topic"` \| `"fanout"` \| `"headers"` | `"direct"` | Routing algorithm |
 | `durable` | boolean | `true` | Survive broker restart |
 | `autoDelete` | boolean | `false` | Delete when last binding removed |
+| `passive` | boolean | `false` | If true, assert exchange exists without creating. Returns error if not found. |
+| `internal` | boolean | `false` | If true, exchange cannot be published to directly (only via e2e bindings) |
 | `arguments` | object | `{}` | Exchange-specific arguments (e.g., `alternate-exchange`) |
 
 **Idempotency:** Declaring an exchange that already exists with the **same type** is a no-op.
 Declaring with a **different type** returns an error.
+
+**Passive declare:** When `passive: true`, the broker checks if the exchange exists and
+returns `exchange-declared` if it does, or an error with `EXCHANGE_NOT_FOUND` if it does
+not. No exchange is created. Used by clients to assert topology without modifying it.
 
 **Pre-declared exchanges** (always exist, cannot be deleted):
 
@@ -691,7 +713,12 @@ Response:
 | `durable` | boolean | `true` | Survive broker restart |
 | `exclusive` | boolean | `false` | Only this connection can consume |
 | `autoDelete` | boolean | `false` | Delete when last subscriber disconnects |
+| `passive` | boolean | `false` | If true, assert queue exists without creating. Returns error if not found. |
 | `arguments` | object | `{}` | Queue policies (see table below) |
+
+**Passive declare:** When `passive: true`, the broker checks if the queue exists and
+returns `queue-declared` with `messageCount` and `consumerCount` if it does, or an error
+with `QUEUE_NOT_FOUND` if it does not. No queue is created.
 
 **Queue arguments:**
 
@@ -810,12 +837,16 @@ also routed to the destination exchange.
       "source": "checkout-service",
       "priority": "high"
     },
+    "contentEncoding": "utf-8",
     "deliveryMode": 2,
+    "priority": 0,
     "correlationId": "req-123",
     "replyTo": "replies",
     "expiration": "60000",
     "messageId": "msg-abc",
     "timestamp": 1713260400,
+    "type": "OrderCreated",
+    "userId": "checkout-svc",
     "appId": "checkout-service"
   },
   "publishId": 1
@@ -828,16 +859,23 @@ also routed to the destination exchange.
 | `routingKey` | string | `""` | Routing key for exchange matching |
 | `mandatory` | boolean | `false` | Return if unroutable |
 | `message.body` | any | required | Message payload (JSON value, string, or base64 for binary) |
-| `message.contentType` | string | `null` | MIME type |
-| `message.headers` | object | `{}` | Application headers (used by headers exchange) |
+| `message.contentType` | string | `null` | MIME type (e.g., `application/json`) |
+| `message.contentEncoding` | string | `null` | Content encoding (e.g., `utf-8`, `gzip`) |
+| `message.headers` | object | `{}` | Application headers (used by headers exchange matching) |
 | `message.deliveryMode` | int | `2` | 1=non-persistent, 2=persistent |
-| `message.correlationId` | string | `null` | Correlation identifier |
-| `message.replyTo` | string | `null` | Reply routing key |
-| `message.expiration` | string | `null` | Per-message TTL in milliseconds |
-| `message.messageId` | string | `null` | Application message ID |
+| `message.priority` | int | `0` | Priority level (0-9, higher = more urgent, see §12.5) |
+| `message.correlationId` | string | `null` | Correlation identifier (for request-reply patterns) |
+| `message.replyTo` | string | `null` | Reply queue/routing key |
+| `message.expiration` | string | `null` | Per-message TTL in milliseconds (see §12.4) |
+| `message.messageId` | string | `null` | Application message ID (for deduplication, §12.7) |
 | `message.timestamp` | long | `null` | Unix epoch seconds |
-| `message.appId` | string | `null` | Application identifier |
+| `message.type` | string | `null` | Application-defined message type (e.g., `OrderCreated`) |
+| `message.userId` | string | `null` | Publishing user. Broker validates it matches the authenticated principal. Rejected with `ACCESS_REFUSED` if mismatch. |
+| `message.appId` | string | `null` | Publishing application identifier |
 | `publishId` | long | `null` | Sequence number for publisher confirms |
+
+All 13 AMQP content properties are supported. This ensures lossless round-trip fidelity
+between WebSocket and AMQP clients consuming the same Kafka topics.
 
 **Body encoding:**
 - If `contentType` is `application/json` or `body` is a JSON object/array: stored as-is
@@ -925,8 +963,108 @@ credit counter, and delivery tag sequence.
 }
 ```
 
-Cancels the subscription. Outstanding unacked messages for this subscription are discarded
-(offsets not committed). The consumer fetch loop is stopped.
+Cancels the subscription. Outstanding unacked messages for this subscription are **requeued**
+(offsets not committed) — they will be redelivered to other active subscribers on the same
+queue. If no other subscribers exist, the messages remain unconsumed until a new subscriber
+connects.
+
+#### 4.8.3 Server-Initiated Cancel (`subscription-cancelled`)
+
+The broker can cancel a subscription without the client requesting it. This happens when:
+- The queue is deleted (by another client or auto-delete trigger)
+- An exclusive consumer is evicted by queue deletion
+- The queue's backing topic is deleted externally
+
+```json
+{
+  "type": "subscription-cancelled",
+  "subscriptionId": "sub-1",
+  "reason": "QUEUE_DELETED",
+  "queue": "order-events"
+}
+```
+
+The client should treat this as a terminal event for the subscription — no more `deliver`
+frames will arrive for this `subscriptionId`. Unacked messages are requeued (if the queue
+still exists) or lost (if the queue was deleted).
+
+#### 4.8.4 Basic.Get — Pull One Message (`get`)
+
+For request-reply patterns and one-off message retrieval, the client can pull a single
+message from a queue without subscribing:
+
+```json
+{
+  "type": "get",
+  "id": "req-12",
+  "queue": "order-events",
+  "noAck": false
+}
+```
+
+**Response — message available:**
+
+```json
+{
+  "type": "get-ok",
+  "id": "req-12",
+  "deliveryTag": 42,
+  "redelivered": false,
+  "exchange": "orders",
+  "routingKey": "order.created",
+  "message": { ... },
+  "messageCount": 153
+}
+```
+
+**Response — queue empty:**
+
+```json
+{
+  "type": "get-empty",
+  "id": "req-12"
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `queue` | string | required | Queue name to pull from |
+| `noAck` | boolean | `false` | If true, message auto-acked (no deliveryTag tracking) |
+
+`messageCount` in `get-ok` is the remaining message count in the queue (same computation
+as `declare-queue` response). If `noAck: false`, the message requires an explicit `ack` or
+`nack`, using the returned `deliveryTag`.
+
+**Kafka mapping:** `get` translates to a single-record `FetchRequest` on the queue's
+backing topic. The offset is tracked per-connection in a `getOffsets` map (separate from
+subscription offsets). Each `get` on the same queue advances the offset by 1.
+
+#### 4.8.5 Queue Purge (`purge-queue`)
+
+Remove all messages from a queue:
+
+```json
+{
+  "type": "purge-queue",
+  "id": "req-13",
+  "queue": "order-events"
+}
+```
+
+Response:
+
+```json
+{
+  "type": "queue-purged",
+  "id": "req-13",
+  "queue": "order-events",
+  "messageCount": 1543
+}
+```
+
+`messageCount` is the number of messages purged. Purge advances committed offsets to the
+log end offset for all partitions of the backing topic — effectively marking all existing
+messages as consumed.
 
 ---
 
@@ -1003,23 +1141,90 @@ auto-acks but respects the credit window.
 
 ---
 
-## 5. HTTP REST API Extensions
+## 5. HTTP REST Management API
 
-These REST endpoints manage routing metadata. They complement the WebSocket control messages
-— both operate on the same in-memory routing state and `__ws_routing_metadata` topic.
+A complete management API for all AMQP routing operations. Every operation available via
+WebSocket control frames is also available via REST — plus additional inspection and
+administration endpoints. All endpoints accept `X-Vhost` header (default `/`).
 
-### 5.1 Exchange Management
+**Base path:** `/v1`  
+**Content-Type:** `application/json`  
+**Authentication:** Same as HTTP API (Bearer, Basic, mTLS — see §19)
+
+### 5.1 Overview & Health
+
+#### Cluster Overview — `GET /v1/overview`
+
+```json
+{
+  "brokerId": 3,
+  "clusterId": "abc123",
+  "exchangeCount": 8,
+  "queueCount": 12,
+  "bindingCount": 24,
+  "connectionCount": 47,
+  "consumerCount": 63,
+  "publishRate": 1250.5,
+  "deliverRate": 1180.2,
+  "vhosts": ["/", "/production", "/staging"]
+}
+```
+
+#### Health Check — `GET /v1/health`
+
+(Existing, unchanged from base HTTP design.)
+
+---
+
+### 5.2 Virtual Host Management
+
+#### List Vhosts — `GET /v1/vhosts`
+
+```json
+{
+  "vhosts": [
+    { "name": "/", "exchangeCount": 5, "queueCount": 3 },
+    { "name": "/production", "exchangeCount": 8, "queueCount": 12 },
+    { "name": "/staging", "exchangeCount": 6, "queueCount": 5 }
+  ]
+}
+```
+
+#### Create Vhost — `PUT /v1/vhosts/{vhost}`
+
+```
+PUT /v1/vhosts/%2Fproduction     ← URL-encoded "/"
+```
+
+Response: 201 Created (or 200 OK if exists).
+
+Creates the vhost namespace. Pre-declared exchanges are auto-created for the new vhost.
+
+#### Delete Vhost — `DELETE /v1/vhosts/{vhost}`
+
+Deletes the vhost and **all its exchanges, queues, bindings, and backing Kafka topics**.
+Requires no active connections to the vhost.
+
+---
+
+### 5.3 Exchange Management
 
 #### Declare Exchange — `PUT /v1/exchanges/{exchange}`
 
-```json
+```
 PUT /v1/exchanges/events
+X-Vhost: /production
+```
 
+```json
 {
   "exchangeType": "topic",
   "durable": true,
   "autoDelete": false,
-  "arguments": {}
+  "internal": false,
+  "arguments": {
+    "alternate-exchange": "unrouted"
+  }
 }
 ```
 
@@ -1028,9 +1233,28 @@ Response (201 Created or 200 OK if already exists with same type):
 ```json
 {
   "exchange": "events",
+  "vhost": "/production",
   "exchangeType": "topic",
   "durable": true,
-  "autoDelete": false
+  "autoDelete": false,
+  "internal": false,
+  "arguments": { "alternate-exchange": "unrouted" }
+}
+```
+
+#### Get Exchange Details — `GET /v1/exchanges/{exchange}`
+
+```json
+{
+  "exchange": "events",
+  "vhost": "/production",
+  "exchangeType": "topic",
+  "durable": true,
+  "autoDelete": false,
+  "internal": false,
+  "arguments": { "alternate-exchange": "unrouted" },
+  "bindingCount": 5,
+  "publishRate": 420.3
 }
 ```
 
@@ -1039,31 +1263,46 @@ Response (201 Created or 200 OK if already exists with same type):
 ```json
 {
   "exchanges": [
-    { "exchange": "", "exchangeType": "direct", "durable": true },
-    { "exchange": "amq.direct", "exchangeType": "direct", "durable": true },
-    { "exchange": "amq.topic", "exchangeType": "topic", "durable": true },
-    { "exchange": "amq.fanout", "exchangeType": "fanout", "durable": true },
-    { "exchange": "amq.headers", "exchangeType": "headers", "durable": true },
-    { "exchange": "events", "exchangeType": "topic", "durable": true }
+    { "exchange": "", "exchangeType": "direct", "durable": true, "internal": false },
+    { "exchange": "amq.direct", "exchangeType": "direct", "durable": true, "internal": false },
+    { "exchange": "amq.topic", "exchangeType": "topic", "durable": true, "internal": false },
+    { "exchange": "amq.fanout", "exchangeType": "fanout", "durable": true, "internal": false },
+    { "exchange": "amq.headers", "exchangeType": "headers", "durable": true, "internal": false },
+    { "exchange": "events", "exchangeType": "topic", "durable": true, "internal": false }
   ]
 }
 ```
 
 #### Delete Exchange — `DELETE /v1/exchanges/{exchange}?ifUnused=false`
 
-Returns 204 No Content on success.
+Returns 204 No Content. `ifUnused=true` fails if any bindings exist.
 
-### 5.2 Queue Management
+---
+
+### 5.4 Queue Management
 
 #### Declare Queue — `PUT /v1/queues/{queue}`
 
-```json
+```
 PUT /v1/queues/order-events
+X-Vhost: /production
+```
 
+```json
 {
   "durable": true,
+  "exclusive": false,
+  "autoDelete": false,
   "arguments": {
-    "x-message-ttl": 86400000
+    "x-message-ttl": 86400000,
+    "x-max-length": 1000000,
+    "x-max-length-bytes": 1073741824,
+    "x-dead-letter-exchange": "dlx",
+    "x-dead-letter-routing-key": "dead.orders",
+    "x-max-priority": 10,
+    "x-overflow": "reject-publish",
+    "x-expires": 3600000,
+    "x-max-retries": 5
   }
 }
 ```
@@ -1073,21 +1312,101 @@ Response (201 Created or 200 OK):
 ```json
 {
   "queue": "order-events",
+  "vhost": "/production",
   "durable": true,
+  "exclusive": false,
+  "autoDelete": false,
+  "arguments": { "x-message-ttl": 86400000, ... },
   "messageCount": 0,
-  "consumerCount": 0
+  "consumerCount": 0,
+  "backingTopic": "ws.production.order-events",
+  "partitions": 1
+}
+```
+
+#### Get Queue Details — `GET /v1/queues/{queue}`
+
+```json
+{
+  "queue": "order-events",
+  "vhost": "/production",
+  "durable": true,
+  "exclusive": false,
+  "autoDelete": false,
+  "arguments": {
+    "x-message-ttl": 86400000,
+    "x-dead-letter-exchange": "dlx",
+    "x-max-priority": 10
+  },
+  "messageCount": 1543,
+  "consumerCount": 3,
+  "publishRate": 120.5,
+  "deliverRate": 115.2,
+  "ackRate": 114.8,
+  "unackedCount": 42,
+  "backingTopic": "ws.production.order-events",
+  "partitions": 4,
+  "consumers": [
+    { "subscriptionId": "sub-1", "connectionId": "ws-3-af72b1c4", "credits": 87, "unacked": 13, "prefetch": 100 },
+    { "subscriptionId": "sub-2", "connectionId": "ws-1-bc83c2d5", "credits": 100, "unacked": 0, "prefetch": 100 },
+    { "subscriptionId": "sub-3", "connectionId": "ws-2-cd94d3e6", "credits": 71, "unacked": 29, "prefetch": 100 }
+  ]
 }
 ```
 
 #### List Queues — `GET /v1/queues`
 
+```json
+{
+  "queues": [
+    { "queue": "order-events", "durable": true, "messageCount": 1543, "consumerCount": 3 },
+    { "queue": "audit-log", "durable": true, "messageCount": 50234, "consumerCount": 1 },
+    { "queue": "dead-letters", "durable": true, "messageCount": 7, "consumerCount": 0 }
+  ]
+}
+```
+
 #### Delete Queue — `DELETE /v1/queues/{queue}?ifUnused=false&ifEmpty=false`
+
+Returns 204 No Content. `ifUnused=true` fails with 409 if consumers are active.
+`ifEmpty=true` fails with 409 if `messageCount > 0`.
 
 #### Purge Queue — `DELETE /v1/queues/{queue}/messages`
 
-### 5.3 Binding Management
+```json
+{ "messageCount": 1543 }
+```
+
+Returns the number of messages purged.
+
+#### Update Queue Settings — `PATCH /v1/queues/{queue}`
+
+Update queue arguments on a live queue without deleting and re-creating:
+
+```json
+PATCH /v1/queues/order-events
+
+{
+  "arguments": {
+    "x-message-ttl": 172800000,
+    "x-max-retries": 10
+  }
+}
+```
+
+**Rules:**
+- `x-message-ttl`, `x-max-length-bytes` → updates Kafka topic config via `AlterConfigsRequest`
+- `x-dead-letter-exchange`, `x-dead-letter-routing-key`, `x-max-retries`, `x-max-priority` → updates queue metadata only
+- `x-max-length`, `x-overflow`, `x-expires` → updates queue metadata only
+- Cannot change `durable`, `exclusive`, `autoDelete` — these are immutable after creation
+
+---
+
+### 5.5 Binding Management
 
 #### Create Binding — `POST /v1/bindings`
+
+Queue-to-exchange binding:
 
 ```json
 {
@@ -1098,17 +1417,49 @@ Response (201 Created or 200 OK):
 }
 ```
 
+Exchange-to-exchange binding:
+
+```json
+{
+  "source": "events",
+  "destination": "errors",
+  "routingKey": "*.error",
+  "arguments": {}
+}
+```
+
 Response (201 Created):
 
 ```json
 {
   "exchange": "events",
   "queue": "order-events",
-  "routingKey": "order.*"
+  "routingKey": "order.*",
+  "vhost": "/"
 }
 ```
 
-#### List Bindings — `GET /v1/bindings?exchange=events`
+#### List Bindings for Exchange — `GET /v1/bindings?exchange=events`
+
+```json
+{
+  "bindings": [
+    { "exchange": "events", "queue": "order-events", "routingKey": "order.*", "arguments": {} },
+    { "exchange": "events", "queue": "audit-log", "routingKey": "#", "arguments": {} }
+  ]
+}
+```
+
+#### List Bindings for Queue — `GET /v1/bindings?queue=order-events`
+
+```json
+{
+  "bindings": [
+    { "exchange": "events", "queue": "order-events", "routingKey": "order.*", "arguments": {} },
+    { "exchange": "amq.direct", "queue": "order-events", "routingKey": "order-events", "arguments": {} }
+  ]
+}
+```
 
 #### Delete Binding — `DELETE /v1/bindings`
 
@@ -1119,6 +1470,274 @@ Response (201 Created):
   "routingKey": "order.*"
 }
 ```
+
+Returns 204 No Content.
+
+---
+
+### 5.6 Connection Management
+
+#### List Connections — `GET /v1/connections`
+
+```json
+{
+  "connections": [
+    {
+      "connectionId": "ws-3-af72b1c4",
+      "brokerId": 3,
+      "vhost": "/production",
+      "principal": "checkout-svc",
+      "connectedAt": "2026-04-16T10:30:00Z",
+      "subscriptionCount": 2,
+      "protocol": "websocket",
+      "remoteAddress": "10.0.1.42:51234"
+    },
+    {
+      "connectionId": "ws-3-bg83c2d5",
+      "brokerId": 3,
+      "vhost": "/",
+      "principal": "anonymous",
+      "connectedAt": "2026-04-16T11:00:00Z",
+      "subscriptionCount": 0,
+      "protocol": "websocket",
+      "remoteAddress": "10.0.1.43:52345"
+    }
+  ]
+}
+```
+
+#### Get Connection Details — `GET /v1/connections/{connectionId}`
+
+```json
+{
+  "connectionId": "ws-3-af72b1c4",
+  "brokerId": 3,
+  "vhost": "/production",
+  "principal": "checkout-svc",
+  "connectedAt": "2026-04-16T10:30:00Z",
+  "remoteAddress": "10.0.1.42:51234",
+  "protocol": "websocket",
+  "subscriptions": [
+    { "subscriptionId": "sub-1", "queue": "order-events", "credits": 87, "unacked": 13, "noAck": false },
+    { "subscriptionId": "sub-2", "queue": "audit-log", "credits": 100, "unacked": 0, "noAck": true }
+  ],
+  "publishConfirmsEnabled": true,
+  "messagesPublished": 4521,
+  "messagesDelivered": 3890,
+  "messagesAcked": 3877
+}
+```
+
+#### Force-Close Connection — `DELETE /v1/connections/{connectionId}`
+
+```json
+{ "reason": "Administrative close" }
+```
+
+Sends WebSocket close frame (code 1001, reason text) and closes the TCP connection.
+All subscriptions are cancelled and unacked messages are requeued (§11.7).
+
+Returns 204 No Content.
+
+---
+
+### 5.7 Consumer Management
+
+#### List Consumers — `GET /v1/consumers`
+
+```json
+{
+  "consumers": [
+    {
+      "subscriptionId": "sub-1",
+      "queue": "order-events",
+      "connectionId": "ws-3-af72b1c4",
+      "brokerId": 3,
+      "credits": 87,
+      "unacked": 13,
+      "prefetch": 100,
+      "noAck": false,
+      "exclusive": false,
+      "startedAt": "2026-04-16T10:31:00Z"
+    }
+  ]
+}
+```
+
+#### List Consumers for Queue — `GET /v1/consumers?queue=order-events`
+
+Filtered view of the above.
+
+#### Cancel Consumer — `DELETE /v1/consumers/{connectionId}/{subscriptionId}`
+
+Force-cancels a subscription from another connection. The target connection receives a
+`subscription-cancelled` frame (§4.8.3) with `reason: "ADMIN_CANCEL"`. Unacked messages
+are requeued.
+
+Returns 204 No Content.
+
+---
+
+### 5.8 Message Operations via REST
+
+#### Publish via REST with Exchange Routing — `POST /v1/exchanges/{exchange}/publish`
+
+Publish a message through an exchange using REST (no WebSocket needed):
+
+```
+POST /v1/exchanges/events/publish
+X-Vhost: /production
+X-Routing-Key: order.created
+```
+
+```json
+{
+  "body": { "orderId": "123", "amount": 42.0 },
+  "contentType": "application/json",
+  "headers": { "source": "rest-client" },
+  "deliveryMode": 2,
+  "mandatory": false
+}
+```
+
+Response (200 OK):
+
+```json
+{
+  "routed": true,
+  "queues": ["order-events", "audit-log"],
+  "offsets": [
+    { "queue": "order-events", "partition": 0, "offset": 1042 },
+    { "queue": "audit-log", "partition": 0, "offset": 5567 }
+  ]
+}
+```
+
+If `mandatory: true` and no queues match:
+
+```json
+{
+  "routed": false,
+  "queues": [],
+  "replyCode": 312,
+  "replyText": "NO_ROUTE"
+}
+```
+
+#### Get Message (Pull) via REST — `POST /v1/queues/{queue}/get`
+
+Pull one or more messages from a queue without a WebSocket subscription:
+
+```
+POST /v1/queues/order-events/get
+X-Vhost: /production
+```
+
+```json
+{
+  "count": 1,
+  "ackMode": "manual",
+  "encoding": "auto"
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `count` | int | `1` | Number of messages to retrieve (max 100) |
+| `ackMode` | `"manual"` \| `"auto"` \| `"reject-requeue"` | `"auto"` | `manual` = message requires separate ack; `auto` = auto-acked; `reject-requeue` = returned to queue |
+| `encoding` | `"auto"` \| `"base64"` | `"auto"` | Value encoding in response |
+
+Response (200 OK):
+
+```json
+{
+  "messages": [
+    {
+      "deliveryTag": 42,
+      "redelivered": false,
+      "exchange": "events",
+      "routingKey": "order.created",
+      "message": {
+        "body": { "orderId": "123" },
+        "contentType": "application/json",
+        "headers": { "source": "checkout" },
+        "deliveryMode": 2,
+        "timestamp": 1713260400
+      },
+      "partition": 0,
+      "offset": 1042,
+      "messageCount": 1542
+    }
+  ]
+}
+```
+
+Response (200 OK, queue empty):
+
+```json
+{ "messages": [] }
+```
+
+When `ackMode: "manual"`, the returned `deliveryTag` must be acked via:
+
+#### Ack Message via REST — `POST /v1/queues/{queue}/ack`
+
+```json
+{
+  "deliveryTag": 42,
+  "multiple": false
+}
+```
+
+#### Nack Message via REST — `POST /v1/queues/{queue}/nack`
+
+```json
+{
+  "deliveryTag": 42,
+  "requeue": true
+}
+```
+
+---
+
+### 5.9 Complete REST Endpoint Summary
+
+| Method | Path | Description | §WS Equivalent |
+|---|---|---|---|
+| `GET` | `/v1/overview` | Cluster overview & stats | `connected` message |
+| `GET` | `/v1/health` | Health check | — |
+| **Vhosts** | | | |
+| `GET` | `/v1/vhosts` | List virtual hosts | — |
+| `PUT` | `/v1/vhosts/{vhost}` | Create virtual host | — |
+| `DELETE` | `/v1/vhosts/{vhost}` | Delete virtual host | — |
+| **Exchanges** | | | |
+| `GET` | `/v1/exchanges` | List all exchanges | — |
+| `PUT` | `/v1/exchanges/{name}` | Declare exchange | `declare-exchange` |
+| `GET` | `/v1/exchanges/{name}` | Get exchange details | — |
+| `DELETE` | `/v1/exchanges/{name}` | Delete exchange | `delete-exchange` |
+| **Queues** | | | |
+| `GET` | `/v1/queues` | List all queues | — |
+| `PUT` | `/v1/queues/{name}` | Declare queue | `declare-queue` |
+| `GET` | `/v1/queues/{name}` | Get queue details (with consumers) | — |
+| `PATCH` | `/v1/queues/{name}` | Update queue settings | — |
+| `DELETE` | `/v1/queues/{name}` | Delete queue | `delete-queue` |
+| `DELETE` | `/v1/queues/{name}/messages` | Purge queue | `purge-queue` |
+| **Bindings** | | | |
+| `GET` | `/v1/bindings` | List bindings (filter by exchange or queue) | — |
+| `POST` | `/v1/bindings` | Create binding | `bind` |
+| `DELETE` | `/v1/bindings` | Delete binding | `unbind` |
+| **Connections** | | | |
+| `GET` | `/v1/connections` | List all WS connections | — |
+| `GET` | `/v1/connections/{id}` | Get connection details | — |
+| `DELETE` | `/v1/connections/{id}` | Force-close connection | — |
+| **Consumers** | | | |
+| `GET` | `/v1/consumers` | List all consumers | — |
+| `DELETE` | `/v1/consumers/{connId}/{subId}` | Force-cancel consumer | — |
+| **Messages** | | | |
+| `POST` | `/v1/exchanges/{name}/publish` | Publish via exchange routing | `publish` |
+| `POST` | `/v1/queues/{name}/get` | Pull message(s) from queue | `get` |
+| `POST` | `/v1/queues/{name}/ack` | Acknowledge message | `ack` |
+| `POST` | `/v1/queues/{name}/nack` | Negative-acknowledge message | `nack` |
 
 ---
 
@@ -1291,6 +1910,48 @@ Publish: exchange="", routingKey="order-events"
 ```
 
 This allows simple publish-to-queue-by-name without explicit binding setup.
+
+### 6.7 Alternate Exchange (Fallback Routing)
+
+When an exchange has an `alternate-exchange` argument and a publish matches **no bindings**,
+the message is re-routed to the alternate exchange instead of being discarded (or returned
+if `mandatory`):
+
+```
+Publish → exchange "orders" (direct)
+  → bindings: queue="new-orders", routingKey="order.new"
+  → routingKey="order.unknown" → NO MATCH
+
+  → alternate-exchange = "unrouted" (fanout)
+  → fanout → all bound queues of "unrouted"
+  → queue "catch-all" receives the message
+```
+
+**Implementation in `routeRecursive()`:**
+
+```java
+Set<String> matchedQueues = matchBindings(exchange, routingKey, headers);
+
+if (matchedQueues.isEmpty() && exchange.alternateExchange != null) {
+    return routeRecursive(exchange.alternateExchange, routingKey, headers,
+                          matchedQueues, visited);
+}
+```
+
+The alternate exchange is set via the `arguments` field on `declare-exchange`:
+
+```json
+{
+  "type": "declare-exchange",
+  "exchange": "orders",
+  "exchangeType": "direct",
+  "arguments": { "alternate-exchange": "unrouted" }
+}
+```
+
+**Interaction with `mandatory`:** If a message is `mandatory: true` and routing (including
+alternate exchange fallback) still finds no queues, the message is returned to the publisher
+via the `returned` frame. The alternate exchange is tried **before** the mandatory return.
 
 ---
 
@@ -1782,6 +2443,58 @@ GET /v1/queues/orders
 - `ws.queue.publish.rate` (meter, per queue) — messages entering the queue per second
 - `ws.queue.deliver.rate` (meter, per queue) — messages delivered to consumers per second
 
+### 11.6 Virtual Host Support
+
+Virtual hosts provide namespace isolation for multi-tenant deployments. Each vhost has its
+own set of exchanges, queues, and bindings — completely invisible to other vhosts.
+
+**Vhost selection:** The client specifies the vhost on WebSocket upgrade via query parameter:
+
+```
+GET /v1/ws?vhost=/production HTTP/1.1
+```
+
+Default vhost is `/`. The vhost is stored on the `WsConnectionContext` and applies to all
+subsequent operations on that connection.
+
+**Topic prefix mapping:**
+
+| Vhost | Topic Prefix | Queue "orders" → Topic |
+|---|---|---|
+| `/` (default) | `ws.` | `ws.orders` |
+| `/production` | `ws.production.` | `ws.production.orders` |
+| `/staging` | `ws.staging.` | `ws.staging.orders` |
+
+**Metadata isolation:** Exchange/queue/binding records in `__ws_routing_metadata` are keyed
+by vhost: `exchange:/production:orders`, `queue:/staging:inbox`. The in-memory routing cache
+maintains separate `RoutingEngine` instances per vhost.
+
+**REST API:** Vhost is specified via the `X-Vhost` header on REST requests (default `/`):
+
+```
+PUT /v1/exchanges/events
+X-Vhost: /production
+```
+
+### 11.7 Disconnect Behavior — Unacked Message Requeue
+
+When a WebSocket connection closes (client disconnect, network failure, or broker shutdown),
+all unacknowledged messages across all subscriptions on that connection are **requeued**:
+
+1. For each active subscription on the connection:
+   a. Consumer fetch loop is stopped
+   b. All pending delivery tags are resolved to `(topicPartition, offset)` pairs
+   c. Offsets are **not committed** — the consumer group retains the last committed offset
+   d. On the next rebalance, another consumer in the group picks up from the last committed
+      offset, redelivering all unacked messages with `redelivered: true`
+
+2. If the subscription was exclusive (`exclusive: true`):
+   a. The queue is deleted (along with its backing Kafka topic)
+   b. Unacked messages are lost (the queue no longer exists)
+
+This ensures **at-least-once delivery semantics**: messages are never silently lost on
+disconnect. They are redelivered to surviving consumers.
+
 ---
 
 ## 12. Message Lifecycle
@@ -2062,10 +2775,14 @@ See §11.1 and §11.2 for the complete mapping.
 | `message.replyTo` | `headers["_ws_reply_to"]` |
 | `message.messageId` | `headers["_ws_message_id"]` |
 | `message.timestamp` | `record.timestamp` (if present) |
+| `message.contentEncoding` | `headers["_ws_content_encoding"]` |
+| `message.priority` | `headers["_ws_priority"]` |
+| `message.type` | `headers["_ws_type"]` |
+| `message.userId` | `headers["_ws_user_id"]` |
 | `message.appId` | `headers["_ws_app_id"]` |
 | `message.expiration` | `headers["_ws_expiration"]` |
 | delivery count | `headers["_ws_delivery_count"]` |
-| priority | `headers["_ws_priority"]` |
+| vhost | `headers["_ws_vhost"]` |
 
 All routing/message metadata is stored as Kafka record headers, enabling lossless
 round-trip for WebSocket-to-WebSocket flows and cross-protocol consumption.
@@ -3517,5 +4234,5 @@ class WsQueueLifecycleIntegrationTest extends HttpIntegrationTestHarness {
 
 ---
 
-*Document version: 0.3 — 2026-04-16*
+*Document version: 0.5 — 2026-04-16*
 *Branch: feature/http-protocol*
