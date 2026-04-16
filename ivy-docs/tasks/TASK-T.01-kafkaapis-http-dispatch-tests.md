@@ -691,7 +691,10 @@ All 8 tests should pass. These are pure unit tests with mocked dependencies -- n
 
 ## Learning
 
-(empty)
+1. ProduceRequest v13 (KIP-516) replaces topic names with topic IDs. Tests must use v11/v12 (name-based) when relying on topic names, or set topicId explicitly at v13.
+2. The normal `handleProduceRequest` calls `replicaManager.handleProduceAppend()`, while the HTTP `handleHttpProduceRequest` calls `replicaManager.appendRecords()` directly. Test 3 (PLAINTEXT regression) must verify the correct method.
+3. `MetadataDelta` must be constructed via `new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build()` (Builder pattern), and `MetadataProvenance.EMPTY` should be used for test metadata images.
+4. Scala compiler treats unused default arguments as errors (-Xfatal-warnings). Tests should use the default at least once or remove it.
 
 ## Limitations
 
@@ -699,20 +702,22 @@ All 8 tests should pass. These are pure unit tests with mocked dependencies -- n
 
 ## Field Notes
 
-(empty)
+- Skeleton code required fixes: FetchRequest.parse/toStruct replaced with FetchRequest.Builder; Compression.NONE (not CompressionType.NONE); MetadataDelta.Builder; MetadataProvenance needs 4th boolean param (isOffsetBatchAligned) or use EMPTY; ProduceResponse.data.responses is an ImplicitLinkedHashCollection requiring .asScala.head (not .get(0)).
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] `KafkaApisHttpTest.scala` is created at `core/src/test/scala/unit/kafka/server/KafkaApisHttpTest.scala`
-- [ ] All 8 tests compile with `./gradlew :core:compileTestScala`
-- [ ] All 8 tests pass with `./gradlew :core:test --tests 'kafka.server.KafkaApisHttpTest*'`
-- [ ] No modifications to `KafkaApisTest.scala`
-- [ ] Tests cover: HTTP dispatch branching, auth failure, local append, leader-not-available, maxWait clamping, local fetch
+- [x] `KafkaApisHttpTest.scala` is created at `core/src/test/scala/unit/kafka/server/KafkaApisHttpTest.scala`
+- [x] All 8 tests compile with `./gradlew :core:compileTestScala`
+- [x] All 8 tests pass with `./gradlew :core:test --tests 'kafka.server.KafkaApisHttpTest*'`
+- [x] No modifications to `KafkaApisTest.scala`
+- [x] Tests cover: HTTP dispatch branching, auth failure, local append, leader-not-available, maxWait clamping, local fetch
 
 ---
 
 ## File Manifest
 
-(empty -- to be filled after implementation)
+| File | Status | Description |
+|------|--------|-------------|
+| `core/src/test/scala/unit/kafka/server/KafkaApisHttpTest.scala` | New | 8 unit tests for HTTP dispatch paths |
