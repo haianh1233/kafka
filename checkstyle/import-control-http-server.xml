@@ -28,6 +28,7 @@
   <allow pkg="org.opentest4j" />
   <allow pkg="org.mockito" />
   <allow pkg="java.security" />
+  <allow pkg="javax.net.ssl" />
 
   <!-- Netty dependencies -->
   <allow pkg="io.netty" />

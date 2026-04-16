@@ -130,9 +130,17 @@ public final class HttpRequestTranslator {
             this.serializedRequest = serializedRequest;
         }
 
-        public ApiKeys apiKey() { return apiKey; }
-        public short apiVersion() { return apiVersion; }
-        public ByteBuffer serializedRequest() { return serializedRequest; }
+        public ApiKeys apiKey() {
+            return apiKey;
+        }
+
+        public short apiVersion() {
+            return apiVersion;
+        }
+
+        public ByteBuffer serializedRequest() {
+            return serializedRequest;
+        }
     }
 
     /**
@@ -622,8 +630,13 @@ public final class HttpRequestTranslator {
             this.builder = builder;
         }
 
-        public ApiKeys apiKey() { return apiKey; }
-        public OffsetCommitRequest.Builder builder() { return builder; }
+        public ApiKeys apiKey() {
+            return apiKey;
+        }
+
+        public OffsetCommitRequest.Builder builder() {
+            return builder;
+        }
     }
 
     /**
@@ -638,8 +651,13 @@ public final class HttpRequestTranslator {
             this.builder = builder;
         }
 
-        public ApiKeys apiKey() { return apiKey; }
-        public OffsetFetchRequest.Builder builder() { return builder; }
+        public ApiKeys apiKey() {
+            return apiKey;
+        }
+
+        public OffsetFetchRequest.Builder builder() {
+            return builder;
+        }
     }
 
     /**

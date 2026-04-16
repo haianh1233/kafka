@@ -85,11 +85,25 @@ public final class HttpRouter {
             this.queryParams = queryParams;
         }
 
-        public HandlerType handlerType() { return handlerType; }
-        public String topicName() { return topicName; }
-        public Integer partition() { return partition; }
-        public String consumerGroup() { return consumerGroup; }
-        public Map<String, String> queryParams() { return queryParams; }
+        public HandlerType handlerType() {
+            return handlerType;
+        }
+
+        public String topicName() {
+            return topicName;
+        }
+
+        public Integer partition() {
+            return partition;
+        }
+
+        public String consumerGroup() {
+            return consumerGroup;
+        }
+
+        public Map<String, String> queryParams() {
+            return queryParams;
+        }
     }
 
     // --- URI patterns (precompiled) ---
