@@ -1273,6 +1273,14 @@ class KafkaApis(val requestChannel: RequestChannel,
     val versionId = request.header.apiVersion
     val clientId = request.header.clientId
     val fetchRequest = request.body[FetchRequest]
+
+    // For HTTP requests, stash the effective maxWaitMs for the X-Kafka-MaxWait-Applied header.
+    // The translator already clamped maxWaitMs, but we clamp again as defense-in-depth.
+    if (request.context.listenerName.value.equalsIgnoreCase("http")) {
+      val effectiveMaxWaitMs: Int = Math.min(fetchRequest.maxWait, config.httpConsumeMaxWaitMs)
+      request.requestLocalProperties.put("httpMaxWaitApplied", effectiveMaxWaitMs.asInstanceOf[AnyRef])
+    }
+
     val topicNames =
       if (fetchRequest.version() >= 13)
         metadataCache.topicIdsToNames()

@@ -38,9 +38,9 @@ import org.apache.kafka.common.message.ProduceResponseData;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.internal.BaseRecords;
-import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.Record;
 import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.record.internal.Records;
 import org.apache.kafka.common.requests.AbstractResponse;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.requests.ListOffsetsResponse;
@@ -283,9 +283,11 @@ public final class HttpResponseSerializer {
 
                 ArrayNode recordsArray = partitionNode.putArray("records");
                 BaseRecords baseRecords = partitionData.records();
-                if (baseRecords instanceof MemoryRecords) {
-                    MemoryRecords memoryRecords = (MemoryRecords) baseRecords;
-                    for (RecordBatch batch : memoryRecords.batches()) {
+                // Handle both MemoryRecords and FileRecords (and any other Records impl)
+                // via the common Records interface which provides batches().
+                if (baseRecords instanceof Records) {
+                    Records records = (Records) baseRecords;
+                    for (RecordBatch batch : records.batches()) {
                         for (Record record : batch) {
                             ObjectNode recordNode = recordsArray.addObject();
                             recordNode.put("offset", record.offset());
