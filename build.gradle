@@ -1076,6 +1076,40 @@ project(':server') {
   }
 }
 
+project(':http-server') {
+  apply plugin: 'scala'
+
+  base {
+    archivesName = "kafka-http-server"
+  }
+
+  dependencies {
+    implementation project(':clients')
+    implementation libs.nettyHandler
+    implementation libs.nettyCodecHttp
+    implementation libs.nettyCodecHttp2
+    implementation libs.nettyTransport
+    implementation libs.nettyBuffer
+    implementation libs.nettyCommon
+    implementation libs.slf4jApi
+    implementation libs.scalaLibrary
+
+    testImplementation libs.junitJupiter
+    testImplementation libs.mockitoCore
+    testImplementation testLog4j2Libs
+
+    testRuntimeOnly runtimeTestLibs
+  }
+
+  checkstyle {
+    configProperties = checkstyleConfigProperties("import-control-http-server.xml")
+  }
+
+  javadoc {
+    enabled = false
+  }
+}
+
 project(':core') {
   apply plugin: 'scala'
 

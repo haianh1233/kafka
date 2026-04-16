@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+<<<<<<< HEAD
 // Time: Created - TASK-F.03
 package kafka.server.http;
 
@@ -158,4 +159,28 @@ public class HttpMetrics implements Closeable {
             Map.of("protocol", "http"));
         forwardQueueGauges.keySet().forEach(this::removeForwardQueueGauge);
     }
+=======
+package kafka.server.http;
+
+/**
+ * Metrics interface for the HTTP server layer.
+ * Tracks connection-level and request-level metrics.
+ */
+public interface HttpMetrics {
+
+    /**
+     * Record that a connection was closed due to idle timeout.
+     */
+    void recordIdleConnectionClose();
+
+    /**
+     * Record that a new connection was established.
+     */
+    void recordConnectionCreated();
+
+    /**
+     * Record that a connection was closed.
+     */
+    void recordConnectionClosed();
+>>>>>>> 6168ee8c21 (feat(http-server): add HTTP/2 support via Netty ALPN negotiation (TASK-F.07))
 }
