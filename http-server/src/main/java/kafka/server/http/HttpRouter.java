@@ -63,14 +63,34 @@ public final class HttpRouter {
         OPENAPI_SPEC
     }
 
-    // --- Route result record ---
-    public record RouteResult(
-        HandlerType handlerType,
-        String topicName,
-        Integer partition,
-        String consumerGroup,
-        Map<String, String> queryParams
-    ) { }
+    // --- Route result ---
+    public static final class RouteResult {
+        private final HandlerType handlerType;
+        private final String topicName;
+        private final Integer partition;
+        private final String consumerGroup;
+        private final Map<String, String> queryParams;
+
+        public RouteResult(
+            HandlerType handlerType,
+            String topicName,
+            Integer partition,
+            String consumerGroup,
+            Map<String, String> queryParams
+        ) {
+            this.handlerType = handlerType;
+            this.topicName = topicName;
+            this.partition = partition;
+            this.consumerGroup = consumerGroup;
+            this.queryParams = queryParams;
+        }
+
+        public HandlerType handlerType() { return handlerType; }
+        public String topicName() { return topicName; }
+        public Integer partition() { return partition; }
+        public String consumerGroup() { return consumerGroup; }
+        public Map<String, String> queryParams() { return queryParams; }
+    }
 
     // --- URI patterns (precompiled) ---
     // Order matters: more specific patterns must be tried before less specific ones.

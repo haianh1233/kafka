@@ -119,11 +119,21 @@ public final class HttpRequestTranslator {
     /**
      * Result of translating an HTTP request to a Kafka wire-format request.
      */
-    public record TranslationResult(
-        ApiKeys apiKey,
-        short apiVersion,
-        ByteBuffer serializedRequest
-    ) { }
+    public static final class TranslationResult {
+        private final ApiKeys apiKey;
+        private final short apiVersion;
+        private final ByteBuffer serializedRequest;
+
+        public TranslationResult(ApiKeys apiKey, short apiVersion, ByteBuffer serializedRequest) {
+            this.apiKey = apiKey;
+            this.apiVersion = apiVersion;
+            this.serializedRequest = serializedRequest;
+        }
+
+        public ApiKeys apiKey() { return apiKey; }
+        public short apiVersion() { return apiVersion; }
+        public ByteBuffer serializedRequest() { return serializedRequest; }
+    }
 
     /**
      * Translates an HTTP request body + route result into a Kafka wire-format request.
@@ -603,18 +613,34 @@ public final class HttpRequestTranslator {
     /**
      * Result of translating an offset commit HTTP request.
      */
-    public record OffsetCommitTranslationResult(
-        ApiKeys apiKey,
-        OffsetCommitRequest.Builder builder
-    ) { }
+    public static final class OffsetCommitTranslationResult {
+        private final ApiKeys apiKey;
+        private final OffsetCommitRequest.Builder builder;
+
+        public OffsetCommitTranslationResult(ApiKeys apiKey, OffsetCommitRequest.Builder builder) {
+            this.apiKey = apiKey;
+            this.builder = builder;
+        }
+
+        public ApiKeys apiKey() { return apiKey; }
+        public OffsetCommitRequest.Builder builder() { return builder; }
+    }
 
     /**
      * Result of translating an offset fetch HTTP request.
      */
-    public record OffsetFetchTranslationResult(
-        ApiKeys apiKey,
-        OffsetFetchRequest.Builder builder
-    ) { }
+    public static final class OffsetFetchTranslationResult {
+        private final ApiKeys apiKey;
+        private final OffsetFetchRequest.Builder builder;
+
+        public OffsetFetchTranslationResult(ApiKeys apiKey, OffsetFetchRequest.Builder builder) {
+            this.apiKey = apiKey;
+            this.builder = builder;
+        }
+
+        public ApiKeys apiKey() { return apiKey; }
+        public OffsetFetchRequest.Builder builder() { return builder; }
+    }
 
     /**
      * Translate JSON body into an OffsetCommitRequest builder.

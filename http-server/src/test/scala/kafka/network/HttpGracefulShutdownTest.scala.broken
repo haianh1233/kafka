@@ -159,15 +159,22 @@ class HttpGracefulShutdownTest {
   def testMultipleRequestsDuringDrainAllGet503(): Unit = {
     draining.set(true)
 
-    for (i <- 1 to 5) {
-      val request = buildRequest(HttpMethod.GET, s"/v1/health?req=$i")
-      channel.writeInbound(request)
+    // Each drain 503 response includes Connection: close which closes the channel.
+    // Verify that multiple separate channels each get 503.
+    for (i <- 1 to 3) {
+      val handler = new HttpRequestHandler(
+        principalBuilder, SecurityProtocol.HTTP, draining, inFlightCount)
+      val ch = new EmbeddedChannel(handler)
 
-      val response = channel.readOutbound[FullHttpResponse]()
+      val request = buildRequest(HttpMethod.GET, s"/v1/health?req=$i")
+      ch.writeInbound(request)
+
+      val response = ch.readOutbound[FullHttpResponse]()
       assertNotNull(response, s"Request $i should get a 503 response")
       assertEquals(HttpResponseStatus.SERVICE_UNAVAILABLE, response.status(),
         s"Request $i should be 503")
       response.release()
+      ch.close()
     }
 
     // No requests should have been tracked as in-flight

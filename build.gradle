@@ -981,10 +981,14 @@ project(':http-server') {
     implementation libs.nettyAll
 
     testImplementation project(':clients').sourceSets.test.output
+    testImplementation project(':core').sourceSets.test.output
     testImplementation libs.junitJupiter
     testImplementation libs.mockitoCore
     testImplementation libs.bcpkix
     testImplementation libs.nettyAll
+    testImplementation libs.jettyClient
+    testImplementation libs.jacksonDatabind
+    testImplementation libs.jacksonDataformatYaml
     testImplementation testLog4j2Libs
 
     testRuntimeOnly runtimeTestLibs
