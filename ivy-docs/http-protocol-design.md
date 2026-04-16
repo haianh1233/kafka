@@ -18,6 +18,7 @@
 11. [Error Handling](#11-error-handling)
 12. [Security](#12-security)
 13. [Implementation Plan](#13-implementation-plan)
+14. [Implementation Concerns](#14-implementation-concerns)
 
 ---
 
@@ -1374,7 +1375,7 @@ New properties added to `KafkaConfig`:
 |---|---|---|
 | `http.enabled` | `false` | Master switch (can also just add `HTTP://...` to `listeners`) |
 | `num.http.network.threads` | `4` | Netty worker thread count for HTTP listener |
-| `http.request.max.bytes` | `67108864` (64 MB) | Max aggregated HTTP request body size |
+| `http.request.max.bytes` | `10485760` (10 MB) | Max aggregated HTTP request body size. Capped low to prevent Netty worker HOL blocking (§14.5); raise to 64 MB only if large batches are needed. |
 | `http.produce.max.records` | `10000` | Max records per produce request; excess rejected with 413 before deserialization |
 | `http.response.timeout.ms` | `30000` | Max time before broker returns a 504 to HTTP client |
 | `http.consume.max.wait.ms` | `5000` | Server-side cap on `maxWaitMs` in consume requests. Any client value above this is silently clamped. Keeps HTTP connections short enough to survive load-balancer idle timeouts. Echoed back in `X-Kafka-MaxWait-Applied` response header. |
@@ -1516,7 +1517,237 @@ HTTP status 429 with `Retry-After: 1` header.
 24. HTTP/2 upgrade via Netty `ApplicationProtocolNegotiationHandler` (ALPN)
 25. Performance benchmarking (produce/consume throughput and latency under load)
 
+## 14. Implementation Concerns
+
+These are issues that must be resolved before merging, grouped by severity.
+
 ---
 
-*Document version: 0.4 — 2026-04-16*
+### 14.1 CRITICAL — Handler thread must never block on futures
+
+`KafkaRequestHandler.run()` is a tight loop: it dequeues a request, calls
+`KafkaApis.handle()`, and immediately loops back. It is **not** async-aware.
+If `handleHttpProduceRequest` or `handleHttpConsumeRequest` calls
+`CompletableFuture.allOf(...).join()` or any blocking wait, **it holds the handler
+thread for the entire forwarding RTT** (up to `http.internal.forwarding.timeout.ms`).
+With `num.io.threads = 8` handler threads and 8 concurrent slow remote brokers, the
+entire broker becomes unresponsive to all protocols.
+
+**Required pattern:** the handler thread chains callbacks and returns immediately.
+All completion work runs on a **dedicated async executor**, never on the handler thread
+or the `InterBrokerSendThread` poll loop:
+
+```java
+// In KafkaApis.handleHttpProduceRequest():
+CompletableFuture<Void> localFuture  = submitLocalAppend(...);
+CompletableFuture<Void> remoteFuture = produceForwardManager.forward(...);
+
+// CORRECT — handler thread returns here; callback runs on httpAsyncExecutor
+CompletableFuture.allOf(localFuture, remoteFuture)
+    .orTimeout(effectiveTimeoutMs, MILLISECONDS)
+    .handleAsync((ignored, err) -> {
+        AbstractResponse response = mergeResults(localFuture, remoteFuture, err);
+        requestChannel.sendResponse(request, response);
+        return null;
+    }, httpAsyncExecutor);   // ← explicit executor, never omit this
+```
+
+`httpAsyncExecutor` is a fixed-size thread pool (e.g., `num.http.async.threads`, default = 4)
+owned by `HttpAcceptor`, separate from both the Netty worker threads and the
+`KafkaRequestHandler` pool.
+
+The same rule applies to `ProduceForwardThread.generateRequests()` callback:
+`future.complete()` runs on the `InterBrokerSendThread` poll loop. Any `.thenApply()` /
+`.handle()` chained without an executor would also run on the poll loop, stalling it.
+Always pass `httpAsyncExecutor` as the executor argument.
+
+---
+
+### 14.2 CRITICAL — `pendingRequests` map must be processor-scoped and bounded
+
+The design stashes `ChannelHandlerContext` in `pendingRequests` keyed by `correlationId`
+(an `Int`). Two bugs:
+
+**Bug A — CorrelationId collision across processors.**
+HTTP and binary-protocol processors share `RequestChannel`. Both generate `correlationId`
+from independent counters and could produce the same value simultaneously. The response
+path routes by `response.processor` first, so the response itself goes to the right
+processor — but if `pendingRequests` is a flat map keyed only by `correlationId`, a
+collision causes a response to be written to the wrong Netty channel.
+
+**Fix:** key the map by `(processorId, correlationId)` or use a per-`HttpRequestHandler`
+map (not shared across processors):
+
+```scala
+// Map lives inside a single HttpRequestHandler instance (one per connection or per processor)
+private val pendingRequests = new ConcurrentHashMap[Int, ChannelHandlerContext]()
+// correlationId only needs to be unique within one handler's lifetime
+```
+
+**Bug B — Channel close leaks map entries.**
+If the HTTP client disconnects before the response arrives, the `ChannelHandlerContext`
+entry stays in the map forever (memory leak) and the eventual response write throws on a
+closed channel.
+
+**Fix:** register a channel-close listener at request creation time:
+
+```scala
+ctx.channel().closeFuture().addListener { _ =>
+    pendingRequests.remove(kafkaRequest.context.correlationId)
+}
+```
+
+Also wrap the response write in a closed-channel guard:
+```scala
+if (ctx.channel().isActive) ctx.writeAndFlush(httpResponse)
+```
+
+---
+
+### 14.3 HIGH — RequestChannel backpressure
+
+`RequestChannel` uses an `ArrayBlockingQueue(queueSize)` (default capacity 500).
+`sendRequest()` calls `put()` — a **blocking put**. If the queue is full, the Netty worker
+thread that called `sendRequest()` blocks inside Kafka code. While blocked, that worker
+cannot read more frames or write responses, stalling all connections multiplexed on it.
+
+**Required:** check queue capacity before blocking the Netty thread. Reject early if the
+queue is saturated rather than blocking:
+
+```scala
+// In HttpRequestHandler.channelRead0():
+if (!requestChannel.tryEnqueue(kafkaRequest, waitMs = 0)) {
+    // Queue full — respond immediately with 503
+    sendErrorResponse(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE,
+        "Broker request queue full, retry later")
+    return
+}
+```
+
+Add `tryEnqueue()` to `RequestChannel` using `offer()` (non-blocking) instead of `put()`.
+
+---
+
+### 14.4 HIGH — Input validation requirements
+
+The following must be enforced in `HttpRequestTranslator` / `HttpRouter` before any
+Kafka code is called:
+
+| Input | Validation rule |
+|---|---|
+| `X-Kafka-Client-ID` header | Whitelist `[a-zA-Z0-9._-]{1,128}`; default `"http-client"` if absent; reject otherwise with 400 |
+| Topic name (URL path segment) | URL-decode first; reject null bytes, `..`, `/`; then enforce `[a-zA-Z0-9._-]{1,249}` before passing to Kafka's own `Topic.validate()` |
+| `maxWaitMs` | Must be `>= 0`; reject negative values with 422 before applying the cap |
+| `partition` | Already in §5.5A; confirm < 0 is rejected with 422 |
+| JSON `data` field nesting | Configure Jackson `StreamReadConstraints`: `maxNestingDepth(20)`, `maxStringLength(1_000_000)`, `maxNumberLength(100)` to prevent deserialization bombs |
+
+---
+
+### 14.5 HIGH — `HttpObjectAggregator` size and Netty HOL blocking
+
+A 64 MB `HttpObjectAggregator` limit means one slow client uploading a large batch ties
+up a Netty worker thread (reading and buffering) while all other connections sharing
+that worker are starved for reads and writes.
+
+Reduce the aggregator to **10 MB** (match `http.request.max.bytes` default to this new
+value, configurable up to 64 MB). For produce workloads this is ample — 10,000 records
+of 1 KB each = 10 MB. Clients that need larger batches should split into multiple requests.
+
+Update the default in §10:
+
+| Property | Old default | New default |
+|---|---|---|
+| `http.request.max.bytes` | 67108864 (64 MB) | 10485760 (10 MB) |
+
+---
+
+### 14.6 MEDIUM — Unbounded `ProduceForwardThread` queue
+
+`ProduceForwardThread.pendingQueue` is a `LinkedBlockingQueue<>()` with no capacity.
+If a remote leader broker is slow (GC pause, I/O saturation), the queue for that broker
+grows without bound as handler threads keep calling `thread.enqueue()`.
+
+**Fix:** use a bounded queue and reject on full:
+
+```java
+private final BlockingQueue<PendingProduce> pendingQueue =
+    new LinkedBlockingQueue<>(MAX_PENDING_PER_BROKER);  // e.g. 10_000
+
+// In enqueue():
+if (!pendingQueue.offer(pending)) {
+    pending.future.completeExceptionally(
+        new KafkaException("Forward queue full for broker " + destination().id()));
+}
+```
+
+The `KafkaRequestHandler` then maps that exceptional future to HTTP 503.
+
+---
+
+### 14.7 MEDIUM — `HttpResponseSerializer` value type detection
+
+When deserializing consumed records, the serializer must decide the `DataObject.type`.
+The algorithm must be explicit to avoid inconsistent client experience:
+
+```
+1. If record has header "_content-type: application/json" → type = JSON, parse value as JSON
+2. Else attempt UTF-8 decode:
+     a. If decode succeeds AND all code points are printable (no C0/C1 control chars
+        except \t \n \r) → type = STRING
+     b. Otherwise → type = BINARY, base64-encode raw bytes
+3. If value bytes are null → type = NULL
+```
+
+Clients SHOULD set a `_content-type` header when producing to eliminate ambiguity on the
+consume side.
+
+---
+
+### 14.8 MEDIUM — Graceful shutdown wiring
+
+`HttpAcceptor.close()` must be integrated into the broker shutdown sequence and include
+a drain period. Without this, in-flight HTTP requests lose their responses silently.
+
+```scala
+override def close(): Unit = {
+  // 1. Stop accepting new connections
+  channel.close().sync()
+
+  // 2. Drain: wait for in-flight HTTP requests (bounded by 2× response timeout)
+  val deadline = System.currentTimeMillis() + 2 * config.httpResponseTimeoutMs
+  while (pendingRequests.nonEmpty && System.currentTimeMillis() < deadline)
+    Thread.sleep(50)
+
+  // 3. Shut down forwarding threads
+  produceForwardManager.close()
+  fetchForwardManager.close()
+
+  // 4. Shut down Netty
+  workerGroup.shutdownGracefully(500, 2000, MILLISECONDS).sync()
+  bossGroup.shutdownGracefully(100, 500,  MILLISECONDS).sync()
+}
+```
+
+`SocketServer.shutdown()` must call `httpAcceptors.values.foreach(_.close())` **before**
+shutting down `RequestChannel` so in-flight requests can still send responses.
+
+---
+
+### 14.9 LOW — Metric tagging
+
+HTTP requests flowing through `KafkaRequestHandler` will be counted by the existing
+per-ApiKey request metrics (e.g. `produce-request-rate`), conflating HTTP and binary
+produces in the same counter.
+
+Add a `protocol` tag to distinguish sources:
+- Binary: `protocol=binary`
+- HTTP: `protocol=http`
+
+The separate `http.produce.request.rate` metrics in §13 are additive — they give
+HTTP-only visibility. The combined `produce-request-rate` (binary + HTTP) remains
+unchanged for backwards-compatible dashboards.
+
+---
+
+*Document version: 0.5 — 2026-04-16*
 *Branch: feature/http-protocol*
