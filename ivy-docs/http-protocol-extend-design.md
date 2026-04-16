@@ -603,6 +603,7 @@ correlation. If omitted, the response has no `id`.
 | `bound` / `unbound` | Binding response | |
 | `subscribed` / `unsubscribed` | Subscription response | |
 | `subscription-cancelled` | Server-initiated cancel | Queue deleted, exclusive eviction, etc. |
+| `rebalance` | Partition reassignment notification | Includes assigned/revoked partition lists |
 | `get-ok` | Pull message response (has message) | |
 | `get-empty` | Pull message response (no message) | |
 | `queue-purged` | Purge response | Includes purged message count |
@@ -719,6 +720,11 @@ Response:
 **Passive declare:** When `passive: true`, the broker checks if the queue exists and
 returns `queue-declared` with `messageCount` and `consumerCount` if it does, or an error
 with `QUEUE_NOT_FOUND` if it does not. No queue is created.
+
+**Server-generated queue names:** When `queue: ""`, the broker generates `q.gen-<UUID>`.
+Server-generated queues respect the client's explicit `exclusive` and `autoDelete` flags —
+they are NOT automatically exclusive. However, the common pattern is
+`{"queue":"","exclusive":true,"autoDelete":true}` for temporary reply queues.
 
 **Queue arguments:**
 
@@ -908,6 +914,25 @@ or on failure:
 }
 ```
 
+**Publish edge case rules:**
+- **Non-existent exchange:** If `mandatory: true`, the message is returned via `returned`
+  frame. If `mandatory: false`, the message is **silently dropped** (not an error). This
+  follows AMQP semantics — publishing to a missing exchange is not a protocol error.
+- **Internal exchange:** If the target exchange has `internal: true`, the publish is rejected
+  with an `error` frame (`ACCESS_REFUSED`). Internal exchanges only receive messages via
+  exchange-to-exchange bindings.
+- **`publishId` without confirms enabled:** The `publishId` field is silently ignored. No
+  `published` or `publish-failed` response is sent.
+- **Empty body:** `message.body` of `null`, empty string `""`, or empty object `{}` is valid.
+  The message is published with zero-length or minimal body.
+- **Default exchange, routing key matches no queue:** If `mandatory: true`, returned. If
+  `mandatory: false`, silently dropped. Not an error.
+- **Multi-queue fanout partial failure:** If routing resolves to multiple queues and one
+  queue's produce fails while others succeed, the entire publish is treated as failed.
+  `publish-failed` is returned (if confirms enabled). Successfully-produced records remain
+  in those topics (the client should republish the entire message on retry, accepting
+  potential duplicates on the succeeded queues — at-least-once semantics).
+
 ---
 
 ### 4.8 Subscribe / Unsubscribe
@@ -952,6 +977,27 @@ After `subscribed`, the broker begins pushing `deliver` messages (§4.3).
 **Multiple subscriptions:** A single WebSocket connection can have multiple active
 subscriptions to different queues. Each subscription has its own `subscriptionId`,
 credit counter, and delivery tag sequence.
+
+**Multiple subscriptions to the same queue:** Allowed. Two subscriptions from the same
+connection to the same queue creates two members in the consumer group. Kafka
+`GroupCoordinator` assigns partitions across them. This is useful for parallel processing
+within a single connection.
+
+**Consumer rebalance notification:** When Kafka reassigns partitions (e.g., another consumer
+joins/leaves the group), the broker sends a notification to affected subscribers:
+
+```json
+{
+  "type": "rebalance",
+  "subscriptionId": "sub-1",
+  "assignedPartitions": [0, 1, 3],
+  "revokedPartitions": [2]
+}
+```
+
+When partitions are revoked, all pending delivery tags for records from those partitions are
+**invalidated**. ACKs for invalidated tags are silently ignored. The fetch loop resumes with
+the new partition assignment.
 
 #### 4.8.2 Unsubscribe
 
@@ -1090,6 +1136,18 @@ messages as consumed.
 **Effect:** Commits offsets to `__consumer_offsets` for the ACK'd messages. Releases
 delivery credits (allowing more messages to be pushed).
 
+**Edge case rules:**
+- **Unknown `deliveryTag`:** Returns an `error` frame with `PRECONDITION_FAILED`. The tag
+  may have been invalidated by a rebalance or unsubscribe. The connection remains open (unlike
+  AMQP which closes the connection — the WS design is intentionally more lenient).
+- **Double-ack (tag already acked):** Silently ignored (idempotent). No error. This differs
+  from AMQP (which treats double-ack as a connection error) but is safer for WebSocket clients
+  that may retry on timeout.
+- **ACK after unsubscribe:** Silently ignored. The subscription's delivery tag tracker has
+  been cleared; the ack has no effect.
+- **`multiple: true` with some tags already acked:** Already-acked tags are skipped. Only
+  remaining unacked tags with `tag <= deliveryTag` are committed.
+
 #### 4.9.2 NACK
 
 ```json
@@ -1110,7 +1168,10 @@ delivery credits (allowing more messages to be pushed).
 iteration (delivery may go to a different consumer in competing-consumer setups).
 
 **`requeue: false`** — if queue has `x-dead-letter-exchange`, republish to DLX. Otherwise,
-commit offset (message lost). See §18.6.
+commit offset (message lost). See §12.3.
+
+**Edge case rules for NACK:** Same as ACK — unknown tag returns `PRECONDITION_FAILED`,
+double-nack is idempotent, nack after unsubscribe is silently ignored.
 
 ---
 
@@ -1275,7 +1336,11 @@ Response (201 Created or 200 OK if already exists with same type):
 
 #### Delete Exchange — `DELETE /v1/exchanges/{exchange}?ifUnused=false`
 
-Returns 204 No Content. `ifUnused=true` fails if any bindings exist.
+Returns 204 No Content. `ifUnused=true` fails with 409 if any bindings exist.
+
+**Binding cleanup:** When an exchange is deleted (with `ifUnused=false`), all queue bindings
+and exchange-to-exchange bindings referencing this exchange are automatically removed from
+the routing engine and `__ws_routing_metadata`.
 
 ---
 
@@ -1370,6 +1435,15 @@ Response (201 Created or 200 OK):
 
 Returns 204 No Content. `ifUnused=true` fails with 409 if consumers are active.
 `ifEmpty=true` fails with 409 if `messageCount > 0`.
+
+**Binding cleanup:** When a queue is deleted, all bindings referencing this queue are
+automatically removed from all exchanges in the routing engine and `__ws_routing_metadata`.
+Active subscribers receive a `subscription-cancelled` frame (§4.8.3).
+
+**Queue redeclare rules:** Declaring an existing queue is idempotent if the `durable`,
+`exclusive`, and `autoDelete` flags match. If any flag differs, the broker returns
+`PRECONDITION_FAILED` (409). Queue arguments (`x-message-ttl`, etc.) are NOT checked on
+redeclare — use `PATCH /v1/queues/{name}` to update arguments on a live queue.
 
 #### Purge Queue — `DELETE /v1/queues/{queue}/messages`
 
@@ -1815,6 +1889,14 @@ boolean topicMatches(String[] patternWords, String[] routingWords) {
 indexed by the first word. This reduces the per-publish scan from O(N bindings) to
 O(matching-prefix bindings). The trie is rebuilt on binding changes (rare).
 
+**Edge cases:**
+- `"*"` alone matches exactly one word: `"foo"` matches, `"foo.bar"` does not, `""` matches
+  (empty string is one empty word)
+- `"#"` alone matches everything including empty routing key `""`
+- Empty pattern `""` matches only empty routing key `""` (exact match, no wildcards)
+- `"#.foo"` matches `"foo"` and `"bar.foo"` and `"a.b.c.foo"`
+- `"foo.#.bar"` matches `"foo.bar"` and `"foo.x.bar"` and `"foo.x.y.z.bar"`
+
 ### 6.3 Fanout Exchange
 
 **Algorithm:** All bound queues receive the message. Routing key is ignored.
@@ -2046,6 +2128,22 @@ the exchange bindings instead of producing directly to a topic.
 
 The key: the routing layer writes to standard Kafka topics. Any consumer protocol can
 read from those topics.
+
+**Header visibility across protocols:**
+- **Kafka binary consumer** reading from `ws.orders`: sees all `_ws_*` Kafka headers as raw
+  bytes. A utility class `WsHeaderDeserializer` is provided in the `http-server` module to
+  decode these headers into structured objects.
+- **HTTP `POST :fetch`** on `ws.orders`: the existing `HttpResponseSerializer` (§14.7 of base
+  HTTP design) uses the `_content-type` header for value type detection. Other `_ws_*` headers
+  are included in the `headers` array of the fetch response JSON.
+- **Direct HTTP `POST /v1/topics/ws.orders/records`**: produces directly to the Kafka topic
+  **bypassing exchange routing**. This is intentional — the HTTP API operates on topics, the
+  WS API operates on exchanges/queues. To publish through exchange routing via REST, use
+  `POST /v1/exchanges/{exchange}/publish` (§5.8).
+
+**Binding query filters:** `GET /v1/bindings` supports combined query parameters:
+`GET /v1/bindings?exchange=events&queue=order-events` returns only bindings matching both
+exchange AND queue. Each parameter narrows the result set.
 
 ---
 
@@ -2488,7 +2586,11 @@ all unacknowledged messages across all subscriptions on that connection are **re
    d. On the next rebalance, another consumer in the group picks up from the last committed
       offset, redelivering all unacked messages with `redelivered: true`
 
-2. If the subscription was exclusive (`exclusive: true`):
+2. For pending `get`-mode delivery tags (from `Basic.Get` / pull messages):
+   a. Same behavior: offsets not committed, messages redelivered on next `get`
+   b. The per-connection `getOffsets` map is discarded
+
+3. If the subscription was exclusive (`exclusive: true`):
    a. The queue is deleted (along with its backing Kafka topic)
    b. Unacked messages are lost (the queue no longer exists)
 
@@ -3080,6 +3182,8 @@ New properties (in addition to existing HTTP config from `http-protocol-design.m
 | `ws.dedup.enabled` | `false` | Enable publish deduplication by messageId (§12.7) |
 | `ws.dedup.cache.size` | `10000` | Max entries in dedup cache per exchange |
 | `ws.dedup.cache.ttl.ms` | `60000` | Dedup cache entry TTL |
+| `ws.max.connections.per.broker` | `10000` | Max concurrent WS connections per broker. Excess rejected with close code 4429. |
+| `ws.metadata.startup.timeout.ms` | `30000` | Max time to wait for `__ws_routing_metadata` replay before starting. If timeout expires, broker starts with default exchanges only and logs a warning. |
 
 No new listener configuration needed — WebSocket runs on the same HTTP listener port.
 
@@ -4234,5 +4338,5 @@ class WsQueueLifecycleIntegrationTest extends HttpIntegrationTestHarness {
 
 ---
 
-*Document version: 0.5 — 2026-04-16*
+*Document version: 0.6 — 2026-04-16*
 *Branch: feature/http-protocol*
