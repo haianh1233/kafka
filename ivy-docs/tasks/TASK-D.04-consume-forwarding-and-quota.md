@@ -727,43 +727,55 @@ class HttpProcessorThrottleTest {
 
 ## Learning
 
-_To be filled by the executing agent._
+- The `core` module cannot depend on `http-server` (circular dependency: http-server already depends on core). Forward manager types must be abstracted via interfaces in `server-common`.
+- Created `FetchForwarder` and `ProduceForwarder` interfaces in `server-common` so KafkaApis can reference them without a circular module dependency. The concrete `FetchForwardManager` and `ProduceForwardManager` in `http-server` implement these interfaces.
+- `FetchPartitionData` has no static factory for empty instances; must construct manually with `Errors.NONE`, `MemoryRecords.EMPTY`, and empty optionals.
+- `AbstractResponse.throttleTimeMs()` is available on all response types, but for `SendResponse` the throttle time is stashed on `request.apiThrottleTimeMs` since SendResponse wraps a raw `Send` object.
+- The B.04 implementation of `HttpProcessor` already had `StartThrottlingResponse` -> 429 and `EndThrottlingResponse` -> no-op. This task added the `Retry-After` header on the `SendResponse` path for throttled but otherwise successful responses.
 
 ## Limitations
 
-_To be filled by the executing agent._
+- No retry logic for consume forwarding (unlike produce forwarding in D.03 which retries once on NOT_LEADER_OR_FOLLOWER). Consume requests simply return empty records on timeout per section 6.9 -- this is by design since consumers naturally re-poll.
+- The `orTimeout(effectiveMaxWaitMs)` on the combined future is the hard ceiling. This means if a remote broker responds after the timeout, its data is silently discarded and the partition gets empty records.
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- The KafkaApisBuilder.java needed updating: it passes positional `null` for each defaulted parameter (httpAsyncExecutor, fetchForwardManager, produceForwardManager). Java cannot use Scala default parameter values.
+- The `remoteFetchSpecsByLeader` mutable map is thread-confined to the handler thread during bucketing, then read-only within the `handleAsync` callback, so no synchronization is needed.
 
 ## Acceptance Criteria
 
 ### Part 1: Consume forwarding
 
-- [ ] `handleHttpConsumeRequest()` correctly buckets partitions by leader.
-- [ ] Local partitions are fetched via `replicaManager.fetchMessages()`.
-- [ ] Remote partitions are forwarded via `fetchForwardManager.forward(leaderId, ...)`.
-- [ ] `effectiveMaxWaitMs` is passed to both local and remote fetches.
-- [ ] `CompletableFuture.allOf` merges local and remote results.
-- [ ] `.handleAsync(httpAsyncExecutor)` is used for all callbacks.
-- [ ] Timed-out remote partitions return empty records (not error).
-- [ ] Unknown leaders return `LEADER_NOT_AVAILABLE`.
-- [ ] Null `fetchForwardManager` falls back gracefully.
-- [ ] `X-Kafka-MaxWait-Applied` header is set.
+- [x] `handleHttpConsumeRequest()` correctly buckets partitions by leader.
+- [x] Local partitions are fetched via `replicaManager.fetchMessages()`.
+- [x] Remote partitions are forwarded via `fetchForwardManager.forward(leaderId, ...)`.
+- [x] `effectiveMaxWaitMs` is passed to both local and remote fetches.
+- [x] `CompletableFuture.allOf` merges local and remote results.
+- [x] `.handleAsync(httpAsyncExecutor)` is used for all callbacks.
+- [x] Timed-out remote partitions return empty records (not error).
+- [x] Unknown leaders return `LEADER_NOT_AVAILABLE`.
+- [x] Null `fetchForwardManager` falls back gracefully.
+- [x] `X-Kafka-MaxWait-Applied` header is set.
 
 ### Part 2: Quota throttle
 
-- [ ] `StartThrottlingResponse` produces HTTP 429 with `Retry-After` header.
-- [ ] `Retry-After` is `ceil(throttleTimeMs / 1000)`, minimum 1.
-- [ ] `EndThrottlingResponse` is a no-op.
-- [ ] `SendResponse` with `throttleTimeMs > 0` adds `Retry-After` header.
-- [ ] 429 response body contains `errorCode: 89`, `errorMessage`, `throttleTimeMs`.
-- [ ] All unit tests pass.
-- [ ] Existing TASK-C.02 tests still pass.
+- [x] `StartThrottlingResponse` produces HTTP 429 with `Retry-After` header.
+- [x] `Retry-After` is `ceil(throttleTimeMs / 1000)`, minimum 1.
+- [x] `EndThrottlingResponse` is a no-op.
+- [x] `SendResponse` with `throttleTimeMs > 0` adds `Retry-After` header.
+- [x] 429 response body contains `errorCode: 89`, `errorMessage`, `throttleTimeMs`.
+- [x] All unit tests pass.
+- [x] Existing TASK-C.02 tests still pass.
 
 ## File Manifest
 
 | File | Action | Description |
 |------|--------|-------------|
-| | | |
+| `core/src/main/scala/kafka/server/KafkaApis.scala` | Modified | Extended `handleHttpConsumeRequest()` with fan-out to remote brokers via `FetchForwarder`; added `fetchForwardManager` constructor param |
+| `http-server/src/main/java/kafka/server/http/HttpProcessor.java` | Modified | Added `Retry-After` header on `SendResponse` path when `throttleTimeMs > 0` |
+| `server-common/src/main/java/org/apache/kafka/server/network/FetchForwarder.java` | Created | Interface for fetch forwarding, lives in shared module to avoid circular dep |
+| `server-common/src/main/java/org/apache/kafka/server/network/ProduceForwarder.java` | Created | Interface for produce forwarding, lives in shared module to avoid circular dep |
+| `http-server/src/main/java/kafka/server/http/FetchForwardManager.java` | Modified | Implements `FetchForwarder` interface |
+| `http-server/src/main/java/kafka/server/http/ProduceForwardManager.java` | Modified | Implements `ProduceForwarder` interface |
+| `core/src/main/java/kafka/server/builders/KafkaApisBuilder.java` | Modified | Added null args for fetchForwardManager and produceForwardManager |
