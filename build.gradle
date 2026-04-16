@@ -2335,6 +2335,7 @@ project(':http-server') {
   dependencies {
     implementation project(':clients')
     implementation project(':server-common')
+    implementation libs.metrics
     implementation libs.slf4jApi
 
     testImplementation project(':clients').sourceSets.test.output
