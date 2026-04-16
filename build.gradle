@@ -2257,6 +2257,34 @@ project(':server-common') {
   }
 }
 
+project(':http-server') {
+  base {
+    archivesName = "kafka-http-server"
+  }
+
+  dependencies {
+    implementation project(':server-common')
+    implementation project(':clients')
+    implementation libs.metrics
+    implementation libs.slf4jApi
+
+    testImplementation libs.junitJupiter
+    testImplementation libs.mockitoCore
+    testImplementation testLog4j2Libs
+    testImplementation project(':server-common').sourceSets.test.output
+
+    testRuntimeOnly runtimeTestLibs
+  }
+
+  checkstyle {
+    configProperties = checkstyleConfigProperties("import-control-http-server.xml")
+  }
+
+  javadoc {
+    enabled = false
+  }
+}
+
 project(':storage:storage-api') {
   base {
     archivesName = "kafka-storage-api"
