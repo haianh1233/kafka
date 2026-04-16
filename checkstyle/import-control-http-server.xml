@@ -35,6 +35,9 @@
   <!-- Jackson for JSON serialization -->
   <allow pkg="com.fasterxml.jackson" />
 
+  <!-- Metrics -->
+  <allow pkg="com.yammer.metrics" />
+
   <!-- Kafka core (RequestChannel, etc.) -->
   <allow pkg="kafka.network" />
   <allow pkg="kafka.server" />

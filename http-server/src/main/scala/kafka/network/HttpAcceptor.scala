@@ -58,6 +58,18 @@ class HttpAcceptor(
     corsAllowedOrigins: String = ""
 ) extends Closeable with Logging {
 
+  /**
+   * No-arg constructor for use in tests where only accepting/pending state tracking is needed
+   * (e.g., HttpRequestHandler tests that pass a standalone HttpAcceptor).
+   */
+  def this() = this(
+    new Endpoint("HTTP", org.apache.kafka.common.security.auth.SecurityProtocol.HTTP, "localhost", 0),
+    org.apache.kafka.network.HttpServerConfigs.NUM_HTTP_NETWORK_THREADS_DEFAULT,
+    org.apache.kafka.network.HttpServerConfigs.HTTP_REQUEST_MAX_BYTES_DEFAULT,
+    org.apache.kafka.network.HttpServerConfigs.HTTP_CONNECTION_IDLE_TIMEOUT_MS_DEFAULT,
+    Time.SYSTEM
+  )
+
   // --- Netty event loop groups ---
   // Boss group MUST use exactly 1 thread (one server socket)
   private val bossGroup: EventLoopGroup = new NioEventLoopGroup(1)
@@ -171,6 +183,9 @@ class HttpAcceptor(
 
   /** Exposed for HttpRequestHandler to check if new requests should be accepted. */
   def isAccepting: Boolean = accepting.get()
+
+  /** Set the accepting state. Used by tests and the drain logic. */
+  def setAccepting(value: Boolean): Unit = accepting.set(value)
 
   /** Increment pending connection count (called by HttpRequestHandler on request start). */
   def incrementPending(): Unit = pendingConnectionCount.incrementAndGet()

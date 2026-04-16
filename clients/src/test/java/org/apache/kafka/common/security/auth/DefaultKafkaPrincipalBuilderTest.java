@@ -184,11 +184,11 @@ public class DefaultKafkaPrincipalBuilderTest {
     @Test
     public void testBuildFromHttpContextReturnsAnonymous() throws Exception {
         DefaultKafkaPrincipalBuilder builder = new DefaultKafkaPrincipalBuilder(null, null);
-        HttpAuthenticationContext httpCtx = new HttpAuthenticationContext(
-            InetAddress.getByName("127.0.0.1"),
-            "HTTP",
-            SecurityProtocol.HTTP,
-            null, null, null);
+        HttpAuthenticationContext httpCtx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getByName("127.0.0.1"))
+            .listenerName("HTTP")
+            .securityProtocol(SecurityProtocol.HTTP)
+            .build();
         KafkaPrincipal principal = builder.build(httpCtx);
         assertEquals(KafkaPrincipal.ANONYMOUS, principal);
     }
@@ -196,11 +196,12 @@ public class DefaultKafkaPrincipalBuilderTest {
     @Test
     public void testBuildFromHttpsContextWithoutCertsReturnsAnonymous() throws Exception {
         DefaultKafkaPrincipalBuilder builder = new DefaultKafkaPrincipalBuilder(null, null);
-        HttpAuthenticationContext httpsCtx = new HttpAuthenticationContext(
-            InetAddress.getByName("127.0.0.1"),
-            "HTTPS",
-            SecurityProtocol.HTTPS,
-            "some-token", null, null);  // bearer token but no certs
+        HttpAuthenticationContext httpsCtx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getByName("127.0.0.1"))
+            .listenerName("HTTPS")
+            .securityProtocol(SecurityProtocol.HTTPS)
+            .bearerToken("some-token")
+            .build();
         KafkaPrincipal principal = builder.build(httpsCtx);
         assertEquals(KafkaPrincipal.ANONYMOUS, principal);
     }
@@ -215,11 +216,12 @@ public class DefaultKafkaPrincipalBuilderTest {
         DefaultKafkaPrincipalBuilder builder = new DefaultKafkaPrincipalBuilder(
             null, SslPrincipalMapper.fromRules("DEFAULT"));
 
-        HttpAuthenticationContext httpsCtx = new HttpAuthenticationContext(
-            InetAddress.getByName("127.0.0.1"),
-            "HTTPS",
-            SecurityProtocol.HTTPS,
-            null, null, new X509Certificate[]{mockCert});
+        HttpAuthenticationContext httpsCtx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getByName("127.0.0.1"))
+            .listenerName("HTTPS")
+            .securityProtocol(SecurityProtocol.HTTPS)
+            .peerCertificates(new X509Certificate[]{mockCert})
+            .build();
         KafkaPrincipal principal = builder.build(httpsCtx);
         assertEquals(KafkaPrincipal.USER_TYPE, principal.getPrincipalType());
         // With DEFAULT rule the full DN is used
@@ -229,11 +231,12 @@ public class DefaultKafkaPrincipalBuilderTest {
     @Test
     public void testBuildFromHttpsContextWithEmptyCertArrayReturnsAnonymous() throws Exception {
         DefaultKafkaPrincipalBuilder builder = new DefaultKafkaPrincipalBuilder(null, null);
-        HttpAuthenticationContext httpsCtx = new HttpAuthenticationContext(
-            InetAddress.getByName("127.0.0.1"),
-            "HTTPS",
-            SecurityProtocol.HTTPS,
-            null, null, new X509Certificate[]{});  // empty array
+        HttpAuthenticationContext httpsCtx = new HttpAuthenticationContext.Builder()
+            .clientAddress(InetAddress.getByName("127.0.0.1"))
+            .listenerName("HTTPS")
+            .securityProtocol(SecurityProtocol.HTTPS)
+            .peerCertificates(new X509Certificate[]{})
+            .build();
         KafkaPrincipal principal = builder.build(httpsCtx);
         assertEquals(KafkaPrincipal.ANONYMOUS, principal);
     }

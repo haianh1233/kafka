@@ -184,6 +184,15 @@ public class HttpProcessor {
                             Unpooled.wrappedBuffer(body));
                         httpResponse.headers().set(HttpHeaderNames.CONTENT_TYPE, HttpHeaderValues.APPLICATION_JSON);
                         httpResponse.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length);
+
+                        // Section 12.3: If throttleTimeMs > 0, add Retry-After header
+                        // so HTTP clients know to back off.
+                        long throttleTimeMs = sendResp.request().apiThrottleTimeMs();
+                        if (throttleTimeMs > 0) {
+                            int retryAfterSeconds = Math.max(1, (int) Math.ceil(throttleTimeMs / 1000.0));
+                            httpResponse.headers().setInt(HttpHeaderNames.RETRY_AFTER, retryAfterSeconds);
+                        }
+
                         ctx.writeAndFlush(httpResponse);
                     } else {
                         log.debug("Channel closed before response could be sent: {}", connectionId);

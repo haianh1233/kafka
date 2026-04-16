@@ -122,9 +122,8 @@ class HttpRequestHandler(
   }
 
   override def channelRead0(ctx: ChannelHandlerContext, req: FullHttpRequest): Unit = {
-    val principal = buildPrincipal(ctx, req)
-    // Principal is available for RequestContext construction.
-    // Full request routing is handled by downstream tasks.
+    // Build principal for RequestContext construction (used by downstream integration)
+    buildPrincipal(ctx, req)
     ctx.fireChannelRead(req.retain())
   }
 }
