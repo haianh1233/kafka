@@ -76,7 +76,8 @@ import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
 import java.util
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.{CompletableFuture, ConcurrentHashMap}
+import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, ScheduledExecutorService, TimeUnit}
+import java.util.function.BiFunction
 import java.util.stream.Collectors
 import java.util.{Collections, Optional}
 import scala.annotation.nowarn
@@ -110,7 +111,8 @@ class KafkaApis(val requestChannel: RequestChannel,
                 val tokenManager: DelegationTokenManager,
                 val apiVersionManager: ApiVersionManager,
                 val clientMetricsManager: ClientMetricsManager,
-                val groupConfigManager: GroupConfigManager
+                val groupConfigManager: GroupConfigManager,
+                val httpAsyncExecutor: ScheduledExecutorService = null
 ) extends ApiRequestHandler with Logging {
 
   type ProduceResponseStats = Map[TopicIdPartition, RecordValidationStats]
@@ -278,19 +280,207 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   /**
-   * Handles HTTP produce requests. Phase 1: delegates to existing handleProduceRequest.
-   * Phase 2 will add fan-out and forwarding via ProduceForwardManager.
+   * Handles HTTP produce requests -- LOCAL leader path only.
    *
-   * LIMITATION: Phase 1 only works correctly for single-partition requests
-   * where the receiving broker is the partition leader. Multi-partition and
-   * cross-broker requests will fail with LEADER_NOT_AVAILABLE for non-local
-   * partitions. This is expected -- Phase 2 adds proper forwarding.
+   * For partitions where this broker is the leader, delegates to
+   * ReplicaManager.appendRecords(). For partitions with a remote leader,
+   * returns LEADER_NOT_AVAILABLE (forwarding added in TASK-D.03).
    *
-   * // Time: Update - TASK-B.06
+   * CRITICAL: This method must NEVER block the KafkaRequestHandler thread.
+   * All CompletableFuture composition uses .handleAsync(httpAsyncExecutor)
+   * per design doc section 14.1.
+   *
+   * @see handleProduceRequest for the binary protocol equivalent
+   * // Time: Update - TASK-C.01
    */
   private def handleHttpProduceRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
-    // Phase 1: delegate to existing handler (local path only)
-    handleProduceRequest(request, requestLocal)
+    val produceRequest = request.body[ProduceRequest]
+    val localBrokerId = config.brokerId
+
+    // ---------------------------------------------------------------
+    // 1. Parse partition data from the ProduceRequest
+    //    (Same pattern as handleProduceRequest)
+    // ---------------------------------------------------------------
+    val unauthorizedTopicResponses = mutable.Map[TopicIdPartition, PartitionResponse]()
+    val nonExistingTopicResponses = mutable.Map[TopicIdPartition, PartitionResponse]()
+    val invalidRequestResponses = mutable.Map[TopicIdPartition, PartitionResponse]()
+    val leaderNotAvailableResponses = mutable.Map[TopicIdPartition, PartitionResponse]()
+    val authorizedLocalRequestInfo = mutable.Map[TopicIdPartition, MemoryRecords]()
+
+    val topicIdToPartitionData =
+      new mutable.ArrayBuffer[(TopicIdPartition, ProduceRequestData.PartitionProduceData)]
+
+    produceRequest.data.topicData.forEach { topic =>
+      topic.partitionData.forEach { partition =>
+        val (topicName, topicId) = if (topic.topicId().equals(Uuid.ZERO_UUID)) {
+          (topic.name(), metadataCache.getTopicId(topic.name()))
+        } else {
+          (metadataCache.getTopicName(topic.topicId).orElse(topic.name), topic.topicId())
+        }
+
+        val topicPartition = new TopicPartition(topicName, partition.index())
+        if (topicName.isEmpty && request.header.apiVersion > 12)
+          nonExistingTopicResponses += new TopicIdPartition(topicId, topicPartition) ->
+            new PartitionResponse(Errors.UNKNOWN_TOPIC_ID)
+        else
+          topicIdToPartitionData += new TopicIdPartition(topicId, topicPartition) -> partition
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // 2. Authorization check (same pattern as existing handler)
+    // ---------------------------------------------------------------
+    val authorizedTopics = authHelper.filterByAuthorized(
+      request.context, WRITE, TOPIC, topicIdToPartitionData
+    )(_._1.topic)
+
+    // ---------------------------------------------------------------
+    // 3. Classify each partition: unauthorized, non-existing,
+    //    invalid, local-leader, or remote-leader
+    // ---------------------------------------------------------------
+    topicIdToPartitionData.foreach { case (topicIdPartition, partition) =>
+      val memoryRecords = partition.records.asInstanceOf[MemoryRecords]
+      if (!authorizedTopics.contains(topicIdPartition.topic)) {
+        unauthorizedTopicResponses += topicIdPartition ->
+          new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
+      } else if (!metadataCache.contains(topicIdPartition.topicPartition)) {
+        nonExistingTopicResponses += topicIdPartition ->
+          new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
+      } else {
+        try {
+          ProduceRequest.validateRecords(request.header.apiVersion, memoryRecords)
+
+          // Leader check: is this broker the leader for this partition?
+          val isLocal = OptionConverters.toScala(metadataCache.getLeaderAndIsr(
+            topicIdPartition.topicPartition.topic,
+            topicIdPartition.topicPartition.partition
+          )).exists(_.leader == localBrokerId)
+
+          if (isLocal) {
+            authorizedLocalRequestInfo += (topicIdPartition -> memoryRecords)
+          } else {
+            // Phase C: no forwarding yet -- return LEADER_NOT_AVAILABLE
+            // Phase D (TASK-D.03) will replace this with actual forwarding
+            leaderNotAvailableResponses += topicIdPartition ->
+              new PartitionResponse(Errors.LEADER_NOT_AVAILABLE)
+          }
+        } catch {
+          case e: ApiException =>
+            invalidRequestResponses += topicIdPartition ->
+              new PartitionResponse(Errors.forException(e))
+        }
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // 4. Merge all non-appendable partition results
+    // ---------------------------------------------------------------
+    val preComputedErrors: Map[TopicIdPartition, PartitionResponse] =
+      (unauthorizedTopicResponses ++ nonExistingTopicResponses ++
+        invalidRequestResponses ++ leaderNotAvailableResponses).toMap
+
+    // ---------------------------------------------------------------
+    // 5. Build response callback that sends the HTTP response
+    // ---------------------------------------------------------------
+    @nowarn("cat=deprecation")
+    def sendMergedResponse(
+      appendResults: java.util.Map[TopicIdPartition, PartitionResponse]
+    ): Unit = {
+      val mergedResponseStatus: java.util.Map[TopicIdPartition, PartitionResponse] =
+        new java.util.HashMap[TopicIdPartition, PartitionResponse]()
+      mergedResponseStatus.putAll(appendResults)
+      preComputedErrors.foreach { case (tp, resp) => mergedResponseStatus.put(tp, resp) }
+
+      // Quota handling (same pattern as existing handler)
+      val timeMs = time.milliseconds()
+      val requestSize = request.sizeInBytes
+      val bandwidthThrottleTimeMs = quotas.produce.maybeRecordAndGetThrottleTimeMs(
+        request.session, request.header.clientId(), requestSize, timeMs)
+      val requestThrottleTimeMs =
+        if (produceRequest.acks == 0) 0
+        else quotas.request.maybeRecordAndGetThrottleTimeMs(request, timeMs)
+      val maxThrottleTimeMs = Math.max(bandwidthThrottleTimeMs, requestThrottleTimeMs)
+
+      if (maxThrottleTimeMs > 0) {
+        request.apiThrottleTimeMs = maxThrottleTimeMs
+        if (bandwidthThrottleTimeMs > requestThrottleTimeMs) {
+          requestHelper.throttle(quotas.produce, request, bandwidthThrottleTimeMs)
+        } else {
+          requestHelper.throttle(quotas.request, request, requestThrottleTimeMs)
+        }
+      }
+
+      if (produceRequest.acks == 0) {
+        requestHelper.sendNoOpResponseExemptThrottle(request)
+      } else {
+        requestChannel.sendResponse(
+          request,
+          new ProduceResponse(mergedResponseStatus, maxThrottleTimeMs,
+            java.util.Collections.emptyList()),
+          None
+        )
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // 6. If no local partitions to append, send immediate response
+    // ---------------------------------------------------------------
+    if (authorizedLocalRequestInfo.isEmpty) {
+      sendMergedResponse(java.util.Collections.emptyMap())
+      return
+    }
+
+    // ---------------------------------------------------------------
+    // 7. Local append via ReplicaManager (async via CompletableFuture)
+    //    CRITICAL: responseCallback may be called synchronously
+    //    (acks=1 fast path). Wrap in CompletableFuture so the merge
+    //    always runs on httpAsyncExecutor (section 14.1).
+    // ---------------------------------------------------------------
+    val localFuture = new CompletableFuture[java.util.Map[TopicIdPartition, PartitionResponse]]()
+
+    replicaManager.appendRecords(
+      timeout = produceRequest.timeout.toLong,
+      requiredAcks = produceRequest.acks,
+      internalTopicsAllowed = request.header.clientId == "__admin_client",
+      origin = AppendOrigin.CLIENT,
+      entriesPerPartition = authorizedLocalRequestInfo,
+      responseCallback = { results: java.util.Map[TopicIdPartition, PartitionResponse] =>
+        localFuture.complete(results)
+      }
+    )
+
+    // Clear partition records to allow GC (same as existing handler)
+    produceRequest.clearPartitionRecords()
+
+    // ---------------------------------------------------------------
+    // 8. When the local append completes, merge and send response
+    //    ALWAYS use .handleAsync with httpAsyncExecutor to avoid
+    //    running on the handler thread or InterBrokerSendThread.
+    // ---------------------------------------------------------------
+    localFuture
+      .orTimeout(produceRequest.timeout.toLong, TimeUnit.MILLISECONDS)
+      .handleAsync(
+        new BiFunction[java.util.Map[TopicIdPartition, PartitionResponse], Throwable, Unit] {
+          override def apply(
+            localResults: java.util.Map[TopicIdPartition, PartitionResponse],
+            ex: Throwable
+          ): Unit = {
+            if (ex != null) {
+              // Timeout or unexpected error -- return REQUEST_TIMED_OUT for all local partitions
+              val timedOutResults = new java.util.HashMap[TopicIdPartition, PartitionResponse]()
+              authorizedLocalRequestInfo.keys.foreach { tp =>
+                timedOutResults.put(tp, new PartitionResponse(Errors.REQUEST_TIMED_OUT))
+              }
+              sendMergedResponse(timedOutResults)
+            } else {
+              sendMergedResponse(localResults)
+            }
+          }
+        },
+        httpAsyncExecutor // NEVER use plain .handle() here
+      )
+
+    // Handler thread returns immediately -- KafkaApis.handle() loops back
   }
 
   /**
