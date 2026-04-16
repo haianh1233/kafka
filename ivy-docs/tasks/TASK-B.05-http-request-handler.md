@@ -666,47 +666,57 @@ public RequestContext(RequestHeader header,
 
 ## Learning
 
-_To be filled by the executing agent._
+- **EmbeddedChannel uses EmbeddedSocketAddress, not InetSocketAddress.** When testing Netty handlers with `EmbeddedChannel`, `ctx.channel().remoteAddress()` returns `EmbeddedSocketAddress` which cannot be cast to `InetSocketAddress`. The handler must use pattern matching (`match { case inet: InetSocketAddress => ... }`) with a fallback to `InetAddress.getLoopbackAddress` to avoid ClassCastException in tests and edge cases.
+- **Java package-private methods are inaccessible from Scala in different packages.** `HttpRouter.validateClientId()` was package-private (default Java access). Since `HttpRequestHandler` is in `kafka.network` (not `kafka.server.http`), it cannot access package-private members. Changed to `public static`.
+- **http-server module needed the Scala plugin.** The module was Java-only; adding Scala source files requires `apply plugin: 'scala'` and the `libs.scalaLibrary` dependency in `build.gradle`.
+- **HttpProcessor.channels is private.** The skeleton code referenced `httpProcessor.channels.remove()` directly, but this is a private field. Added `unregisterChannel(connectionId)` public method to `HttpProcessor` for cleanup on enqueue failure.
+- **RequestChannel.Request constructor eagerly parses the buffer.** `context.parseRequest(buffer)` runs in the constructor body, so the ByteBuffer from the translator must contain a valid serialized Kafka request body (not including the header). The translator's `request.serialize().buffer()` produces exactly the body format that `AbstractRequest.parseRequest()` expects.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **Authentication fields are null placeholders.** The `HttpAuthenticationContext` is constructed with null bearerToken, basicCredentials, and peerCertificates. Actual extraction from HTTP headers and TLS handshake will be wired in TASK-F.05 (security wiring).
+- **HttpAcceptor is a stub.** The real `HttpAcceptor` (Netty ServerBootstrap lifecycle) will be implemented in TASK-B.03. The current stub provides the minimal `isAccepting`, `incrementPending`, `decrementPending` interface needed by the handler.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- The `RequestChannelMetrics` class is at `org.apache.kafka.network.metrics.RequestChannelMetrics`, not in the `kafka.network` package. Tests must mock this type for `RequestChannel.Request` construction.
+- `BrokerState` is at `org.apache.kafka.metadata.BrokerState`, not `org.apache.kafka.server.BrokerState` as the skeleton imports suggested.
+- The skeleton used `kafka.server.KafkaConfig` but this is not needed -- the handler delegates config to `HttpServerConfigs` passed as a constructor parameter.
+- 13 test methods all pass: health check (3), normal request (1), queue full (1), drain mode (1), invalid route (1), invalid topic (1), request ID (3), exception handling (1), registration ordering (1).
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] `./gradlew :http-server:test --tests "kafka.network.HttpRequestHandlerTest"` exits 0
-- [ ] `HttpRequestHandler.scala` exists at `http-server/src/main/scala/kafka/network/HttpRequestHandler.scala`
-- [ ] Health check returns 200/503 without touching RequestChannel
-- [ ] Health response includes brokerId and clusterId
-- [ ] Queue-full returns 503 with `Retry-After: 1` header
-- [ ] Drain mode returns 503 with SHUTTING_DOWN error
-- [ ] `X-Kafka-Request-ID` is set on every response
-- [ ] Channel is registered with HttpProcessor before request is enqueued
-- [ ] `connectionId` uses `ctx.channel().id().asLongText()`
-- [ ] `fromPrivilegedListener` is always `false`
-- [ ] `exceptionCaught()` closes the channel
-- [ ] Learning section filled with at least one entry
-- [ ] Limitations section filled (use "None" if truly none)
-- [ ] File Manifest section updated after commit
+- [x] `./gradlew :http-server:test --tests "kafka.network.HttpRequestHandlerTest"` exits 0
+- [x] `HttpRequestHandler.scala` exists at `http-server/src/main/scala/kafka/network/HttpRequestHandler.scala`
+- [x] Health check returns 200/503 without touching RequestChannel
+- [x] Health response includes brokerId and clusterId
+- [x] Queue-full returns 503 with `Retry-After: 1` header
+- [x] Drain mode returns 503 with SHUTTING_DOWN error
+- [x] `X-Kafka-Request-ID` is set on every response
+- [x] Channel is registered with HttpProcessor before request is enqueued
+- [x] `connectionId` uses `ctx.channel().id().asLongText()`
+- [x] `fromPrivilegedListener` is always `false`
+- [x] `exceptionCaught()` closes the channel
+- [x] Learning section filled with at least one entry
+- [x] Limitations section filled (use "None" if truly none)
+- [x] File Manifest section updated after commit
 
 ---
 
 ## File Manifest
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-16 -- TASK-B.05: HttpRequestHandler (commit 9bd130d3cc)
 Created:
-  - http-server/src/main/scala/kafka/network/HttpRequestHandler.scala — Netty HTTP request handler
-  - http-server/src/test/scala/kafka/network/HttpRequestHandlerTest.scala — Handler tests
+  - http-server/src/main/scala/kafka/network/HttpRequestHandler.scala -- Netty HTTP request handler
+  - http-server/src/main/scala/kafka/network/HttpAcceptor.scala -- Stub for HttpAcceptor (full impl in TASK-B.03)
+  - http-server/src/test/scala/kafka/network/HttpRequestHandlerTest.scala -- 13 handler tests
 Modified:
-  - (none)
--->
+  - build.gradle -- Added Scala plugin and scalaLibrary dep to http-server module
+  - http-server/src/main/java/kafka/server/http/HttpRouter.java -- Made validateClientId() public
+  - http-server/src/main/java/kafka/server/http/HttpProcessor.java -- Added unregisterChannel() method

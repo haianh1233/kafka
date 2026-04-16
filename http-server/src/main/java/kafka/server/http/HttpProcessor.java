@@ -133,6 +133,16 @@ public class HttpProcessor {
     }
 
     /**
+     * Unregisters a Netty channel for a connection. Called by HttpRequestHandler
+     * when enqueue fails and the channel registration needs to be cleaned up.
+     *
+     * @param connectionId Netty channel long text ID
+     */
+    public void unregisterChannel(String connectionId) {
+        channels.remove(connectionId);
+    }
+
+    /**
      * Enqueues a response for delivery to the Netty channel.
      * Non-blocking — called from KafkaRequestHandler threads via RequestChannel.sendResponse().
      *

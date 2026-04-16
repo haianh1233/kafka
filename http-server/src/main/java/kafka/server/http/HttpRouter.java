@@ -231,7 +231,7 @@ public final class HttpRouter {
      * @return validated client ID string
      * @throws InvalidRequestException if clientId contains illegal characters
      */
-    static String validateClientId(String clientId) {
+    public static String validateClientId(String clientId) {
         if (clientId == null || clientId.isEmpty()) {
             return DEFAULT_CLIENT_ID;
         }

@@ -1601,6 +1601,8 @@ project(':group-coordinator') {
 }
 
 project(':http-server') {
+  apply plugin: 'scala'
+
   base {
     archivesName = "kafka-http-server"
   }
@@ -1616,6 +1618,7 @@ project(':http-server') {
     implementation libs.nettyAll
     implementation libs.jacksonDatabind
     implementation libs.slf4jApi
+    implementation libs.scalaLibrary
 
     testImplementation project(':core').sourceSets.test.output
     testImplementation project(':clients').sourceSets.test.output
