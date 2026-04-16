@@ -964,6 +964,41 @@ tasks.create(name: "jarConnect", dependsOn: connectPkgs.collect { it + ":jar" })
 
 tasks.create(name: "testConnect", dependsOn: connectPkgs.collect { it + ":test" }) {}
 
+project(':http-server') {
+  apply plugin: 'scala'
+
+  base {
+    archivesName = "kafka-http-server"
+  }
+
+  dependencies {
+    implementation project(':clients')
+    implementation project(':server-common')
+    implementation project(':core')
+    implementation libs.scalaLibrary
+    implementation libs.scalaLogging
+    implementation libs.slf4jApi
+    implementation libs.nettyAll
+
+    testImplementation project(':clients').sourceSets.test.output
+    testImplementation libs.junitJupiter
+    testImplementation libs.mockitoCore
+    testImplementation libs.bcpkix
+    testImplementation libs.nettyAll
+    testImplementation testLog4j2Libs
+
+    testRuntimeOnly runtimeTestLibs
+  }
+
+  checkstyle {
+    configProperties = checkstyleConfigProperties("import-control-http-server.xml")
+  }
+
+  javadoc {
+    enabled = false
+  }
+}
+
 project(':server') {
   base {
     archivesName = "kafka-server"
