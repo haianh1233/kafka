@@ -22,6 +22,7 @@
 
   <!-- common library dependencies -->
   <allow pkg="java" />
+<<<<<<< HEAD
   <allow pkg="javax.management" />
   <allow pkg="org.slf4j" />
   <allow pkg="org.junit" />
@@ -48,5 +49,27 @@
 
   <!-- Scala interop -->
   <allow pkg="scala" />
+=======
+  <allow pkg="org.slf4j" />
+  <allow pkg="org.junit" />
+  <allow pkg="org.mockito" />
+  <allow pkg="org.opentest4j" />
+
+  <!-- Netty -->
+  <allow pkg="io.netty" />
+
+  <!-- Jackson -->
+  <allow pkg="com.fasterxml.jackson" />
+
+  <!-- Kafka clients -->
+  <allow pkg="org.apache.kafka.common" />
+  <allow pkg="org.apache.kafka.clients" />
+
+  <!-- Kafka server configs -->
+  <allow pkg="org.apache.kafka.network" />
+
+  <!-- Same module -->
+  <allow pkg="kafka.server.http" />
+>>>>>>> worktree-agent-ad2b13af
 
 </import-control>

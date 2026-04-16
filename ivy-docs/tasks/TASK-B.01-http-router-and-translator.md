@@ -1058,19 +1058,28 @@ private static String detectInvalidTopic(String name) {
 
 ## Learning
 
-_To be filled by the executing agent._
+- Jackson's `StreamReadConstraints` must be configured on `JsonFactory.builder().streamReadConstraints(...)`, not on `ObjectMapper` directly. The `setStreamReadConstraints` method exists on `JsonFactory` but not on `ObjectMapper` in Jackson 2.21.x.
+- `ListOffsetsRequest` has a private constructor; must use `ListOffsetsRequest.Builder.forConsumer(...)` to build instances.
+- `TimestampType` lives in `org.apache.kafka.common.record.TimestampType`, not in `org.apache.kafka.common.record.internal.TimestampType`.
+- The `http-server` module needed a dedicated `checkstyle/import-control-http-server.xml` since the default import-control is scoped to `org.apache.kafka` but the module uses `kafka.server.http` package.
+- Checkstyle enforces CyclomaticComplexity (max 16) and NPathComplexity (max 500), which required breaking `translateProduce` and `translateFetch` into ~10 smaller helper methods.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- Consumer lag endpoint (`CONSUMER_LAG`) throws `InvalidRequestException` as a placeholder; full implementation requires OFFSET_FETCH + LIST_OFFSETS composition which is deferred to a later task.
+- The `HttpServerConfigs` wrapper class in `kafka.server.http` is a simple POJO created for this task; it will be replaced or expanded when the full server lifecycle is wired in.
+- The `roundRobinCounter` for batch-sticky partition assignment is a single global `AtomicInteger` rather than per-topic, which is sufficient for phase 1 but may need refinement for multi-topic HTTP produce batching.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- The FETCH route pattern (`/records:fetch`) must be matched before the PRODUCE pattern (`/records`) since the PRODUCE regex would match `/records:fetch` partially if tested first.
+- `MemoryRecords.withRecords(Compression.NONE, ...)` is the simplest way to build produce record batches for HTTP; no compression is applied at this layer since HTTP payloads are JSON (compression happens at Kafka layer).
+- ProduceRequestData uses `TopicProduceDataCollection` (not a plain List) for the topic data, requiring iterator-based construction.
+- FetchRequest uses `Uuid.ZERO_UUID` for topic IDs since HTTP requests use topic names, not UUIDs; the request version negotiation will resolve this at the Kafka protocol layer.
 
 ---
 
@@ -1094,12 +1103,13 @@ _To be filled by the executing agent._
 
 ## File Manifest
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-16 — Implement HttpRouter + HttpRequestTranslator (commit 4b5605aaa5)
 Created:
-  - http-server/src/main/java/kafka/server/http/HttpRouter.java — URI routing and validation
-  - http-server/src/main/java/kafka/server/http/HttpRequestTranslator.java — JSON to Kafka request translation
-  - http-server/src/test/java/kafka/server/http/HttpRouterTest.java — Router unit tests
-  - http-server/src/test/java/kafka/server/http/HttpRequestTranslatorTest.java — Translator unit tests
+  - http-server/src/main/java/kafka/server/http/HttpRouter.java — URI routing and path parameter extraction with validation
+  - http-server/src/main/java/kafka/server/http/HttpRequestTranslator.java — JSON body deserialization and Kafka request construction
+  - http-server/src/main/java/kafka/server/http/HttpServerConfigs.java — Runtime config holder wrapping network config constants
+  - http-server/src/test/java/kafka/server/http/HttpRouterTest.java — Router unit tests (15 tests)
+  - http-server/src/test/java/kafka/server/http/HttpRequestTranslatorTest.java — Translator unit tests (18 tests)
+  - checkstyle/import-control-http-server.xml — Import control for kafka.server.http package
 Modified:
-  - (none)
--->
+  - build.gradle — Added checkstyle config for http-server module
