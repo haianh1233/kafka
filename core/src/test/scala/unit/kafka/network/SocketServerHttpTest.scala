@@ -21,6 +21,7 @@ import kafka.server.KafkaConfig
 import kafka.utils.TestUtils
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.message.ApiMessageType.ListenerType
+import org.apache.kafka.common.Endpoint
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.common.utils.Time
 import org.apache.kafka.common.security.scram.internals.ScramMechanism
@@ -91,7 +92,20 @@ class SocketServerHttpTest {
 
   private def createSocketServer(props: Properties): SocketServer = {
     val config = KafkaConfig.fromProps(props)
-    server = new SocketServer(config, metrics, Time.SYSTEM, credentialProvider, apiVersionManager)
+    val factory: (Endpoint, Time) => HttpAcceptorLike = (ep, t) => new HttpAcceptorLike {
+      private val _startedFuture = new java.util.concurrent.CompletableFuture[Void]()
+      private var _draining = false
+      override def endpoint: Endpoint = ep
+      override def startedFuture: java.util.concurrent.CompletableFuture[Void] = _startedFuture
+      override def startup(): Unit = _startedFuture.complete(null)
+      override def beginDrain(): Unit = _draining = true
+      override def awaitDrain(timeoutMs: Long): Unit = ()
+      override def close(): Unit = ()
+      override def isDraining: Boolean = _draining
+      override def pendingRequestCount: Int = 0
+    }
+    server = new SocketServer(config, metrics, Time.SYSTEM, credentialProvider, apiVersionManager,
+      httpAcceptorFactory = factory)
     server
   }
 
