@@ -136,7 +136,17 @@ class HttpAcceptor(
   def beginDrain(): Unit = {
     accepting.set(false)
     _draining.set(true)
-    // The HttpRequestHandler (TASK-B.05) checks isAccepting and rejects new requests
+    // Stop accepting new TCP connections by closing the server channel.
+    // Existing connections remain open so in-flight responses can be written.
+    if (serverChannel != null) {
+      try {
+        serverChannel.close().sync()
+      } catch {
+        case e: Exception =>
+          warn(s"Error closing server channel during drain: ${e.getMessage}")
+      }
+    }
+    info(s"HTTP acceptor drain started for ${endpoint.host()}:${endpoint.port()}")
   }
 
   /**
@@ -148,6 +158,10 @@ class HttpAcceptor(
     val deadline = time.milliseconds() + timeoutMs
     while (pendingConnectionCount.get() > 0 && time.milliseconds() < deadline) {
       Thread.sleep(20)
+    }
+    val remaining = pendingConnectionCount.get()
+    if (remaining > 0) {
+      warn(s"HTTP drain timed out with $remaining requests still in-flight")
     }
   }
 

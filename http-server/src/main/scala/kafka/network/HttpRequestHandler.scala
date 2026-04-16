@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 // Time: Created - TASK-F.05
+// Time: Modified - TASK-F.06 (drain check + in-flight tracking)
 package kafka.network
 
-import io.netty.channel.{ChannelHandlerContext, SimpleChannelInboundHandler}
-import io.netty.handler.codec.http.{FullHttpRequest, HttpHeaderNames}
+import io.netty.buffer.Unpooled
+import io.netty.channel.{ChannelFutureListener, ChannelHandlerContext, SimpleChannelInboundHandler}
+import io.netty.handler.codec.http.{DefaultFullHttpResponse, FullHttpRequest, HttpHeaderNames, HttpResponseStatus, HttpVersion}
 import io.netty.handler.ssl.SslHandler
 import org.apache.kafka.common.security.auth.{HttpAuthenticationContext, KafkaPrincipal, KafkaPrincipalBuilder, SecurityProtocol}
 
@@ -26,6 +28,7 @@ import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
 import java.security.cert.X509Certificate
 import java.util.Base64
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 /**
  * Netty channel handler for HTTP requests that extracts authentication context
@@ -34,23 +37,29 @@ import java.util.Base64
  * Authentication extraction priority: mTLS > Bearer > Basic > Anonymous.
  * Once a method is found, lower-priority methods are not checked.
  *
- * This handler does NOT validate Bearer tokens or Basic credentials -- that is
- * the KafkaPrincipalBuilder's responsibility.
+ * This handler also implements drain-phase request rejection: when the broker
+ * is shutting down, new requests receive 503 Service Unavailable with a
+ * Retry-After header directing clients to retry on another broker.
+ *
+ * In-flight request tracking: the handler increments the in-flight counter
+ * when a request passes the drain check. The counter is decremented when the
+ * response is written (handled by HttpProcessor) or on error paths.
  */
 class HttpRequestHandler(
   principalBuilder: KafkaPrincipalBuilder,
-  securityProtocol: SecurityProtocol
+  securityProtocol: SecurityProtocol,
+  draining: AtomicBoolean,
+  inFlightCount: AtomicInteger
 ) extends SimpleChannelInboundHandler[FullHttpRequest] {
 
-  /**
-   * Extract authentication context from the HTTP request and Netty channel.
-   *
-   * Priority order:
-   * 1. Client certificates (mTLS) from SslHandler
-   * 2. Bearer token from Authorization header
-   * 3. Basic auth from Authorization header
-   * 4. Anonymous (no credentials)
-   */
+  /** Convenience constructor for backward compatibility (no drain support). */
+  def this(principalBuilder: KafkaPrincipalBuilder, securityProtocol: SecurityProtocol) =
+    this(principalBuilder, securityProtocol, new AtomicBoolean(false), new AtomicInteger(0))
+
+  /** JSON body for 503 drain response */
+  private val DrainingResponseBody =
+    """{"errorCode":-1,"errorMessage":"Broker is shutting down","detail":"SERVICE_UNAVAILABLE"}"""
+
   private[network] def extractAuthContext(
     ctx: ChannelHandlerContext,
     req: FullHttpRequest
@@ -60,7 +69,6 @@ class HttpRequestHandler(
       .clientAddress(remoteAddr.getAddress)
       .securityProtocol(securityProtocol)
 
-    // 1. Try mTLS (client certificate) -- only if SslHandler is in the pipeline
     val sslHandler = ctx.pipeline().get(classOf[SslHandler])
     if (sslHandler != null) {
       try {
@@ -75,22 +83,18 @@ class HttpRequestHandler(
         }
       } catch {
         case _: javax.net.ssl.SSLPeerUnverifiedException =>
-          // No client certificate presented -- fall through to header-based auth
       }
     }
 
-    // 2. Try Authorization header (Bearer or Basic)
     val authHeader = req.headers().get(HttpHeaderNames.AUTHORIZATION)
     if (authHeader != null) {
       if (authHeader.regionMatches(true, 0, "Bearer ", 0, 7)) {
-        // Bearer token -- case-insensitive prefix match
         val token = authHeader.substring(7).trim
         if (token.nonEmpty) {
           builder.bearerToken(token)
           return builder.build()
         }
       } else if (authHeader.regionMatches(true, 0, "Basic ", 0, 6)) {
-        // Basic auth -- decode base64, split on first colon only
         val encoded = authHeader.substring(6).trim
         try {
           val decoded = new String(Base64.getDecoder.decode(encoded), StandardCharsets.UTF_8)
@@ -103,28 +107,46 @@ class HttpRequestHandler(
           }
         } catch {
           case _: IllegalArgumentException =>
-            // Invalid base64 -- fall through to anonymous
         }
       }
     }
 
-    // 3. Anonymous -- no credentials found
     builder.build()
   }
 
-  /**
-   * Build KafkaPrincipal from the authentication context.
-   * Delegates to the configured KafkaPrincipalBuilder.
-   */
   private[network] def buildPrincipal(ctx: ChannelHandlerContext, req: FullHttpRequest): KafkaPrincipal = {
     val authContext = extractAuthContext(ctx, req)
     principalBuilder.build(authContext)
   }
 
   override def channelRead0(ctx: ChannelHandlerContext, req: FullHttpRequest): Unit = {
-    val _ = buildPrincipal(ctx, req)
-    // Principal is available for RequestContext construction.
-    // Full request routing is handled by downstream tasks.
-    ctx.fireChannelRead(req.retain())
+    if (draining.get()) {
+      sendDrainingResponse(ctx)
+      return
+    }
+
+    inFlightCount.incrementAndGet()
+
+    try {
+      buildPrincipal(ctx, req)
+      ctx.fireChannelRead(req.retain())
+    } catch {
+      case e: Exception =>
+        inFlightCount.decrementAndGet()
+        throw e
+    }
+  }
+
+  private[network] def sendDrainingResponse(ctx: ChannelHandlerContext): Unit = {
+    val body = DrainingResponseBody.getBytes(StandardCharsets.UTF_8)
+    val response = new DefaultFullHttpResponse(
+      HttpVersion.HTTP_1_1,
+      HttpResponseStatus.SERVICE_UNAVAILABLE,
+      Unpooled.wrappedBuffer(body))
+    response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json")
+    response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length)
+    response.headers().set("Retry-After", "5")
+    response.headers().set(HttpHeaderNames.CONNECTION, "close")
+    ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE)
   }
 }

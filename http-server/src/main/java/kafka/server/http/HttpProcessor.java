@@ -36,6 +36,7 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Response routing bridge between {@link RequestChannel} and Netty.
@@ -70,6 +71,9 @@ public class HttpProcessor {
     // --- Processor ID (registered with RequestChannel) ---
     private final int id;
 
+    // --- In-flight request count (shared with HttpRequestHandler for drain coordination) ---
+    private final AtomicInteger inFlightCount;
+
     // --- Response queue (unbounded, non-blocking add) ---
     private final LinkedBlockingDeque<RequestChannel.Response> responseQueue =
         new LinkedBlockingDeque<>();
@@ -98,12 +102,24 @@ public class HttpProcessor {
     private static final String THROTTLE_ERROR_MESSAGE = "THROTTLING_QUOTA_EXCEEDED";
 
     /**
-     * Creates a new HttpProcessor.
+     * Creates a new HttpProcessor with a shared in-flight counter.
+     *
+     * @param id            unique processor ID for RequestChannel registration
+     * @param inFlightCount shared counter for tracking in-flight requests (owned by HttpAcceptor)
+     */
+    public HttpProcessor(int id, AtomicInteger inFlightCount) {
+        this.id = id;
+        this.inFlightCount = Objects.requireNonNull(inFlightCount, "inFlightCount");
+    }
+
+    /**
+     * Creates a new HttpProcessor with its own in-flight counter.
+     * Convenience constructor for tests and backward compatibility.
      *
      * @param id unique processor ID for RequestChannel registration
      */
     public HttpProcessor(int id) {
-        this.id = id;
+        this(id, new AtomicInteger(0));
     }
 
     /**
@@ -193,9 +209,11 @@ public class HttpProcessor {
                             httpResponse.headers().setInt(HttpHeaderNames.RETRY_AFTER, retryAfterSeconds);
                         }
 
-                        ctx.writeAndFlush(httpResponse);
+                        // Decrement in-flight count after the response is written to the channel.
+                        ctx.writeAndFlush(httpResponse).addListener(f -> inFlightCount.decrementAndGet());
                     } else {
                         log.debug("Channel closed before response could be sent: {}", connectionId);
+                        inFlightCount.decrementAndGet();
                     }
                     channels.remove(connectionId);
 
@@ -204,6 +222,7 @@ public class HttpProcessor {
                     if (ctx != null) {
                         ctx.close();
                     }
+                    inFlightCount.decrementAndGet();
 
                 } else if (response instanceof RequestChannel.StartThrottlingResponse) {
                     // HTTP: convert to immediate 429 response
@@ -212,6 +231,7 @@ public class HttpProcessor {
                         long throttleTimeMs = response.request().apiThrottleTimeMs();
                         sendThrottleResponse(ctx, throttleTimeMs);
                     }
+                    inFlightCount.decrementAndGet();
                     channels.remove(connectionId);
 
                 } else if (response instanceof RequestChannel.EndThrottlingResponse) {

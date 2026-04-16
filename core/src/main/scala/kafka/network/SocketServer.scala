@@ -42,7 +42,7 @@ import org.apache.kafka.common.requests.{ApiVersionsRequest, RequestContext, Req
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.common.utils.{LogContext, Time, Utils}
 import org.apache.kafka.common.{Endpoint, KafkaException, MetricName, Reconfigurable}
-import org.apache.kafka.network.{ConnectionQuotaEntity, ConnectionThrottledException, SocketServer => JSocketServer, SocketServerConfigs, TooManyConnectionsException}
+import org.apache.kafka.network.{ConnectionQuotaEntity, ConnectionThrottledException, HttpServerConfigs, SocketServer => JSocketServer, SocketServerConfigs, TooManyConnectionsException}
 import org.apache.kafka.security.CredentialProvider
 import org.apache.kafka.server.{ApiVersionManager, ServerSocketFactory}
 import org.apache.kafka.server.config.QuotaConfig
@@ -292,7 +292,7 @@ class SocketServer(
 
       // 2. NEW: drain HTTP in-flight requests (bounded window)
       httpAcceptors.asScala.values.foreach(_.beginDrain())
-      val httpDrainMs = 2000L // default drain timeout
+      val httpDrainMs: Long = HttpServerConfigs.HTTP_SHUTDOWN_DRAIN_MS_DEFAULT
       val drainDeadline = time.milliseconds() + httpDrainMs
       httpAcceptors.asScala.values.foreach { acc =>
         val remaining = drainDeadline - time.milliseconds()

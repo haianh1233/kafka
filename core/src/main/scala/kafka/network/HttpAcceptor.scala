@@ -18,6 +18,7 @@
 package kafka.network
 
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import kafka.server.KafkaConfig
 import kafka.utils.Logging
 import org.apache.kafka.common.Endpoint
@@ -29,9 +30,10 @@ import org.apache.kafka.common.utils.Time
  * the Kafka request pipeline.
  *
  * Phase 1 stub: minimal implementation for wiring into SocketServer.
- * Full Netty integration will be added in Phase 2.
+ * Full Netty integration lives in http-server module's HttpAcceptor.
  *
  * // Time: Created - TASK-B.03
+ * // Time: Modified - TASK-F.06 (graceful shutdown drain support)
  */
 class HttpAcceptor(
   val socketServer: SocketServer,
@@ -43,6 +45,10 @@ class HttpAcceptor(
 ) extends Logging {
 
   val startedFuture = new CompletableFuture[Void]()
+
+  // --- Drain support ---
+  private val draining = new AtomicBoolean(false)
+  private val inFlightCount = new AtomicInteger(0)
 
   /**
    * Start the Netty ServerBootstrap and bind to the endpoint port.
@@ -57,8 +63,11 @@ class HttpAcceptor(
   /**
    * Begin draining in-flight HTTP requests. New requests are rejected
    * with 503 Service Unavailable.
+   *
+   * This method is idempotent -- calling it multiple times is safe.
    */
   def beginDrain(): Unit = {
+    draining.set(true)
     info(s"Beginning drain for HTTP acceptor ${endPoint.listener}")
   }
 
@@ -68,6 +77,14 @@ class HttpAcceptor(
    * @param timeoutMs maximum time to wait for drain completion
    */
   def awaitDrain(timeoutMs: Long): Unit = {
+    val deadline = time.milliseconds() + timeoutMs
+    while (inFlightCount.get() > 0 && time.milliseconds() < deadline) {
+      Thread.sleep(20)
+    }
+    val remaining = inFlightCount.get()
+    if (remaining > 0) {
+      warn(s"HTTP drain timed out with $remaining requests still in-flight for ${endPoint.listener}")
+    }
     info(s"Awaiting drain for HTTP acceptor ${endPoint.listener}, timeout=${timeoutMs}ms")
   }
 
@@ -78,4 +95,10 @@ class HttpAcceptor(
     info(s"Closing HTTP acceptor for ${endPoint.listener}")
     httpProcessor.close()
   }
+
+  /** Whether the acceptor is currently draining. */
+  def isDraining: Boolean = draining.get()
+
+  /** Current count of in-flight requests. */
+  def pendingRequestCount: Int = inFlightCount.get()
 }
