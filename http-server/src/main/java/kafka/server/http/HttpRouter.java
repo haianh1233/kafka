@@ -245,7 +245,7 @@ public final class HttpRouter {
         matcher = CONSUMER_LAG_PATTERN.matcher(path);
         if (matcher.matches()) {
             requireMethod(method, HttpMethod.GET, path);
-            String consumerGroup = matcher.group(1);
+            String consumerGroup = validateGroupId(matcher.group(1));
             return new RouteResult(HandlerType.CONSUMER_LAG, null, null, consumerGroup, queryParams);
         }
 

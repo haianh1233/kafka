@@ -188,88 +188,102 @@ public class HttpProcessor implements ResponseProcessor {
             String connectionId = response.request().context().connectionId();
             try {
                 if (response instanceof RequestChannel.SendResponse) {
-                    RequestChannel.SendResponse sendResp = (RequestChannel.SendResponse) response;
-                    ChannelHandlerContext ctx = channels.get(connectionId);
-                    if (ctx != null && ctx.channel().isActive()) {
-                        FullHttpResponse httpResponse;
-                        ApiKeys apiKey = sendResp.request().header().apiKey();
-                        String requestId = connectionId + "-" + sendResp.request().header().correlationId();
-
-                        // Check if the AbstractResponse was stored for HTTP serialization
-                        Object storedResponse = sendResp.request().requestLocalProperties()
-                            .get("httpAbstractResponse");
-                        if (storedResponse instanceof AbstractResponse) {
-                            AbstractResponse abstractResponse = (AbstractResponse) storedResponse;
-                            // Use the real HTTP response serializer for proper JSON conversion
-                            Object maxWaitObj = sendResp.request().requestLocalProperties()
-                                .get("httpMaxWaitApplied");
-                            int effectiveMaxWaitMs = maxWaitObj instanceof Integer ?
-                                (Integer) maxWaitObj : -1;
-                            httpResponse = HttpResponseSerializer.serialize(
-                                abstractResponse, requestId, apiKey, effectiveMaxWaitMs);
-                        } else {
-                            // Fallback: use response log or minimal response
-                            byte[] body = serializeSendResponse(sendResp);
-                            httpResponse = new DefaultFullHttpResponse(
-                                HttpVersion.HTTP_1_1,
-                                HttpResponseStatus.OK,
-                                Unpooled.wrappedBuffer(body));
-                            httpResponse.headers().set(HttpHeaderNames.CONTENT_TYPE,
-                                HttpHeaderValues.APPLICATION_JSON);
-                            httpResponse.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length);
-                        }
-
-                        // Section 12.3: If throttleTimeMs > 0, add Retry-After header
-                        // so HTTP clients know to back off.
-                        long throttleTimeMs = sendResp.request().apiThrottleTimeMs();
-                        if (throttleTimeMs > 0) {
-                            int retryAfterSeconds = Math.max(1, (int) Math.ceil(throttleTimeMs / 1000.0));
-                            httpResponse.headers().setInt(HttpHeaderNames.RETRY_AFTER, retryAfterSeconds);
-                        }
-
-                        // Update request metrics (same as SocketServer.Processor does for binary protocol)
-                        sendResp.request().responseDequeueTimeNanos_$eq(
-                            org.apache.kafka.common.utils.Time.SYSTEM.nanoseconds());
-                        sendResp.request().updateRequestMetrics(0L, response);
-
-                        // Decrement in-flight count after the response is written to the channel.
-                        ctx.writeAndFlush(httpResponse).addListener(f -> inFlightCount.decrementAndGet());
-                    } else {
-                        log.debug("Channel closed before response could be sent: {}", connectionId);
-                        sendResp.request().updateRequestMetrics(0L, response);
-                        inFlightCount.decrementAndGet();
-                    }
-                    channels.remove(connectionId);
-
+                    handleSendResponse((RequestChannel.SendResponse) response, connectionId);
                 } else if (response instanceof RequestChannel.NoOpResponse) {
-                    response.request().updateRequestMetrics(0L, response);
                     sendNoContentResponse(connectionId);
-
+                    safeUpdateMetrics(response);
                 } else if (response instanceof RequestChannel.CloseConnectionResponse) {
-                    response.request().updateRequestMetrics(0L, response);
                     ChannelHandlerContext ctx = channels.remove(connectionId);
                     if (ctx != null) {
                         ctx.close();
                     }
                     inFlightCount.decrementAndGet();
-
                 } else if (response instanceof RequestChannel.StartThrottlingResponse) {
-                    // HTTP: convert to immediate 429 response
-                    ChannelHandlerContext ctx = channels.get(connectionId);
-                    if (ctx != null && ctx.channel().isActive()) {
-                        long throttleTimeMs = response.request().apiThrottleTimeMs();
-                        sendThrottleResponse(ctx, throttleTimeMs);
-                    }
-                    inFlightCount.decrementAndGet();
-                    channels.remove(connectionId);
-
+                    handleStartThrottling(response, connectionId);
                 } else if (response instanceof RequestChannel.EndThrottlingResponse) {
                     // No-op for HTTP — no mute/unmute mechanism
                 }
             } catch (Exception e) {
                 log.error("Error processing response for connection {}", connectionId, e);
-                // Continue processing remaining responses
             }
+        }
+    }
+
+    /**
+     * Handles a SendResponse by serializing to HTTP and writing to the Netty channel.
+     */
+    private void handleSendResponse(RequestChannel.SendResponse sendResp, String connectionId) {
+        ChannelHandlerContext ctx = channels.get(connectionId);
+        if (ctx != null && ctx.channel().isActive()) {
+            FullHttpResponse httpResponse = buildHttpResponse(sendResp, connectionId);
+
+            // Section 12.3: If throttleTimeMs > 0, add Retry-After header
+            long throttleTimeMs = sendResp.request().apiThrottleTimeMs();
+            if (throttleTimeMs > 0) {
+                int retryAfterSeconds = Math.max(1, (int) Math.ceil(throttleTimeMs / 1000.0));
+                httpResponse.headers().setInt(HttpHeaderNames.RETRY_AFTER, retryAfterSeconds);
+            }
+
+            ctx.writeAndFlush(httpResponse).addListener(f -> inFlightCount.decrementAndGet());
+        } else {
+            log.debug("Channel closed before response could be sent: {}", connectionId);
+            inFlightCount.decrementAndGet();
+        }
+        safeUpdateMetrics(sendResp);
+        channels.remove(connectionId);
+    }
+
+    /**
+     * Builds a FullHttpResponse from a SendResponse.
+     */
+    private FullHttpResponse buildHttpResponse(RequestChannel.SendResponse sendResp, String connectionId) {
+        ApiKeys apiKey = sendResp.request().header().apiKey();
+        String requestId = connectionId + "-" + sendResp.request().header().correlationId();
+
+        java.util.concurrent.ConcurrentHashMap<String, Object> props =
+            sendResp.request().requestLocalProperties();
+        if (props != null) {
+            Object storedResponse = props.get("httpAbstractResponse");
+            if (storedResponse instanceof AbstractResponse) {
+                AbstractResponse abstractResponse = (AbstractResponse) storedResponse;
+                Object maxWaitObj = props.get("httpMaxWaitApplied");
+                int effectiveMaxWaitMs = maxWaitObj instanceof Integer ? (Integer) maxWaitObj : -1;
+                return HttpResponseSerializer.serialize(abstractResponse, requestId, apiKey, effectiveMaxWaitMs);
+            }
+        }
+        // Fallback: use response log or minimal response
+        byte[] body = serializeSendResponse(sendResp);
+        FullHttpResponse httpResponse = new DefaultFullHttpResponse(
+            HttpVersion.HTTP_1_1, HttpResponseStatus.OK, Unpooled.wrappedBuffer(body));
+        httpResponse.headers().set(HttpHeaderNames.CONTENT_TYPE, HttpHeaderValues.APPLICATION_JSON);
+        httpResponse.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length);
+        return httpResponse;
+    }
+
+    /**
+     * Handles a StartThrottlingResponse by sending 429 to the client.
+     */
+    private void handleStartThrottling(RequestChannel.Response response, String connectionId) {
+        ChannelHandlerContext ctx = channels.get(connectionId);
+        if (ctx != null && ctx.channel().isActive()) {
+            long throttleTimeMs = response.request().apiThrottleTimeMs();
+            sendThrottleResponse(ctx, throttleTimeMs);
+        }
+        inFlightCount.decrementAndGet();
+        channels.remove(connectionId);
+    }
+
+    /**
+     * Safely updates request metrics, catching any exceptions to avoid
+     * breaking the response flow.
+     */
+    private void safeUpdateMetrics(RequestChannel.Response response) {
+        try {
+            response.request().responseDequeueTimeNanos_$eq(
+                org.apache.kafka.common.utils.Time.SYSTEM.nanoseconds());
+            response.request().updateRequestMetrics(0L, response);
+        } catch (Exception e) {
+            log.debug("Failed to update request metrics: {}", e.getMessage());
         }
     }
 

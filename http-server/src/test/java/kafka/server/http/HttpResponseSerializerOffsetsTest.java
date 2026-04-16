@@ -107,12 +107,14 @@ class HttpResponseSerializerOffsetsTest {
         ObjectNode result = HttpResponseSerializer.serializeOffsetFetchResponse(response, "my-group");
 
         assertEquals("my-group", result.get("group").asText());
-        JsonNode offsets = result.get("offsets");
-        assertEquals(2, offsets.size());
-        assertEquals("orders", offsets.get(0).get("topic").asText());
-        assertEquals(0, offsets.get(0).get("partition").asInt());
-        assertEquals(150, offsets.get(0).get("offset").asLong());
-        assertEquals("test", offsets.get(0).get("metadata").asText());
+        JsonNode topics = result.get("topics");
+        assertEquals(1, topics.size());
+        assertEquals("orders", topics.get(0).get("topic").asText());
+        JsonNode partitions = topics.get(0).get("partitions");
+        assertEquals(2, partitions.size());
+        assertEquals(0, partitions.get(0).get("partition").asInt());
+        assertEquals(150, partitions.get(0).get("offset").asLong());
+        assertEquals("test", partitions.get(0).get("metadata").asText());
     }
 
     @Test
@@ -136,8 +138,12 @@ class HttpResponseSerializerOffsetsTest {
         OffsetFetchResponse response = new OffsetFetchResponse(data, ApiKeys.OFFSET_FETCH.latestVersion());
         ObjectNode result = HttpResponseSerializer.serializeOffsetFetchResponse(response, "my-group");
 
-        JsonNode offsets = result.get("offsets");
-        assertEquals(0, offsets.size());  // Negative offset = no committed offset, filtered out
+        JsonNode topics = result.get("topics");
+        assertEquals(1, topics.size());
+        JsonNode partitions = topics.get(0).get("partitions");
+        assertEquals(1, partitions.size());
+        // Partition with committedOffset=-1 means no committed offset
+        assertEquals(-1, partitions.get(0).get("offset").asLong());
     }
 
     @Test
