@@ -570,7 +570,7 @@ def sendMergedResponse(allResults: Map[TopicIdPartition, PartitionResponse]): Un
 
 > Filled by the executing agent after each commit.
 
-### 2026-04-17 — WsPublishHandler (commit pending)
+### 2026-04-17 — WsPublishHandler (commit b27d3c43b1)
 
 Created:
   - `http-server/src/main/java/kafka/server/http/ws/WsPublishHandler.java` —
