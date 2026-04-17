@@ -551,19 +551,30 @@ class WsMessageDeserializerTest {
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Mirror, don't duplicate, the header constants.** The deserializer must agree byte-for-byte with `WsMessageSerializer` on every header name, or round-trip silently corrupts data. I aliased the constants through package-private references (`HDR_EXCHANGE = WsMessageSerializer.HDR_EXCHANGE`, ...) rather than re-declaring string literals, which makes the compiler enforce the coupling at build time. Tests reference `WsMessageSerializer.HDR_*` directly so they see the one authoritative source.
+- **Never throw on malformed payload.** Delivery-path deserialization sits in a hot loop; a thrown exception stops consumption for that subscription. I wrapped JSON body parsing and `_ws_headers` parsing in try/catch with sensible fallbacks (UTF-8 string for bodies; skip the `headers` field when invalid). A `deliveryMode` header that is not parseable as int is preserved as its raw string rather than silently dropped — the client at least sees the original wire value.
+- **Single-pass header scan.** Walked the `Iterable<Header>` once into a `HashMap` keyed by header name, then looked up each field. Two passes (one to find exchange, another to find delivery-mode, etc.) would cost O(n*k) on large header lists.
+- **NullNode for null payload.** Jackson distinguishes "field absent" from "field explicitly null"; using `NullNode.getInstance()` gives the frame a `body: null` entry, which round-trips cleanly and lets clients distinguish "empty payload" from "missing body".
+- **Only `_ws_*` / `_content-type` are meaningful.** Arbitrary Kafka headers must not be promoted onto the message object — otherwise a producer injecting a header called `correlationId` would overwrite what WsMessageSerializer put under `_ws_correlation_id`. The `isWsHeader()` gate filters them out.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **Binary-body round-trip re-encodes.** The serializer stores raw bytes in the record value; the deserializer re-base64s them for the deliver frame. That costs a Base64 encode per message on the hot path. An alternative would be to pass the raw bytes through the frame as a Netty `ByteBuf` attachment, but the JSON deliver frame contract expects a base64 string for binary.
+- **Invalid JSON falls back silently.** When `_content-type: application/json` but the value is not valid JSON, we emit the UTF-8 string as the body. This is intentional (never block delivery) but the client cannot tell whether the producer sent valid JSON that survived in object form versus corrupted JSON that degraded to a string. A warning log would help observability but was out of scope.
+- **`_ws_headers` must be a JSON object.** If the header value is a JSON array, number, or string, we omit the `headers` field entirely rather than surface it as-is. The serializer only ever writes objects, so this matches WsMessageSerializer's output contract, but a malicious producer (via the binary Kafka protocol) could silently drop headers by writing e.g. `"not an object"` into `_ws_headers`.
+- **Numeric property coercion is best-effort.** `deliveryMode` / `priority` may end up as strings in the deliver frame when the header value is not parseable as int. Clients that assume these fields are always numeric will need to handle the string case.
+- **No defensive copies.** The `byte[]` inputs (`key`, `value`) are read but not copied. Callers must not mutate those arrays after calling `deserialize(...)` — the JSON body node may reference the same UTF-8 view.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- **Pre-existing scala compile errors on `feature/http-protocol`.** The HTTP module's scala sources (`HttpRequestHandler.scala`, `HttpCorsTest.scala`, `HttpGracefulShutdownTest.scala`, `HttpRequestHandlerTest.scala`) do not compile against the current Java sources — the main worktree only succeeds because its `build/classes/scala` directory is stale from before the Java interfaces changed. I verified this by running `./gradlew :http-server:compileScala --rerun-tasks` in `/home/anh/kafka` (the main checkout), which also fails with the same 23 errors. This is unrelated to WS1.10; tracking it separately is out of scope. To run the targeted tests I used `-x compileScala -x compileTestScala`.
+- **Worktree was based on pre-http-server HEAD.** The harness created the worktree at commit `f95a1f995d`, which predates the entire `http-server/` module. I had to `git rebase feature/http-protocol` before any WS1.10 work was possible. WS1.09 author hit the same issue and worked in the main checkout instead; I chose to rebase and keep the worktree isolated.
+- **WsMessageSerializer arrived mid-task.** Initially the `ws/` directory was empty. A parallel agent committed `f6e5479c12 feat: WS1.09 — WsMessageSerializer` during my rebase, which made the round-trip test viable. I added three round-trip tests (JSON, string, binary) on top of the task's specified suite to exercise the full serialize → deserialize loop.
+- **Per project memory, I did NOT run `:http-server:test` in full.** Only `--tests 'kafka.server.http.ws.WsMessageDeserializerTest'`. All 21 tests pass.
 
 ---
 
@@ -587,9 +598,11 @@ _To be filled by the executing agent._
 
 > Filled by the executing agent after each commit.
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-17 — WsMessageDeserializer initial implementation (commit eeee29346a)
+
 Created:
-  - path/to/NewFile.java — <what it does>
+  - `http-server/src/main/java/kafka/server/http/ws/WsMessageDeserializer.java` — Kafka record → deliver-frame components. Exposes the `DeliverFrame` record (exchange, routingKey, message JsonNode, partition, offset, kafkaTimestamp) and a single `deserialize(key, value, headers, partition, offset, timestamp)` entry point. Reconstructs routing metadata + all 13 AMQP properties from `_ws_*` headers, with cross-protocol synthesis when headers are absent. Body deserialization handles JSON / base64 / string / null; never throws on malformed input.
+  - `http-server/src/test/java/kafka/server/http/ws/WsMessageDeserializerTest.java` — 21 JUnit 5 tests covering routing reconstruction, body encodings, all AMQP properties, missing / null / invalid headers, non-ws header filtering, Kafka metadata passthrough, and three round-trip tests against `WsMessageSerializer` (JSON / string / binary).
+
 Modified:
-  - path/to/Existing.java — <what changed>
--->
+  - `ivy-docs/tasks/TASK-WS1.10-ws-message-deserializer.md` — filled Learning / Limitations / Field Notes / File Manifest sections.
