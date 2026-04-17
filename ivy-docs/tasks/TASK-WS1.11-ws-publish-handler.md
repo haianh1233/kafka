@@ -477,19 +477,78 @@ def sendMergedResponse(allResults: Map[TopicIdPartition, PartitionResponse]): Un
 
 ## Learning
 
-_To be filled by the executing agent._
+- The routing engine's API (`RoutingEngine.route(exchange, routingKey, headers)`) is
+  vhost-agnostic — the vhost is baked into the functional interfaces supplied to its
+  constructor (`exchangeTypeFn`, `bindingsFn`). This means a single `WsPublishHandler`
+  either shares a vhost-scoped `RoutingEngine`, or callers must scope construction per
+  vhost. For this handler the vhost is taken from `WsConnectionContext.vhost()` and is
+  only used for (a) `ExchangeManager.getExchange(vhost, name)` existence check and
+  (b) the `_ws_vhost` record header via `WsMessageSerializer`.
+- `JsonNode.fields()` is deprecated in Jackson 2.17; use `fieldNames()` + `get(name)`
+  or `properties()` instead. `-Werror` on `http-server:compileJava` catches this.
+- Checkstyle in this module caps cyclomatic complexity at 16 and NPath complexity at
+  500 — pipelined methods with sequential validation steps need to be decomposed into
+  helpers (one per stage). `handlePublish` was split into `parsePublishFrame`,
+  `runRoute`, `serializeOrError`, and `fanOut`.
+- A `ProduceRequestSink` functional interface is the cleanest seam between the
+  publish handler and the Kafka request pipeline: tests capture every hand-off as a
+  lambda; production wiring supplies a real lambda that builds a
+  `RequestChannel.Request` with a `ProduceRequest` payload and stamps
+  `requestLocalProperties.put("wsPublishId", publishId)` so
+  `HttpProcessor.handleWsResponse` can emit the correct confirm/failed frame.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **No QueueManager yet** — queue-name → Kafka-topic resolution is a
+  `Function<String,String>` placeholder. Callers pass `queue -> "ws." + queue` as the
+  default. A future task introducing `QueueManager.resolveTopicName(vhost, queue)` will
+  replace this lambda. Until then the handler cannot verify that the resolved topic
+  actually exists.
+- **Sink is not wired to RequestChannel** — `ProduceRequestSink.enqueue` is invoked,
+  but no production implementation ships in this task. The integration (building
+  `ProduceRequest` + `RequestChannel.tryEnqueue` + stamping `wsPublishId`) lives in a
+  separate wiring task (between this and `HttpProcessor.handleWsResponse`, which was
+  added in WS1.12).
+- **Publisher-confirm correlation is half-wired** — the handler stamps the
+  `publishId` onto the sink call, which the real sink is expected to copy into
+  `requestLocalProperties`. The actual `published` / `publish-failed` frames are
+  emitted by `HttpProcessor.handleWsResponse` (already in place). If confirms are
+  enabled but **no queues match** (non-mandatory drop), *no* confirm is emitted here;
+  per WS3.01 that may need to change to an immediate `published` frame — deferred.
+- **No partition math** — records are fanned out to topics as a `SerializedMessage`
+  and the sink is free to pick a partition (murmur2 of the key is the expected default).
+  This keeps the handler free of `metadataSupplier` coupling.
+- **Single-record batches** — each matched queue triggers an independent hand-off.
+  Batching N queues into one request is a potential future optimisation but
+  intentionally out of scope.
+- **Mandatory return frame carries the original message** — emitting the client's
+  message back on `returned` mirrors AMQP semantics. No extra size cap is enforced
+  beyond Jackson's configured `maxStringLength`.
+- **DLX / retry / dedup** are WS4.* features and are explicitly NOT wired here.
+- **Timeouts** for the produce hand-off are delegated to the sink / broker — this
+  handler returns to the Netty event loop immediately after `sink.enqueue()`.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Red→green was fast (one compile fail for deprecated `JsonNode.fields()`, one
+  checkstyle fail for complexity). Splitting the pipeline method into named helpers
+  both satisfied checkstyle and improved readability — each stage now has a single
+  responsibility and its own early-return semantics.
+- The test class relies on a real `WsMessageSerializer` (not a mock) because its
+  output shape is the invariant we care about — mocking it would just re-encode its
+  behaviour. The handler's produce hand-off payload is covered by the serializer's
+  own unit tests plus one end-to-end assertion here
+  (`handlePublish_validExchange_singleQueue_enqueuesOneProduce` asserts both key
+  bytes and value bytes).
+- Capturing WS frames with a mocked `ChannelHandlerContext.writeAndFlush(any())`
+  that stashes `TextWebSocketFrame.text()` worked cleanly — no `EmbeddedChannel`
+  needed, matching the pattern already established by `WsFrameHandlerTest`.
+- `ExchangeManager.getExchange` takes `(vhost, name)` — do NOT confuse with
+  `RoutingEngine.route(exchange, routingKey, headers)` which has no vhost at all.
 
 ---
 
@@ -511,9 +570,26 @@ _To be filled by the executing agent._
 
 > Filled by the executing agent after each commit.
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-17 — WsPublishHandler (commit b27d3c43b1)
+
 Created:
-  - path/to/NewFile.java — <what it does>
-Modified:
-  - path/to/Existing.java — <what changed>
--->
+  - `http-server/src/main/java/kafka/server/http/ws/WsPublishHandler.java` —
+    Publish-frame processing pipeline: parse → exchange existence check
+    (`ExchangeManager.getExchange`) → `RoutingEngine.route` → per-queue
+    `WsMessageSerializer.serialize` → sink hand-off. Emits `error` frames for
+    invalid frames / unknown exchanges / routing failures, `returned` frames
+    for mandatory messages with no matching queues, and silently drops
+    non-mandatory unrouted publishes. Exposes the nested
+    `ProduceRequestSink` functional interface as the seam for the Kafka
+    request pipeline.
+  - `http-server/src/test/java/kafka/server/http/ws/WsPublishHandlerTest.java`
+    — 16 JUnit 5 tests covering constructor validation (5), happy-path single
+    + multi-queue publishes (2), confirm-flag propagation (1), empty-route
+    mandatory vs non-mandatory (2), unknown exchange (1), malformed frames (3),
+    routing-engine failure propagation (1), and user-header propagation to
+    the routing engine (1). Real `WsMessageSerializer`; mocks for
+    `ExchangeManager`, `RoutingEngine`, Netty `ChannelHandlerContext`.
+
+Modified: none. (No existing file needed changes — `WsFrameHandler.handlePublish`
+still throws `UnsupportedOperationException`; wiring the frame handler to
+call `WsPublishHandler` is left to an integration task.)
