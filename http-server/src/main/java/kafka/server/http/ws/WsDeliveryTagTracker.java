@@ -17,6 +17,8 @@
 
 // Time: Created - TASK-WS1.13
 // Time: Update - TASK-WS3.03 - added competing consumer / group integration
+// Time: Update - TASK-WS4.01 - added peek() so DLX path can look up record location
+//                              without flipping ack state
 
 package kafka.server.http.ws;
 
@@ -213,6 +215,25 @@ public final class WsDeliveryTagTracker {
                 ackMap.put(delivery.offset(), requeue ? AckState.NACKED_REQUEUE : AckState.NACKED_DISCARD);
             }
             return delivery;
+        }
+    }
+
+    /**
+     * Returns the {@link PendingDelivery} for a tag without altering state.
+     * Used by the DLX path (TASK-WS4.01) which needs the record's
+     * {@code (TopicPartition, offset)} to look up the source queue and
+     * dead-letter the message before transitioning the tag to a terminal
+     * ACK state. Returns {@code null} for unknown tags or after
+     * {@link #clear()}.
+     *
+     * <p>Idempotent and side-effect free; safe to call concurrently.
+     */
+    public PendingDelivery peek(long deliveryTag) {
+        synchronized (lock) {
+            if (cleared) {
+                return null;
+            }
+            return pendingDeliveries.get(deliveryTag);
         }
     }
 

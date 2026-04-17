@@ -16,6 +16,7 @@
  */
 
 // Time: Created - TASK-WS1.16
+// Time: Update - TASK-WS4.01 - added DeadLetterHook integration tests
 
 package kafka.server.http.ws;
 
@@ -226,6 +227,127 @@ class WsAckHandlerTest {
 
         assertNotNull(error);
         assertTrue(error.contains("PRECONDITION_FAILED"));
+    }
+
+    // ---- DLX hook integration (TASK-WS4.01) ----
+
+    @Test
+    void handleNack_noRequeue_withDlxHook_holdsCommitUntilHookCompletes() throws Exception {
+        // Hook future left in-flight: commit watermark MUST NOT advance.
+        java.util.concurrent.CompletableFuture<Void> hookFuture =
+            new java.util.concurrent.CompletableFuture<>();
+        RecordingHook hook = new RecordingHook(hookFuture);
+        rebuildHandlerWithHook(hook);
+
+        SubscriptionContext ctx = subscriptionManager.getSubscription("sub-1");
+        long tag = ctx.deliveryTagTracker().assign(tp0, 500L);
+
+        String error = handler.handleNack("sub-1", tag, false, false);
+
+        assertNull(error);
+        assertEquals(1, hook.calls.size(), "hook called exactly once");
+        assertEquals("orders", hook.calls.get(0).queueName);
+        assertEquals(tp0, hook.calls.get(0).pd.topicPartition());
+        assertEquals(500L, hook.calls.get(0).pd.offset());
+        // Hook in-flight ⇒ tracker tag still PENDING ⇒ no commit emitted.
+        assertTrue(sink.commits().isEmpty(),
+            "commit must not advance while DLX hook is pending; got " + sink.commits());
+
+        // Now complete the hook successfully — commit should advance.
+        hookFuture.complete(null);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (sink.commits().isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        assertEquals(List.of(Map.of(tp0, 501L)), sink.commits(),
+            "commit watermark must advance after DLX produce completes");
+    }
+
+    @Test
+    void handleNack_noRequeue_withDlxHookFailure_keepsOffsetUncommitted() throws Exception {
+        // Hook future fails: tag must transition to NACKED_REQUEUE so the offset stays put.
+        java.util.concurrent.CompletableFuture<Void> hookFuture =
+            new java.util.concurrent.CompletableFuture<>();
+        RecordingHook hook = new RecordingHook(hookFuture);
+        rebuildHandlerWithHook(hook);
+
+        SubscriptionContext ctx = subscriptionManager.getSubscription("sub-1");
+        long tag = ctx.deliveryTagTracker().assign(tp0, 500L);
+
+        assertNull(handler.handleNack("sub-1", tag, false, false));
+        assertTrue(sink.commits().isEmpty());
+
+        hookFuture.completeExceptionally(new RuntimeException("kafka down"));
+        // Give the async whenComplete a moment.
+        Thread.sleep(100);
+        // Tracker is now NACKED_REQUEUE → no commit.
+        assertTrue(sink.commits().isEmpty(),
+            "DLX failure must NOT advance commit; got " + sink.commits());
+    }
+
+    @Test
+    void handleNack_noRequeue_unknownTag_doesNotInvokeDlxHook() {
+        RecordingHook hook = new RecordingHook(java.util.concurrent.CompletableFuture.completedFuture(null));
+        rebuildHandlerWithHook(hook);
+
+        String error = handler.handleNack("sub-1", 42L, false, false);
+
+        assertNotNull(error);
+        assertTrue(error.contains("PRECONDITION_FAILED"));
+        assertTrue(hook.calls.isEmpty(), "hook must not be called for unknown tag");
+    }
+
+    @Test
+    void handleNack_withRequeue_withDlxHook_doesNotInvokeHook() {
+        // requeue=true bypasses DLX entirely.
+        RecordingHook hook = new RecordingHook(java.util.concurrent.CompletableFuture.completedFuture(null));
+        rebuildHandlerWithHook(hook);
+
+        SubscriptionContext ctx = subscriptionManager.getSubscription("sub-1");
+        long tag = ctx.deliveryTagTracker().assign(tp0, 100L);
+
+        assertNull(handler.handleNack("sub-1", tag, true, false));
+        assertTrue(hook.calls.isEmpty(), "requeue path must not call DLX hook");
+        assertTrue(sink.commits().isEmpty(), "requeue must not commit");
+    }
+
+    @Test
+    void handleNack_noRequeue_withSyncHookThrow_keepsOffsetUncommitted() throws Exception {
+        // Hook throws synchronously: must be treated as DLX failure (requeue).
+        WsAckHandler.DeadLetterHook throwingHook = (q, pd) -> {
+            throw new RuntimeException("boom");
+        };
+        rebuildHandlerWithHook(throwingHook);
+
+        SubscriptionContext ctx = subscriptionManager.getSubscription("sub-1");
+        long tag = ctx.deliveryTagTracker().assign(tp0, 100L);
+
+        assertNull(handler.handleNack("sub-1", tag, false, false));
+        Thread.sleep(50);
+        assertTrue(sink.commits().isEmpty(),
+            "sync hook throw is treated as DLX failure → no commit; got " + sink.commits());
+    }
+
+    private void rebuildHandlerWithHook(WsAckHandler.DeadLetterHook hook) {
+        handler.stop();
+        sink.clear();
+        handler = new WsAckHandler(subscriptionManager, 0L, sink, null, hook);
+    }
+
+    /** Captures hook invocations and replays a caller-supplied future. */
+    private static final class RecordingHook implements WsAckHandler.DeadLetterHook {
+        record Call(String queueName, WsDeliveryTagTracker.PendingDelivery pd) { }
+        final List<Call> calls = new CopyOnWriteArrayList<>();
+        private final java.util.concurrent.CompletableFuture<Void> future;
+        RecordingHook(java.util.concurrent.CompletableFuture<Void> future) {
+            this.future = future;
+        }
+        @Override
+        public java.util.concurrent.CompletableFuture<Void> deadLetter(
+                String queueName, WsDeliveryTagTracker.PendingDelivery pd) {
+            calls.add(new Call(queueName, pd));
+            return future;
+        }
     }
 
     // ---- Batched commit timer ----
