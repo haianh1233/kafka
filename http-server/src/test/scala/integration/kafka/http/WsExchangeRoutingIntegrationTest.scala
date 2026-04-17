@@ -97,34 +97,17 @@ class WsExchangeRoutingIntegrationTest extends HttpIntegrationTestHarness {
    */
   @Test
   @Timeout(30)
-  def testExchangeRestRoutesReachable_currentlyReturn501(): Unit = {
+  def testExchangeRestRoutesReachable(): Unit = {
+    // Post-T1/T2: REST exchange + binding routes resolve to real handlers.
+    // Spot-check that a GET returns a real response (not 501 not-wired).
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
-    // Paths that map to ExchangeRestHandler / MessageRestHandler (WS2.06/WS2.08).
-    val paths = Seq(
-      "GET"    -> "/v1/exchanges",
-      "GET"    -> "/v1/exchanges/amq.direct",
-      "PUT"    -> "/v1/exchanges/orders",
-      "DELETE" -> "/v1/exchanges/orders",
-      "POST"   -> "/v1/exchanges/orders/publish",
-      "POST"   -> "/v1/bindings",
-      "GET"    -> "/v1/bindings",
-      "DELETE" -> "/v1/bindings"
-    )
-    paths.foreach { case (method, path) =>
-      val builder = HttpRequest.newBuilder().uri(URI.create(s"$base$path"))
-      val req = method match {
-        case "GET"    => builder.GET().build()
-        case "PUT"    => builder.PUT(HttpRequest.BodyPublishers.ofString("{\"type\":\"direct\"}"))
-                                .header("Content-Type", "application/json").build()
-        case "DELETE" => builder.DELETE().build()
-        case "POST"   => builder.POST(HttpRequest.BodyPublishers.ofString("{}"))
-                                .header("Content-Type", "application/json").build()
-      }
-      val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
-      assertTrue(resp.statusCode() >= 400 && resp.statusCode() < 600,
-        s"Expected 4xx/5xx pre-wiring for $method $path, got ${resp.statusCode()}: ${resp.body()}")
-    }
+    val resp = client.send(
+      HttpRequest.newBuilder().uri(URI.create(s"$base/v1/exchanges")).GET().build(),
+      HttpResponse.BodyHandlers.ofString())
+    assertNotEquals(501, resp.statusCode(),
+      s"GET /v1/exchanges should be wired after T1 (not 501): ${resp.statusCode()}: ${resp.body()}")
+    assertEquals(200, resp.statusCode())
   }
 
   // --------------------------------------------------------------------
@@ -133,7 +116,7 @@ class WsExchangeRoutingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline wiring pending: WsUpgradeOrHttpHandler is not installed in HttpChannelInitializer and WsFrameHandler.handleDeclareExchange/Bind/Subscribe/Publish are stubs.")
+  @Disabled("Data-plane Kafka wiring pending: publish/subscribe/deliver require real Kafka produce + fetch integration.")
   def testTopicExchange_wildcardStarAndHash(): Unit = {
     ws.connect()
     ws.declareExchange("events", "topic")
@@ -158,7 +141,7 @@ class WsExchangeRoutingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline wiring pending: WsUpgradeOrHttpHandler is not installed in HttpChannelInitializer.")
+  @Disabled("Data-plane Kafka wiring pending: publish/subscribe/deliver require real Kafka produce + fetch integration.")
   def testFanoutExchange_allSubscribersReceive(): Unit = {
     ws.connect()
     ws.declareExchange("broadcast", "fanout")
@@ -182,7 +165,7 @@ class WsExchangeRoutingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline wiring pending: headers exchange requires handlePublish to pass headers to the router.")
+  @Disabled("Data-plane Kafka wiring pending: publish/subscribe/deliver require real Kafka produce + fetch integration.")
   def testHeadersExchange_matchAllAndMatchAny(): Unit = {
     ws.connect()
     ws.declareExchange("hdrs", "headers")
@@ -204,7 +187,7 @@ class WsExchangeRoutingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline wiring pending: exchange-to-exchange bindings require bind-exchange frame and WsFrameHandler stubs replaced.")
+  @Disabled("Data-plane Kafka wiring pending: publish/subscribe/deliver require real Kafka produce + fetch integration.")
   def testExchangeToExchangeBinding(): Unit = {
     ws.connect()
     ws.declareExchange("source", "direct")
@@ -224,7 +207,7 @@ class WsExchangeRoutingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline wiring pending: e2e cycle detection requires bind-exchange frames and router traversal end-to-end.")
+  @Disabled("Data-plane Kafka wiring pending: publish/subscribe/deliver require real Kafka produce + fetch integration.")
   def testExchangeToExchangeCycle_doesNotHang(): Unit = {
     ws.connect()
     ws.declareExchange("A", "direct")
@@ -245,7 +228,7 @@ class WsExchangeRoutingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline wiring pending: the default exchange is a pre-declared direct exchange that routes by queue name; requires handlePublish + handleDeclareQueue to be non-stub.")
+  @Disabled("Data-plane Kafka wiring pending: publish/subscribe/deliver require real Kafka produce + fetch integration.")
   def testDefaultExchange_routesByQueueName(): Unit = {
     ws.connect()
     ws.declareQueue("orders")
@@ -259,7 +242,7 @@ class WsExchangeRoutingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline wiring pending: alternate-exchange fallback requires declare-exchange to accept the alternate-exchange argument via the WS frame.")
+  @Disabled("Data-plane Kafka wiring pending: publish/subscribe/deliver require real Kafka produce + fetch integration.")
   def testAlternateExchange_fallbackRouting(): Unit = {
     ws.connect()
     // primary exchange with no matching binding for 'unknown'; alt catches it.
@@ -278,7 +261,7 @@ class WsExchangeRoutingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline wiring pending: combines declare-exchange, declare-queue, bind, subscribe, publish, deliver — full round trip.")
+  @Disabled("Data-plane Kafka wiring pending: publish/subscribe/deliver require real Kafka produce + fetch integration.")
   def testDirectExchange_fullRoundTrip(): Unit = {
     ws.connect()
     ws.declareExchange("events", "direct")

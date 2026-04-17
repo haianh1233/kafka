@@ -186,7 +186,7 @@ class WsCrossProtocolIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline not yet wired: WsUpgradeOrHttpHandler is not installed in HttpChannelInitializer. Enable after WS pipeline wiring task lands.")
+  @Disabled("Data-plane Kafka wiring pending: WS publish/subscribe/deliver require real Kafka produce + fetch integration (post-T3 control plane works).")
   def testWsPublish_httpFetch(): Unit = {
     ws.connect()
     ws.declareExchange("events", "direct")
@@ -212,7 +212,7 @@ class WsCrossProtocolIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline not yet wired: handleSubscribe/WsConsumerFetchLoop stubs cannot deliver records to the test client.")
+  @Disabled("Data-plane Kafka wiring pending: WS publish/subscribe/deliver require real Kafka produce + fetch integration (post-T3 control plane works).")
   def testHttpProduce_wsDeliver(): Unit = {
     ws.connect()
     ws.declareQueue(queueName)
@@ -234,7 +234,7 @@ class WsCrossProtocolIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline not yet wired: handleSubscribe/WsConsumerFetchLoop stubs cannot deliver records to the test client.")
+  @Disabled("Data-plane Kafka wiring pending: WS publish/subscribe/deliver require real Kafka produce + fetch integration (post-T3 control plane works).")
   def testKafkaProducer_wsDeliver(): Unit = {
     ws.connect()
     ws.declareQueue(queueName)
@@ -257,7 +257,7 @@ class WsCrossProtocolIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS pipeline not yet wired: handlePublish stub + RoutingEngine not connected to a producer; Kafka consumer would never see WS-published records on the backing topic.")
+  @Disabled("Data-plane Kafka wiring pending: WS publish/subscribe/deliver require real Kafka produce + fetch integration (post-T3 control plane works).")
   def testWsPublish_kafkaConsumer(): Unit = {
     ws.connect()
     ws.declareExchange("events", "direct")
@@ -287,7 +287,7 @@ class WsCrossProtocolIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("WS REST handlers (ExchangeRestHandler/MessageRestHandler) default to null in HttpRequestHandler; /v1/exchanges/{name}/publish currently returns 501 not-wired. Enable once REST handlers are passed into HttpAcceptor wiring.")
+  @Disabled("Data-plane Kafka wiring pending: REST publish path wired but sinks are stubs; real produce/fetch deferred.")
   def testRestPublish_wsDeliver(): Unit = {
     ws.connect()
     ws.declareExchange("events", "direct")

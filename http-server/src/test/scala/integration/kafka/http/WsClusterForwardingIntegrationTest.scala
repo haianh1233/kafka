@@ -347,7 +347,7 @@ class WsClusterForwardingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(60)
-  @Disabled("WS pipeline wiring pending: WsUpgradeOrHttpHandler is not installed in HttpChannelInitializer, so WebSocket upgrade fails on every broker. Enable after WS pipeline wiring task lands.")
+  @Disabled("Data-plane Kafka wiring pending: multi-broker WS publish/subscribe/deliver requires real Kafka produce + fetch integration.")
   def testWsPublishOnBroker0_wsConsumeOnBroker2(): Unit = {
     // Cross-broker WS publish / consume on a queue backed by ws.cluster-queue.
     val publisher = new WsTestClient(httpUrl(0))
@@ -375,7 +375,7 @@ class WsClusterForwardingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(60)
-  @Disabled("WS pipeline wiring pending: WsRoutingMetadataManager is not yet installed on the brokers, so metadata replication across brokers can't be exercised end-to-end. Enable after WS pipeline wiring task lands.")
+  @Disabled("Data-plane Kafka wiring pending: multi-broker WS publish/subscribe/deliver requires real Kafka produce + fetch integration.")
   def testMetadataPropagation_declareOnB0_subscribeOnB1(): Unit = {
     val ws0 = new WsTestClient(httpUrl(0))
     val ws1 = new WsTestClient(httpUrl(1))
@@ -417,7 +417,7 @@ class WsClusterForwardingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(60)
-  @Disabled("WS pipeline wiring pending: WsConsumerGroupCoordinator isn't yet installed on the brokers, so competing consumers across brokers can't be exercised. Enable after WS pipeline wiring task lands.")
+  @Disabled("Data-plane Kafka wiring pending: multi-broker WS publish/subscribe/deliver requires real Kafka produce + fetch integration.")
   def testCompetingConsumers_acrossBrokers(): Unit = {
     val ws0 = new WsTestClient(httpUrl(0))
     val ws1 = new WsTestClient(httpUrl(1))
