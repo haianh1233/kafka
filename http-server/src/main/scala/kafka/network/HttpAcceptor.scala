@@ -29,7 +29,10 @@ import io.netty.handler.ssl.SslContext
 import kafka.server.http.HttpProcessor
 import kafka.server.http.rest.{BindingRestHandler, ConnectionRestHandler, ConsumerRestHandler, ExchangeRestHandler, MessageRestHandler, QueueRestHandler, VhostRestHandler}
 import kafka.server.http.routing.{BindingManager, ExchangeManager, RoutingEngine, VhostManager}
-import kafka.server.http.ws.{WsConfigs, WsConnectionRegistry, WsMessageSerializer, WsRoutingMetadataManager}
+import kafka.server.http.ws.{WiredWsFrameHandler, WsConfigs, WsConnectionContext, WsConnectionRegistry, WsMessageSerializer, WsRoutingMetadataManager, WsUpgradeOrHttpHandler}
+import io.netty.channel.ChannelHandler
+import org.apache.kafka.common.security.auth.SecurityProtocol
+import org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder
 import kafka.utils.Logging
 import org.apache.kafka.common.Endpoint
 import org.apache.kafka.common.utils.Time
@@ -124,6 +127,7 @@ class HttpAcceptor(
   @volatile private var _vhostRestHandler: VhostRestHandler = _
   @volatile private var _messageRestHandler: MessageRestHandler = _
   @volatile private var _wsConnectionRegistry: WsConnectionRegistry = _
+  @volatile private var _wsUpgradeHandlerFactory: () => WsUpgradeOrHttpHandler = _
 
   private def buildRestHandlerStack(): Unit = {
     if (_exchangeRestHandler != null) return // already built
@@ -202,7 +206,25 @@ class HttpAcceptor(
       stubGetSink,
       stubAckSink
     )
+
+    // T3: frame-handler factory — constructs WiredWsFrameHandler per connection.
+    // Only control-plane (declare-exchange / declare-queue / bind / unbind /
+    // unsubscribe) is wired; publish/subscribe/ack/nack/credits/get remain
+    // stubbed and return INTERNAL_ERROR via WsFrameHandler's catch arm.
+    val frameHandlerFactory: java.util.function.Function[WsConnectionContext, ChannelHandler] =
+      (connCtx: WsConnectionContext) =>
+        new WiredWsFrameHandler(connCtx, wsConfigs, exchangeManager, bindingManager)
+    _wsUpgradeHandlerFactory = () => new WsUpgradeOrHttpHandler(
+      wsConfigs, brokerId, clusterId,
+      new DefaultKafkaPrincipalBuilder(null, null),
+      SecurityProtocol.HTTP,
+      null, // no resource limit manager
+      frameHandlerFactory
+    )
   }
+
+  /** T3: exposed for HttpChannelInitializer — builds a fresh upgrade handler per pipeline. */
+  def wsUpgradeHandlerFactory: () => WsUpgradeOrHttpHandler = _wsUpgradeHandlerFactory
 
   override def setRequestChannel(requestChannel: RequestChannel): Unit = {
     _requestChannel = requestChannel
@@ -265,7 +287,8 @@ class HttpAcceptor(
         connectionRestHandler = _connectionRestHandler,
         consumerRestHandler = _consumerRestHandler,
         vhostRestHandler = _vhostRestHandler,
-        messageRestHandler = _messageRestHandler))
+        messageRestHandler = _messageRestHandler,
+        wsUpgradeHandlerFactory = _wsUpgradeHandlerFactory))
 
     val host = if (endpoint.host() == null || endpoint.host().isEmpty) "0.0.0.0" else endpoint.host()
     try {

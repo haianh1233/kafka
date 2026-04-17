@@ -24,6 +24,7 @@ import io.netty.handler.ssl.SslContext
 import io.netty.handler.timeout.IdleStateHandler
 import kafka.server.http.{HttpMetrics, HttpProcessor, HttpProtocolNegotiationHandler, HttpServerConfigs, IdleStateCloseHandler}
 import kafka.server.http.rest.{BindingRestHandler, ConnectionRestHandler, ConsumerRestHandler, ExchangeRestHandler, MessageRestHandler, QueueRestHandler, VhostRestHandler}
+import kafka.server.http.ws.WsUpgradeOrHttpHandler
 import org.apache.kafka.common.security.auth.{KafkaPrincipalBuilder, SecurityProtocol}
 import org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder
 
@@ -77,7 +78,10 @@ class HttpChannelInitializer(
   connectionRestHandler: ConnectionRestHandler = null,
   consumerRestHandler: ConsumerRestHandler = null,
   messageRestHandler: MessageRestHandler = null,
-  vhostRestHandler: VhostRestHandler = null
+  vhostRestHandler: VhostRestHandler = null,
+  // T3: factory for WsUpgradeOrHttpHandler — new instance per pipeline so
+  // pipeline mutations stay isolated. null = WS disabled (pre-T3 behavior).
+  wsUpgradeHandlerFactory: () => WsUpgradeOrHttpHandler = null
 ) extends ChannelInitializer[SocketChannel] {
 
   // Build CORS config once at initialization time, reused for every channel
@@ -120,6 +124,13 @@ class HttpChannelInitializer(
     pipeline.addLast("idle-handler", new IdleStateHandler(
       0, 0, connectionIdleTimeoutMs, TimeUnit.MILLISECONDS))
     pipeline.addLast("idle-closer", new IdleStateCloseHandler(httpMetrics))
+
+    // T3: install WS upgrade handler BEFORE the main HTTP handler so it can
+    // intercept GET /v1/ws Upgrade requests and rewire the pipeline.
+    if (wsUpgradeHandlerFactory != null) {
+      pipeline.addLast("ws-or-http", wsUpgradeHandlerFactory())
+    }
+
     pipeline.addLast("kafka-handler",
       new HttpRequestHandler(principalBuilder, securityProtocol, draining, inFlightCount,
         brokerId, clusterId, requestChannel, httpProcessor, metadataSupplier, topicIdSupplier, httpServerConfigs,

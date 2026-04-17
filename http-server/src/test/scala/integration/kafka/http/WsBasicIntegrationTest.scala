@@ -69,7 +69,7 @@ class WsBasicIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   @Test
-  @Disabled("WS pipeline not yet wired: WsUpgradeOrHttpHandler is not added to HttpChannelInitializer. Enable after WS pipeline wiring task.")
+  // T3: enabled — WsUpgradeOrHttpHandler wired into HttpChannelInitializer.
   def testConnectAndDisconnect(): Unit = {
     wsClient.connect()
     // connected message already validated in connect()
@@ -77,7 +77,7 @@ class WsBasicIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   @Test
-  @Disabled("WS pipeline not yet wired + WsFrameHandler.handleDeclareExchange/handleDeclareQueue are stubs.")
+  // T3: enabled — WiredWsFrameHandler overrides handleDeclareExchange/handleDeclareQueue.
   def testDeclareExchangeAndQueue(): Unit = {
     wsClient.connect()
 
@@ -89,7 +89,7 @@ class WsBasicIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   @Test
-  @Disabled("WS pipeline not yet wired + handleBind is a stub.")
+  // T3: enabled — WiredWsFrameHandler overrides handleBind.
   def testBindAndRoute(): Unit = {
     wsClient.connect()
 
@@ -100,7 +100,7 @@ class WsBasicIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   @Test
-  @Disabled("WS pipeline not yet wired + handlePublish/handleSubscribe are stubs, WsSubscriptionManager.doFetchIteration is a no-op.")
+  @Disabled("Data-plane Kafka wiring pending: handlePublish needs Kafka produce, handleSubscribe needs real consumer + doFetchIteration. Deferred until RequestChannel integration or in-process KafkaProducer/Consumer wiring.")
   def testPublishSubscribeDeliver(): Unit = {
     wsClient.connect()
 
@@ -123,7 +123,7 @@ class WsBasicIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   @Test
-  @Disabled("WS pipeline not yet wired + handleAck stub + WsAckHandler.OffsetCommitSink not wired to a real commit path.")
+  @Disabled("Requires data-plane Kafka wiring: publish/subscribe/ack need real Kafka produce/fetch/commit round-trip.")
   def testAckCommitsOffset(): Unit = {
     wsClient.connect()
 
@@ -150,7 +150,7 @@ class WsBasicIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   @Test
-  @Disabled("WS pipeline not yet wired + full producer→broker→consumer flow requires all WS1.* stubs to be implemented.")
+  @Disabled("Requires data-plane Kafka wiring: full produce→broker→consumer round-trip.")
   def testFullRoundTrip(): Unit = {
     wsClient.connect()
 
@@ -187,14 +187,12 @@ class WsBasicIntegrationTest extends HttpIntegrationTestHarness {
   // --------------------------------------------------------------------
 
   /**
-   * The WS endpoint path `/v1/ws` is reserved for WebSocket upgrades.  Until
-   * `WsUpgradeOrHttpHandler` is installed in the pipeline, the path is unknown
-   * to `HttpRouter` and falls through to the default 404 handler.  This test
-   * pins the pre-wiring behaviour so the transition can be detected by test
-   * output: once WS is wired, this test MUST be updated or removed.
+   * The WS endpoint path `/v1/ws` is reserved for WebSocket upgrades. After
+   * T3 the `WsUpgradeOrHttpHandler` is installed; a plain GET (no upgrade
+   * headers) passes through and yields 404 (no HTTP route matches /v1/ws).
    */
   @Test
-  def testWsEndpointNotYetWired(): Unit = {
+  def testWsEndpoint_plainGetReturns404(): Unit = {
     import java.net.URI
     import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 
@@ -205,11 +203,9 @@ class WsBasicIntegrationTest extends HttpIntegrationTestHarness {
         .GET()
         .build()
       val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
-      // Any non-success response is acceptable pre-wiring; most likely a 404.
-      // The assertion asserts that the server is REACHABLE and responds over
-      // HTTP — the whole harness is healthy and ready for WS wiring to land.
-      assertTrue(resp.statusCode() >= 400 && resp.statusCode() < 600,
-        s"Expected 4xx/5xx before WS wiring, got ${resp.statusCode()}")
+      // Post-T3: plain GET (no Upgrade header) passes through → HTTP router → 404.
+      assertEquals(404, resp.statusCode(),
+        s"Plain GET /v1/ws should be 404 (no HTTP route), got ${resp.statusCode()}")
     } finally {
       // java.net.http.HttpClient has no close() on Java 17/21 — GC cleans up.
     }

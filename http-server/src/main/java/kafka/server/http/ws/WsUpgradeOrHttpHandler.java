@@ -58,6 +58,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 
 /**
  * Detects WebSocket upgrade requests on {@code GET /v1/ws} and switches the
@@ -129,6 +130,13 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
     private final WsResourceLimitManager resourceLimitManager;
 
     /**
+     * T3: optional factory for the real {@link WsFrameHandler} installed after
+     * the handshake completes. When {@code null}, the pre-existing no-op
+     * placeholder is installed (which preserves WS1.03 unit-test semantics).
+     */
+    private final Function<WsConnectionContext, ChannelHandler> frameHandlerFactory;
+
+    /**
      * TASK-WS3.07: when set, new WebSocket upgrade requests are rejected with
      * HTTP 503. Flipped via {@link #beginDrain()} during graceful shutdown and
      * never reset — the handler is single-use per shutdown lifecycle.
@@ -158,12 +166,30 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
             KafkaPrincipalBuilder principalBuilder,
             SecurityProtocol securityProtocol,
             WsResourceLimitManager resourceLimitManager) {
+        this(wsConfigs, brokerId, clusterId, principalBuilder, securityProtocol,
+             resourceLimitManager, null);
+    }
+
+    /**
+     * T3: full constructor. The {@code frameHandlerFactory} supplies the real
+     * {@link WsFrameHandler} for each new connection. When {@code null} the
+     * placeholder no-op handler is installed (kept for WS1.03 unit tests).
+     */
+    public WsUpgradeOrHttpHandler(
+            WsConfigs wsConfigs,
+            int brokerId,
+            String clusterId,
+            KafkaPrincipalBuilder principalBuilder,
+            SecurityProtocol securityProtocol,
+            WsResourceLimitManager resourceLimitManager,
+            Function<WsConnectionContext, ChannelHandler> frameHandlerFactory) {
         this.wsConfigs = Objects.requireNonNull(wsConfigs, "wsConfigs");
         this.brokerId = brokerId;
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
         this.principalBuilder = Objects.requireNonNull(principalBuilder, "principalBuilder");
         this.securityProtocol = Objects.requireNonNull(securityProtocol, "securityProtocol");
         this.resourceLimitManager = resourceLimitManager;
+        this.frameHandlerFactory = frameHandlerFactory;
     }
 
     /**
@@ -347,20 +373,22 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
             removeIfPresent(pipeline, HTTP_AGGREGATOR_NAME);
             removeIfPresent(pipeline, COMPRESSOR_NAME);
 
-            // Install WebSocket handlers BEFORE removing ourselves so they end up
-            // in the same relative position in the pipeline.
-            pipeline.addAfter(HANDLER_NAME, WS_HANDLER_NAME, placeholderFrameHandler());
-            pipeline.addAfter(HANDLER_NAME, WS_FRAME_AGGREGATOR_NAME,
-                    new WebSocketFrameAggregator(wsConfigs.maxFrameSize()));
-
-            // 4. Build the per-connection context.  Stored via AttributeKey so later
-            //    handlers in the pipeline can retrieve it.  (TASK-WS1.04 will wire this
-            //    into WsFrameHandler.)
+            // 4. Build the per-connection context FIRST — the real frame
+            //    handler (T3+) may capture the context in its constructor.
             InetSocketAddress remote = remoteAddress(ctx.channel().remoteAddress());
             String sessionId = generateSessionId();
             WsConnectionContext connCtx = new WsConnectionContext(
                     sessionId, principal, vhost, ctx, remote);
             ctx.channel().attr(WsAttributes.CONNECTION_CONTEXT).set(connCtx);
+
+            // Install WebSocket handlers BEFORE removing ourselves so they end up
+            // in the same relative position in the pipeline.
+            ChannelHandler frameHandler = (frameHandlerFactory != null)
+                    ? frameHandlerFactory.apply(connCtx)
+                    : placeholderFrameHandler();
+            pipeline.addAfter(HANDLER_NAME, WS_HANDLER_NAME, frameHandler);
+            pipeline.addAfter(HANDLER_NAME, WS_FRAME_AGGREGATOR_NAME,
+                    new WebSocketFrameAggregator(wsConfigs.maxFrameSize()));
 
             // 5. Emit `connected` frame.
             String connectedJson = buildConnectedJson(sessionId);
