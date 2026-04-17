@@ -225,19 +225,26 @@ cd /home/anh/kafka && ./gradlew :http-server:test --tests 'kafka.server.http.rou
 
 ## Learning
 
-_To be filled by the executing agent._
+- API shape deliberately diverges from `DirectMatcher.match(List<Binding>, String)`: fanout takes `Collection<String>` because routing-key/headers/arguments are irrelevant, so the caller can reuse a cached flat queue-name list (anticipating the Phase 2 fanout binding index) without paying to re-box Binding records on every publish.
+- `Set.of()` is used for the empty-input fast path to avoid allocating a throwaway `HashSet`. Matches the Phase 1 `DirectMatcher` empty-bindings branch, so the `RoutingEngine` dispatch table sees consistent immutable-vs-mutable return conventions across matchers.
+- Added `Objects.requireNonNull(boundQueues, ...)` even though the task skeleton omitted it — every sibling matcher (DirectMatcher) null-checks its binding collection, and we want a fast, attributable NPE rather than one buried inside `HashSet` copy.
+- Duplicate-queue dedup is a free property of `HashSet`, not an explicit filter — this is why `match()` can accept the raw `b.queue()` stream from the ivy-ref loop without an intermediate "unique queues" pass.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- Not yet wired into `RoutingEngine.matchQueueBindings` — the `"fanout"` branch still throws `UnsupportedOperationException`. Wiring is deferred per the WS2.02 task-card pre-flight note ("THIS task creates the matcher — wiring into the dispatch table is deferred"). The wiring task will also need to decide whether to extract `queue()` at the call site or cache a fanout-specific binding index.
+- Fanout exchange-to-exchange (e2e) routing is likewise deferred: `RoutingEngine.e2eMatches` only handles `"direct"`. Fanout e2e semantics (all e2e bindings match) belong to the wiring task, not this one.
+- `boundQueues` is expected non-null; a null argument produces an NPE rather than an empty set. Chose fail-fast over silent-empty so a broken caller surfaces immediately in tests.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- TDD loop: RED (compile error, 9 `cannot find symbol` on `FanoutMatcher`) → GREEN (7/7 PASS on first implementation). No refactor phase needed — the implementation is a two-line delegate to `HashSet` copy.
+- Task-file skeleton showed 6 tests; shipped 7 by adding `match_extractedFromBindings_headersIgnored` which exercises the intended call pattern (pull `queue()` off real `Binding` records with non-trivial `arguments`). This locks the contract that arguments/headers are irrelevant to fanout, which would otherwise only be implicit.
+- Pre-flight `git log --oneline -1` returned `f95a1f995d` (a drifted worktree); `git fetch origin && git reset --hard origin/feature/http-protocol` brought the worktree to the expected `0c9549098f` HEAD before any work began.
 
 ---
 
@@ -262,3 +269,8 @@ Created:
 Modified:
   - path/to/Existing.java — <what changed>
 -->
+
+### 2026-04-17 — FanoutMatcher + tests (commit 33788de005)
+Created:
+  - http-server/src/main/java/kafka/server/http/routing/FanoutMatcher.java — stateless utility that returns all bound queue names as a deduplicated Set, ignoring routing key; O(K) HashSet copy with Set.of() fast-path for empty input.
+  - http-server/src/test/java/kafka/server/http/routing/FanoutMatcherTest.java — 7 JUnit 5 tests covering empty bindings, single/multiple queues, duplicate dedup, routing-key invariance across keys, null routing key, and the extract-from-Binding caller pattern (headers/arguments ignored).
