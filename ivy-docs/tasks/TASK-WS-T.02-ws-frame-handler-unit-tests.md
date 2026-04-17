@@ -224,19 +224,67 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsFrameHan
 
 ## Learning
 
-_To be filled by the executing agent._
+- The existing `WsFrameHandlerTest` (36 tests) already covers per-type dispatch,
+  null-guards, every malformed-JSON variant, and the `enable-confirms`
+  behavioural path. Anything new has to target *cross-cutting* behaviour —
+  multi-frame sequences, isolation between connections, or degradation modes
+  that the single-frame tests can't express.
+- `WsFrameHandler` has **no static mutable state** — the shared `ObjectMapper`
+  is the only static, and `ObjectMapper.readTree` is documented thread-safe.
+  That is why two handlers on two threads happily interleave without locks;
+  the concurrent test asserts the absence of cross-talk rather than per-handler
+  concurrency (Netty itself guarantees single-threaded delivery per channel).
+- `textOrNull` treats non-textual `id` fields (number, array, object) as
+  missing. The handler therefore tolerates `{"id":42}` or `{"id":[1,2,3]}`
+  without throwing; the outbound error frame just omits the `id` field. This
+  is a defensive degradation worth pinning down explicitly in tests.
+- The dispatch switch catches both `UnsupportedOperationException` (stub
+  handlers) and generic `RuntimeException`. The extended tests add coverage
+  for `IllegalArgumentException` in the generic arm, complementing the
+  existing `IllegalStateException` assertion.
+- Driving `channelRead` rather than a full `EmbeddedChannel` keeps the tests
+  fast and removes the overhead of simulating handshake + frame aggregator —
+  but it means anything above the frame handler (aggregator, handshake) is
+  untested here. `WsUpgradeOrHttpHandlerTest` already covers that boundary.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- These tests focus on frame-handler behaviour only. They do **not** wire an
+  `EmbeddedChannel` to exercise the full HTTP→WS upgrade→frame dispatch
+  pipeline — that integration concern is already covered by
+  `WsUpgradeOrHttpHandlerTest` and is left intentionally out of scope here to
+  avoid duplicating setup code.
+- Rate limiting, metrics rate-limit effects, and real subscription managers
+  are mocked away. The tests use anonymous subclasses of `WsFrameHandler` to
+  override handler methods — this means the production handler wiring (once
+  real handlers exist) is exercised only indirectly via the stub-throws
+  `UnsupportedOperationException` path.
+- The concurrency test uses 4 threads × 50 frames per thread on independent
+  handlers. It proves no static mutable state leaks; it does **not** assert
+  safety of concurrent writes to a single handler instance (which Netty's
+  threading model forbids anyway).
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Initial checkstyle run failed with 15 `LeftCurly` violations because I had
+  written the 15 handler overrides on single lines (`{ hit.add("x"); }`).
+  Kafka's checkstyle config requires `{` to be followed by a line break.
+  Expanded the overrides to multi-line form to pass.
+- RED/GREEN discipline: I wrote the test file first targeting behaviour the
+  production code already supports (since this is test-only work). Ran the
+  suite, saw all 11 pass on first compile-clean run, no production-code
+  changes required.
+- The WsFrameHandler's `channelRead` (inherited from
+  `SimpleChannelInboundHandler`) is the right entry point for these tests —
+  it handles the type check and auto-release, matching how Netty would
+  deliver frames. Calling `channelRead0` directly works too but skips the
+  release safety net.
+
+---
 
 ---
 
@@ -251,4 +299,29 @@ _To be filled by the executing agent._
 
 ## File Manifest
 
-_To be filled by the executing agent._
+### Added
+
+- `http-server/src/test/java/kafka/server/http/ws/WsFrameHandlerExtendedTest.java`
+  — 11 cross-cutting supplementary tests complementing the 36 already in
+  `WsFrameHandlerTest`. Tests cover:
+    1. `sequentialFrames_eachDispatchedIndependently`
+    2. `invalidFrameDoesNotPoisonSubsequentDispatch`
+    3. `enableConfirmsPersistsAcrossLaterFrames`
+    4. `twoConnections_independentStateAndFrames`
+    5. `concurrentDispatch_acrossConnections_noCrossTalk`
+    6. `channelInactive_clearsSubscriptionsPopulatedByHandler`
+    7. `numericCorrelationId_degradesToNull_andDispatchStillHappens`
+    8. `arrayCorrelationId_degradesToNull_onUnknownType`
+    9. `illegalArgumentException_inHandler_emitsInternalErrorWithCorrelationId`
+    10. `fullDispatchSequence_allTypesReachTheirHandlers`
+    11. `largeButValidJsonPayload_dispatchesCleanly`
+
+### Modified
+
+- `ivy-docs/tasks/TASK-WS-T.02-ws-frame-handler-unit-tests.md` —
+  Learning / Limitations / Field Notes / File Manifest sections filled in.
+
+### Unchanged
+
+- `http-server/src/main/java/kafka/server/http/ws/WsFrameHandler.java` —
+  production code was not modified (test-only task).
