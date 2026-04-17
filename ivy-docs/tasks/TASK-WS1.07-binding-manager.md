@@ -757,19 +757,43 @@ public void removeQueue(String queue) {
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Per-exchange monitor + COW list gives correctness without global locks.** The bind path is a check-then-add (scan for dup → check quota → append). A `CopyOnWriteArrayList` alone is not enough — two concurrent identical `bind()` calls could both pass the scan and both append. A `ConcurrentHashMap<String, Object>` of per-exchange monitors, entered as `synchronized(lockFor(exchange))`, serializes only the critical section for a given exchange while leaving reads and cross-exchange writes fully concurrent. The concurrency stress test (`concurrentBindUnbind_doesNotCorruptIndex`) catches this — drop the synchronized block and the listByExchange count diverges from the sum across queues under 8-thread contention.
+- **Dedup must compare `arguments`, not just `(queue, routingKey)`.** The ivy-ref `Amqp091RoutingEngine.bind()` comment in the task spec explicitly calls this out. Headers-exchange bindings with the same routing key but different `x-match` rules are semantically distinct; using `Binding.equals()` (record-default, compares all four fields) as the dedup predicate preserves them correctly. The test `bind_sameQueueKeyDifferentArgs_createsBoth` is the regression guard.
+- **`unbind()` matches on `(queue, routingKey)` only, not arguments.** This is deliberate and matches AMQP 0-9-1 semantics — the broker cannot expect clients to re-send the full argument map on unbind. It implies that `bind()` with different args followed by a single `unbind()` deletes ALL matching bindings for that (queue, routingKey). Documented in the Javadoc.
+- **`CopyOnWriteArrayList.removeIf` is atomic wrt iterators** — we do not need the synchronized block for unbind or for cleanup (removeAllForExchange / removeAllForQueue), only for the check-then-add in bind. This matters: cascade cleanup can run concurrently with reads on other exchanges without contention.
+- **`List.copyOf()` returns a truly immutable snapshot.** This is the right API for `listByExchange` — the caller gets a frozen view that cannot observe concurrent mutations even if the underlying COW list is modified later, which is what `listByExchange_returnsSnapshot_notLiveView` asserts.
+- **Functional-predicate injection for validation is cheap and testable.** The manager takes `Predicate<String> exchangeExistsFn` / `queueExistsFn` instead of concrete manager references. Tests pass `Set::contains`; production wiring will pass `exchangeManager::exchangeExists` / `queueManager::queueExists` method references. No test doubles required.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **Not integrated with `WsRoutingMetadataManager.writeBinding` / `deleteBinding`** — this task follows the authoritative task spec (§Specification), which treats persistence as "a persistence callback in Phase 1 stub form". Bindings are in-memory only; they do not survive broker restart and do not replay across nodes. Integration with the metadata topic is a follow-up task (likely as part of WS1.11 / publish-handler wiring, where bindings first need to be durable for routing to be correct on restart).
+- **Not vhost-aware.** The task spec uses a flat exchange-name keyspace (no `(vhost, exchange)` tuple), whereas ExchangeManager and WsRoutingMetadataManager are vhost-aware. For Phase 1 single-vhost ("/") this is fine; multi-vhost support (planned for WS2.09) will require adding a vhost dimension to both the `bindingsByExchange` key and the constructor predicates. The callsite will need to pass a vhost-scoped predicate (e.g. `name -> exchangeManager.getExchange(vhost, name) != null`).
+- **`queueExistsFn` is a placeholder — QueueManager does not yet exist.** The task spec's `queueExistsFn` is declared as a functional interface specifically so BindingManager can be built and tested before QueueManager (which is a separate, deferred task) lands. Once QueueManager exists, the production wiring will pass `queueManager::queueExists` as the predicate; no changes to BindingManager are required.
+- **Default exchange `""` is not special-cased.** AMQP 0-9-1 auto-binds every queue to the default exchange with the queue name as the routing key. BindingManager does not handle this — the caller must explicitly `bind("", queueName, queueName, Map.of())` when a queue is declared. Wiring this into QueueManager is deferred.
+- **`bindingCount(exchange)` reflects only in-memory state.** If the metadata topic integration lands later and does an async replay, callers relying on this for quota decisions during replay may observe stale counts momentarily. Not an issue while Phase 1 is in-memory only.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Package placement: the task file specifies `kafka.server.http.routing` (peer of `ExchangeManager`), so this task uses that package rather than `kafka.server.http.ws` despite the invocation preamble's alternative guidance. ExchangeManager already lives there; BindingManager fits alongside it.
+- Chose `ConcurrentHashMap<String, Object>` for per-exchange locks rather than one big `synchronized(this)` or a `ReadWriteLock`. The former would serialize all exchanges against each other; the latter is heavier and `bind()` needs write-mode for the check-then-add so it would degenerate to an exclusive lock anyway. Per-exchange monitors keep the hot path (reads + cross-exchange writes) fully parallel.
+- `totalBindingCount()` iterates the exchange map once; with ConcurrentHashMap it's weakly consistent (may miss concurrent inserts) but does not throw `ConcurrentModificationException`. Good enough for metrics; do not use for correctness decisions.
+- `removeAllForExchange()` does three things atomically-enough: (1) remove the exchange's own queue-bindings bucket, (2) remove its e2e-source bucket, (3) scan all *other* e2e buckets and remove bindings whose `destination` equals this exchange. Step 3 is O(total e2e bindings) but is only called on exchange deletion so the cost is acceptable.
+- The concurrency stress test runs 8 threads × 500 ops = 4000 bind/unbind pairs against the same exchange. With the synchronized block present the final list size always equals the sum across queues; without it the invariant breaks.
+
+---
+
+## File Manifest
+
+### 2026-04-17 — WS1.07 BindingManager (commit 8ca2e9f43b)
+Created:
+  - http-server/src/main/java/kafka/server/http/routing/Binding.java — immutable queue-to-exchange binding record (all four fields in equality)
+  - http-server/src/main/java/kafka/server/http/routing/E2EBinding.java — immutable exchange-to-exchange binding record
+  - http-server/src/main/java/kafka/server/http/routing/BindingManager.java — bind/unbind/list/cleanup with dual in-memory index, per-exchange monitors, per-exchange quota
+  - http-server/src/test/java/kafka/server/http/routing/BindingManagerTest.java — 48 test methods (bind, unbind, listByExchange, listByQueue, e2e bindings, cleanup, quota, concurrency, record invariants)
 
 ---
 
