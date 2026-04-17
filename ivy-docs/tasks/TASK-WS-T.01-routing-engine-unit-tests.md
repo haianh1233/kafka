@@ -333,32 +333,106 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.routing.Routi
 
 ## Learning
 
-_To be filled by the executing agent._
+This task landed as a **supplementary cross-cutting** test class on top of the
+already-existing per-matcher and engine-wiring suites. By the time it ran, the
+baseline coverage was:
+
+| Test class | Methods | Scope |
+|------------|--------:|-------|
+| `RoutingEngineTest`       | 29 | direct/topic/fanout/headers wiring, e2e (all source types), alternate-exchange (chained, cycle, empty, dangling), null/constructor contracts |
+| `DirectMatcherTest`       | 11 | exact routing-key matching |
+| `TopicMatcherTest`        | 32 | `*`/`#` wildcard patterns, §6.2 edge cases |
+| `FanoutMatcherTest`       |  7 | all-bound-queues delivery |
+| `HeadersMatcherTest`      | 24 | `x-match=all/any`, missing/extra headers |
+
+Net-new coverage added by `RoutingEngineCrossCuttingTest` (20 methods):
+
+- Multi-hop e2e chains that mix exchange types (direct → topic → fanout;
+  headers → topic → direct) — a single failed chain link silences the whole
+  route.
+- Mixed-type cycle detection (direct → topic → direct).
+- Single fanout source fan-out into e2e bindings of all four types in one
+  topology, with the routing key / headers selecting different subsets.
+- Same queue reachable via direct and e2e paths is de-duplicated by the
+  `Set<String>` contract.
+- Per-exchange alternate-exchange semantics when e2e recursion produces a
+  match on one branch but not the ancestor — the ancestor's alternate is
+  correctly skipped (documents the actual behaviour of `matchedBefore` vs
+  `matched.size()`).
+- Alternate fallback when e2e destination is dangling.
+- Unknown exchange type returns empty instead of throwing.
+- Self-loop e2e binding + self-as-alternate both terminate via the visited
+  set.
+- Concurrency smoke: 8 threads × 200 calls each against a shared engine
+  produce zero cross-thread contamination (engine holds no mutable state;
+  visited/matched sets are local to every `route()` call).
+- Performance sanity: 100 route calls over 1002 direct bindings complete in
+  <500ms; 500 topic patterns route in <200ms (catches accidental O(N²)
+  regressions).
+- Live mutation of the bindings function between calls is reflected
+  immediately (no engine-side caching).
+- Returned `Set` is independent — caller mutation does not corrupt engine.
+
+Key implementation insight surfaced while writing the tests: the alternate
+exchange fallback is **per-exchange**, not global. When a primary's e2e
+descendant fires its own alternate and contributes queues, the primary sees
+`matched.size() > matchedBefore` and treats itself as "matched". This is
+asserted explicitly in
+`alternateExchange_eachExchangeInChainGetsItsOwnFallback` so any future
+refactor that changes the semantics trips a specific test.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- The performance tests are smoke-level upper bounds (<500ms / <200ms), not
+  benchmarks. They catch O(N²) regressions, not milli-level tuning.
+- The concurrency test uses a `ConcurrentHashMap` for the bindings function
+  only in the stateless-engine scenario; the cyclic-topology concurrency test
+  shares the `HashMap` instances set up in `@BeforeEach` because it performs
+  no concurrent writes (bindings are frozen before the threads start). If
+  later tests mutate state concurrently, they must swap in a concurrent-safe
+  map.
+- Tests exercise the public `route()` API only. Internal helpers
+  (`recurseE2E`, `e2eMatches`, `resolveType`) are covered transitively; if
+  those are ever made package-private, targeted tests could be added.
+- No test exercises a 10-level-deep e2e chain. The existing `chainOfThree`
+  in `RoutingEngineTest` plus the 3-type mixed chain here cover the common
+  failure modes without needing deeper stacks.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Running `./gradlew :http-server:test --tests 'kafka.server.http.routing.*Test'`
+  with an already-compiled build takes ~10s; a clean rebuild takes ~2m40s
+  on this machine (dominated by `:core:compileScala`).
+- The `performance_thousandBindings` test logs are clean because the engine
+  never logs during `direct`/`topic`/`fanout`/`headers` matching — only on
+  unknown types and e2e dangling destinations.
+- `Binding` is a `record`; `Map.of()` for arguments is enough and `Map.copyOf`
+  in the compact constructor normalises nulls. This means tests don't have to
+  pre-freeze their maps.
+- Confirmed the engine's `matched.size() == matchedBefore` check is the
+  pivot for alternate-exchange behaviour in chained topologies — so a
+  `Set.of()` result at the primary happens iff **no** descendant (queue or
+  e2e-reached queue) contributed.
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] `timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.routing.RoutingEngineTest' -x spotlessCheck` exits 0
-- [ ] At least 15 test methods in RoutingEngineTest
-- [ ] All 4 exchange types tested (direct, topic, fanout, headers)
-- [ ] Cycle guard tested
-- [ ] Learning section filled with at least one entry
+- [x] `timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.routing.RoutingEngineTest' -x spotlessCheck` exits 0
+- [x] At least 15 test methods in RoutingEngineTest (29 pre-existing) + 20 in the new cross-cutting class
+- [x] All 4 exchange types tested (direct, topic, fanout, headers)
+- [x] Cycle guard tested (including mixed-type and self-loop variants)
+- [x] Learning section filled with at least one entry
 
 ---
 
 ## File Manifest
 
-_To be filled by the executing agent._
+| File | Change |
+|------|--------|
+| `http-server/src/test/java/kafka/server/http/routing/RoutingEngineCrossCuttingTest.java` | **new** — 20 cross-cutting unit tests (mixed-type chains, mixed-type cycles, fan-out to all e2e types, dedup, alt-exchange × e2e, dangling-e2e + alt, unknown type, self-loop, concurrency smoke, perf sanity, live binding mutation, returned-set independence) |
+| `ivy-docs/tasks/TASK-WS-T.01-routing-engine-unit-tests.md` | **updated** — Learning / Limitations / Field Notes / File Manifest filled |
