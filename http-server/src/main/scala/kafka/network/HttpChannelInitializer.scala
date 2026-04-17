@@ -23,6 +23,7 @@ import io.netty.handler.codec.http.cors.{CorsConfig, CorsConfigBuilder, CorsHand
 import io.netty.handler.ssl.SslContext
 import io.netty.handler.timeout.IdleStateHandler
 import kafka.server.http.{HttpMetrics, HttpProcessor, HttpProtocolNegotiationHandler, HttpServerConfigs, IdleStateCloseHandler}
+import kafka.server.http.rest.{BindingRestHandler, ConnectionRestHandler, ConsumerRestHandler, ExchangeRestHandler, MessageRestHandler, QueueRestHandler, VhostRestHandler}
 import org.apache.kafka.common.security.auth.{KafkaPrincipalBuilder, SecurityProtocol}
 import org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder
 
@@ -68,7 +69,15 @@ class HttpChannelInitializer(
   httpProcessor: HttpProcessor = null,
   metadataSupplier: java.util.function.Function[String, Integer] = null,
   topicIdSupplier: java.util.function.Function[String, org.apache.kafka.common.Uuid] = null,
-  httpServerConfigs: HttpServerConfigs = HttpServerConfigs.withDefaults()
+  httpServerConfigs: HttpServerConfigs = HttpServerConfigs.withDefaults(),
+  // TASK-T1: REST handlers for WS admin endpoints (exchange/queue/binding/vhost/conn/consumer/message)
+  exchangeRestHandler: ExchangeRestHandler = null,
+  queueRestHandler: QueueRestHandler = null,
+  bindingRestHandler: BindingRestHandler = null,
+  connectionRestHandler: ConnectionRestHandler = null,
+  consumerRestHandler: ConsumerRestHandler = null,
+  messageRestHandler: MessageRestHandler = null,
+  vhostRestHandler: VhostRestHandler = null
 ) extends ChannelInitializer[SocketChannel] {
 
   // Build CORS config once at initialization time, reused for every channel
@@ -83,7 +92,9 @@ class HttpChannelInitializer(
         pipeline.addLast("ssl", ssl.newHandler(ch.alloc()))
         val handlerFactory: java.util.function.Supplier[ChannelHandler] = () =>
           new HttpRequestHandler(principalBuilder, securityProtocol, draining, inFlightCount,
-            brokerId, clusterId, requestChannel, httpProcessor, metadataSupplier, topicIdSupplier, httpServerConfigs)
+            brokerId, clusterId, requestChannel, httpProcessor, metadataSupplier, topicIdSupplier, httpServerConfigs,
+            exchangeRestHandler, queueRestHandler, bindingRestHandler,
+            connectionRestHandler, consumerRestHandler, messageRestHandler, vhostRestHandler)
         pipeline.addLast("protocol-negotiation",
           new HttpProtocolNegotiationHandler(
             draining, inFlightCount, httpMetrics,
@@ -111,7 +122,9 @@ class HttpChannelInitializer(
     pipeline.addLast("idle-closer", new IdleStateCloseHandler(httpMetrics))
     pipeline.addLast("kafka-handler",
       new HttpRequestHandler(principalBuilder, securityProtocol, draining, inFlightCount,
-        brokerId, clusterId, requestChannel, httpProcessor, metadataSupplier, topicIdSupplier, httpServerConfigs))
+        brokerId, clusterId, requestChannel, httpProcessor, metadataSupplier, topicIdSupplier, httpServerConfigs,
+        exchangeRestHandler, queueRestHandler, bindingRestHandler,
+        connectionRestHandler, consumerRestHandler, messageRestHandler, vhostRestHandler))
   }
 }
 

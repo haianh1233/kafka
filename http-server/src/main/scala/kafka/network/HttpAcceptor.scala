@@ -27,6 +27,9 @@ import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.nio.NioServerSocketChannel
 import io.netty.handler.ssl.SslContext
 import kafka.server.http.HttpProcessor
+import kafka.server.http.rest.{BindingRestHandler, ConnectionRestHandler, ConsumerRestHandler, ExchangeRestHandler, QueueRestHandler, VhostRestHandler}
+import kafka.server.http.routing.{BindingManager, ExchangeManager, VhostManager}
+import kafka.server.http.ws.{WsConfigs, WsConnectionRegistry, WsRoutingMetadataManager}
 import kafka.utils.Logging
 import org.apache.kafka.common.Endpoint
 import org.apache.kafka.common.utils.Time
@@ -111,6 +114,66 @@ class HttpAcceptor(
   // with binary protocol processor IDs (which start from 0).
   private val httpProcessorId = 10000 + brokerId
 
+  // --- TASK-T1: REST handler stack (in-memory, shared across all broker-level requests) ---
+  // Constructed lazily in startup() so tests that never call startup() don't pay the cost.
+  @volatile private var _exchangeRestHandler: ExchangeRestHandler = _
+  @volatile private var _queueRestHandler: QueueRestHandler = _
+  @volatile private var _bindingRestHandler: BindingRestHandler = _
+  @volatile private var _connectionRestHandler: ConnectionRestHandler = _
+  @volatile private var _consumerRestHandler: ConsumerRestHandler = _
+  @volatile private var _vhostRestHandler: VhostRestHandler = _
+  @volatile private var _wsConnectionRegistry: WsConnectionRegistry = _
+
+  private def buildRestHandlerStack(): Unit = {
+    if (_exchangeRestHandler != null) return // already built
+
+    val wsConfigs = WsConfigs.withDefaults()
+
+    // In-memory metadata manager — record writer is a no-op stub. Multi-broker
+    // replication of routing metadata is a separate integration task; for
+    // single-broker REST CRUD this is fine.
+    val metadataManager = new WsRoutingMetadataManager(wsConfigs, (_, _) => ())
+    metadataManager.markReplayComplete()
+
+    // Shared single-instance ExchangeManager + BindingManager. Pre-declared
+    // exchanges for vhost "/" land here via initializeDefaults.
+    val exchangeManager = new ExchangeManager(metadataManager, wsConfigs)
+    exchangeManager.initializeDefaults("/")
+
+    val bindingManager = new BindingManager(
+      wsConfigs.maxBindingsPerExchange(),
+      (ex: String) => exchangeManager.getExchange("/", ex) != null,
+      (_: String) => true // no QueueManager yet — accept any queue name as existing
+    )
+
+    // VhostManager wraps the same instances; it auto-creates the default vhost.
+    val vhostManager = new VhostManager(metadataManager, exchangeManager, bindingManager)
+
+    _wsConnectionRegistry = new WsConnectionRegistry()
+
+    _exchangeRestHandler = new ExchangeRestHandler(exchangeManager, bindingManager)
+
+    // No QueueManager yet — stub QueueStore throws QueueConflict on declare,
+    // returns empty on get/list, no-op on delete. Tests that require real
+    // queue CRUD remain @Disabled.
+    val queueStore = new kafka.server.http.rest.QueueRestHandler.QueueStore {
+      override def get(vhost: String, name: String): kafka.server.http.ws.QueueMetadata = null
+      override def declare(vhost: String, name: String, durable: Boolean, exclusive: Boolean,
+                           autoDelete: Boolean, arguments: java.util.Map[String, String])
+          : kafka.server.http.ws.QueueMetadata =
+        throw new kafka.server.http.rest.QueueRestHandler.QueueConflict(
+          "QueueManager not yet implemented")
+      override def list(vhost: String): java.util.Collection[kafka.server.http.ws.QueueMetadata] =
+        java.util.Collections.emptyList()
+      override def delete(vhost: String, name: String, ifUnused: Boolean, ifEmpty: Boolean): Unit = ()
+    }
+    _queueRestHandler = new QueueRestHandler(queueStore)
+    _bindingRestHandler = new BindingRestHandler(bindingManager)
+    _connectionRestHandler = new ConnectionRestHandler(_wsConnectionRegistry, brokerId)
+    _consumerRestHandler = new ConsumerRestHandler(_wsConnectionRegistry, (_: String) => null)
+    _vhostRestHandler = new VhostRestHandler(vhostManager)
+  }
+
   override def setRequestChannel(requestChannel: RequestChannel): Unit = {
     _requestChannel = requestChannel
   }
@@ -144,6 +207,9 @@ class HttpAcceptor(
       info(s"HTTP processor $httpProcessorId registered with RequestChannel")
     }
 
+    // TASK-T1: construct in-memory REST handler stack for /v1/exchanges|queues|bindings|vhosts|connections|consumers.
+    buildRestHandlerStack()
+
     val bootstrap = new ServerBootstrap()
     bootstrap.group(bossGroup, workerGroup)
       .channel(classOf[NioServerSocketChannel])
@@ -162,7 +228,13 @@ class HttpAcceptor(
         requestChannel = _requestChannel,
         httpProcessor = _httpProcessor,
         metadataSupplier = _metadataSupplier,
-        topicIdSupplier = _topicIdSupplier))
+        topicIdSupplier = _topicIdSupplier,
+        exchangeRestHandler = _exchangeRestHandler,
+        queueRestHandler = _queueRestHandler,
+        bindingRestHandler = _bindingRestHandler,
+        connectionRestHandler = _connectionRestHandler,
+        consumerRestHandler = _consumerRestHandler,
+        vhostRestHandler = _vhostRestHandler))
 
     val host = if (endpoint.host() == null || endpoint.host().isEmpty) "0.0.0.0" else endpoint.host()
     try {

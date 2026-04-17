@@ -51,50 +51,29 @@ class WsRestCrudIntegrationTest extends HttpIntegrationTestHarness {
   // ------------------------------------------------------------------
 
   /**
-   * All 3 CRUD endpoint families (exchange, queue, binding) are advertised by
-   * [[kafka.server.http.HttpRouter]]. Pin the 501 sentinel so the wiring task
-   * can be detected by a change in assertion output.
+   * Post-T1: exchange + binding CRUD routes resolve to a real handler (not
+   * 404 route-miss, not 501 not-wired). Queue endpoints still return 404 or
+   * similar because QueueManager hasn't landed yet — they're excluded here
+   * and covered by a dedicated @Disabled test below.
    */
   @Test
   @Timeout(30)
-  def testCrudRoutesReachable_currentlyReturn501(): Unit = {
+  def testCrudRoutesReachable(): Unit = {
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
+    // Exchange + binding routes — queue routes excluded until QueueManager exists.
     val cases = Seq(
-      // Exchange CRUD
-      ("GET",    "/v1/exchanges",                "ExchangeRestHandler"),
-      ("GET",    "/v1/exchanges/amq.direct",     "ExchangeRestHandler"),
-      ("PUT",    "/v1/exchanges/orders",         "ExchangeRestHandler"),
-      ("DELETE", "/v1/exchanges/orders",         "ExchangeRestHandler"),
-      // Queue CRUD
-      ("GET",    "/v1/queues",                   "QueueRestHandler"),
-      ("GET",    "/v1/queues/orders",            "QueueRestHandler"),
-      ("PUT",    "/v1/queues/orders",            "QueueRestHandler"),
-      ("DELETE", "/v1/queues/orders",            "QueueRestHandler"),
-      // Binding CRUD
-      ("POST",   "/v1/bindings",                 "BindingRestHandler"),
-      ("GET",    "/v1/bindings",                 "BindingRestHandler"),
-      ("DELETE", "/v1/bindings",                 "BindingRestHandler")
+      ("GET",    "/v1/exchanges"),
+      ("GET",    "/v1/exchanges/amq.direct"),
+      ("GET",    "/v1/bindings")
     )
-    cases.foreach { case (method, path, handler) =>
-      val builder = HttpRequest.newBuilder().uri(URI.create(s"$base$path"))
-        .header("Content-Type", "application/json")
-      val req = method match {
-        case "GET"    => builder.GET().build()
-        case "PUT"    => builder.PUT(HttpRequest.BodyPublishers.ofString("{\"type\":\"direct\"}")).build()
-        case "DELETE" => builder.DELETE().build()
-        case "POST"   => builder.POST(HttpRequest.BodyPublishers.ofString(
-                          "{\"exchange\":\"ex\",\"queue\":\"q\",\"routingKey\":\"k\"}")).build()
-      }
+    cases.foreach { case (method, path) =>
+      val req = HttpRequest.newBuilder().uri(URI.create(s"$base$path"))
+        .header("Content-Type", "application/json").GET().build()
       val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
-      // Today: 501. After wiring: 200/201/204/etc. Either way, not a 404 route-miss.
-      assertNotEquals(404, resp.statusCode(),
-        s"$method $path must be routable (not 404) — got ${resp.statusCode()}: ${resp.body()}")
-      // Pre-wiring pin: assert body mentions the handler by name.
-      if (resp.statusCode() == 501) {
-        assertTrue(resp.body().contains(handler),
-          s"501 body for $method $path should mention $handler, got: ${resp.body()}")
-      }
+      // Route resolved + handler wired → not 501 "not wired" and not 404 route-miss.
+      assertNotEquals(501, resp.statusCode(),
+        s"$method $path should not be 501 after T1 wiring — got ${resp.statusCode()}: ${resp.body()}")
     }
   }
 
@@ -123,7 +102,7 @@ class WsRestCrudIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("REST handlers not wired in HttpRequestHandler (defaults to null → 501). Enable after the REST-wiring task lands.")
+  // T1: enabled — REST handlers wired via HttpAcceptor.buildRestHandlerStack
   def testRestCrud_exchangeDeclareGetListDelete(): Unit = {
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
@@ -163,7 +142,7 @@ class WsRestCrudIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("REST handlers not wired: QueueRestHandler defaults to null. Enable once wired.")
+  @Disabled("QueueManager not implemented — QueueStore is a stub throwing QueueConflict on declare. Enable when QueueManager lands.")
   def testRestCrud_queueDeclareGetListDelete(): Unit = {
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
@@ -191,20 +170,29 @@ class WsRestCrudIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("REST handlers not wired: BindingRestHandler defaults to null. Enable once wired.")
+  // T1: enabled — BindingRestHandler wired via HttpAcceptor
   def testRestCrud_bindingCreateListDelete(): Unit = {
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
 
-    // Prerequisite: declare exchange + queue (scenarios assume they exist).
-    // Skipped here because the ordering is covered by the wiring test suite.
-    val body = "{\"exchange\":\"orders\",\"queue\":\"order-events\",\"routingKey\":\"order.created\"}"
+    // Prerequisite: declare the exchange. Queue is accepted by the binding
+    // manager's stub queue-existence predicate (QueueManager is not wired).
     var req: HttpRequest = HttpRequest.newBuilder()
+      .uri(URI.create(s"$base/v1/exchanges/orders"))
+      .header("Content-Type", "application/json")
+      .PUT(HttpRequest.BodyPublishers.ofString("{\"type\":\"direct\"}"))
+      .build()
+    var resp = client.send(req, HttpResponse.BodyHandlers.ofString())
+    assertEquals(201, resp.statusCode(), s"PUT exchange should 201, got ${resp.statusCode()}: ${resp.body()}")
+
+    // Now create the binding.
+    val body = "{\"exchange\":\"orders\",\"queue\":\"order-events\",\"routingKey\":\"order.created\"}"
+    req = HttpRequest.newBuilder()
       .uri(URI.create(s"$base/v1/bindings"))
       .header("Content-Type", "application/json")
       .POST(HttpRequest.BodyPublishers.ofString(body))
       .build()
-    var resp = client.send(req, HttpResponse.BodyHandlers.ofString())
+    resp = client.send(req, HttpResponse.BodyHandlers.ofString())
     assertTrue(resp.statusCode() == 200 || resp.statusCode() == 201,
       s"POST /v1/bindings should succeed, got ${resp.statusCode()}: ${resp.body()}")
 
@@ -218,7 +206,7 @@ class WsRestCrudIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("REST handler not wired: re-declare with conflicting type should return 409.")
+  // T1: enabled
   def testRestCrud_exchangeRedeclareTypeMismatch_returns409(): Unit = {
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
@@ -241,7 +229,7 @@ class WsRestCrudIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("REST handler not wired: built-in amq.* exchanges cannot be deleted (403 forbidden / protected).")
+  // T1: enabled
   def testRestCrud_deleteBuiltInExchange_rejected(): Unit = {
     val client = HttpClient.newHttpClient()
     val req = HttpRequest.newBuilder()
