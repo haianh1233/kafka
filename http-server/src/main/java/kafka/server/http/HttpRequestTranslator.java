@@ -191,6 +191,10 @@ public final class HttpRequestTranslator {
             case PUBLISH_VIA_EXCHANGE, QUEUE_GET, QUEUE_ACK, QUEUE_NACK ->
                 throw new InvalidRequestException(
                     "Message operation requests are handled directly, not translated");
+            // WS2.09 vhost admin — dispatched directly too.
+            case LIST_VHOSTS, CREATE_VHOST, DELETE_VHOST ->
+                throw new InvalidRequestException(
+                    "Vhost admin requests are handled directly, not translated");
         };
     }
 

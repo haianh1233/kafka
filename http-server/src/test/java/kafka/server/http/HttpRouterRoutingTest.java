@@ -330,4 +330,39 @@ class HttpRouterRoutingTest {
         var r = router.route(HttpMethod.POST, "/v1/queues/myq/get");
         assertEquals(HttpRouter.HandlerType.QUEUE_GET, r.handlerType());
     }
+
+    // --- WS2.09 vhost admin routes ---
+
+    @Test
+    void route_listVhosts_get() {
+        var r = router.route(HttpMethod.GET, "/v1/vhosts");
+        assertEquals(HttpRouter.HandlerType.LIST_VHOSTS, r.handlerType());
+        assertNull(r.resourceName());
+    }
+
+    @Test
+    void route_createVhost_put() {
+        var r = router.route(HttpMethod.PUT, "/v1/vhosts/production");
+        assertEquals(HttpRouter.HandlerType.CREATE_VHOST, r.handlerType());
+        assertEquals("production", r.resourceName());
+    }
+
+    @Test
+    void route_deleteVhost_delete() {
+        var r = router.route(HttpMethod.DELETE, "/v1/vhosts/staging");
+        assertEquals(HttpRouter.HandlerType.DELETE_VHOST, r.handlerType());
+        assertEquals("staging", r.resourceName());
+    }
+
+    @Test
+    void route_vhost_wrongMethod_throws() {
+        assertThrows(InvalidRequestException.class,
+            () -> router.route(HttpMethod.POST, "/v1/vhosts/production"));
+    }
+
+    @Test
+    void route_vhost_wrongListMethod_throws() {
+        assertThrows(InvalidRequestException.class,
+            () -> router.route(HttpMethod.PUT, "/v1/vhosts"));
+    }
 }

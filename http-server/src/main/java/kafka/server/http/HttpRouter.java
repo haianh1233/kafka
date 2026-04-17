@@ -18,6 +18,7 @@
 // Time: Update - TASK-WS2.06 - added exchange/queue/binding REST routes
 // Time: Update - TASK-WS2.07 - added connection/consumer REST routes
 // Time: Update - TASK-WS2.08 - added message-ops REST routes
+// Time: Update - TASK-WS2.09 - added vhost scoping (vhost REST routes)
 package kafka.server.http;
 
 import io.netty.handler.codec.http.HttpMethod;
@@ -90,7 +91,11 @@ public final class HttpRouter {
         PUBLISH_VIA_EXCHANGE,
         QUEUE_GET,
         QUEUE_ACK,
-        QUEUE_NACK
+        QUEUE_NACK,
+        // --- WS2.09: Vhost admin ---
+        LIST_VHOSTS,
+        CREATE_VHOST,
+        DELETE_VHOST
     }
 
     // --- Route result ---
@@ -263,6 +268,17 @@ public final class HttpRouter {
     private static final Pattern BINDINGS_PATTERN =
         Pattern.compile("^/v1/bindings$");
 
+    // --- WS2.09: vhost admin ---
+
+    // Matches: /v1/vhosts
+    private static final Pattern VHOSTS_LIST_PATTERN =
+        Pattern.compile("^/v1/vhosts$");
+
+    // Matches: /v1/vhosts/{name}. The name segment may be URL-encoded — path
+    // traversal characters ('/', '\0') are rejected in validateResourceName.
+    private static final Pattern VHOST_DETAIL_PATTERN =
+        Pattern.compile("^/v1/vhosts/([^/?]+)$");
+
     // --- WS2.07 connection / consumer management patterns ---
 
     // Matches: /v1/connections
@@ -325,6 +341,9 @@ public final class HttpRouter {
         if (result != null) return result;
 
         result = matchRoutingRoutes(method, path, queryParams);
+        if (result != null) return result;
+
+        result = matchVhostRoutes(method, path, queryParams);
         if (result != null) return result;
 
         result = matchAdminRoutes(method, path, queryParams);
@@ -533,6 +552,44 @@ public final class HttpRouter {
                 "Method " + method + " not allowed for " + path + "; expected POST, GET or DELETE");
         }
         return new RouteResult(ht, null, null, null, null, null, queryParams);
+    }
+
+    /**
+     * WS2.09 — Matches vhost admin routes.
+     *
+     * <p>Routes:
+     * <ul>
+     *   <li>{@code GET /v1/vhosts} → {@link HandlerType#LIST_VHOSTS}</li>
+     *   <li>{@code PUT /v1/vhosts/{name}} → {@link HandlerType#CREATE_VHOST}</li>
+     *   <li>{@code DELETE /v1/vhosts/{name}} → {@link HandlerType#DELETE_VHOST}</li>
+     * </ul>
+     *
+     * <p>The vhost name is extracted into {@link RouteResult#resourceName()}.
+     * Callers must URL-encode leading slashes (e.g. {@code %2Fproduction}) or
+     * pass the bare name (e.g. {@code production}); both forms are validated
+     * via {@link #validateResourceName(String, String)}.
+     */
+    private RouteResult matchVhostRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
+        Matcher matcher = VHOST_DETAIL_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            String name = validateResourceName(matcher.group(1), "vhost");
+            HandlerType ht;
+            if (method.equals(HttpMethod.PUT)) {
+                ht = HandlerType.CREATE_VHOST;
+            } else if (method.equals(HttpMethod.DELETE)) {
+                ht = HandlerType.DELETE_VHOST;
+            } else {
+                throw new InvalidRequestException(
+                    "Method " + method + " not allowed for " + path + "; expected PUT or DELETE");
+            }
+            return new RouteResult(ht, null, null, null, null, name, queryParams);
+        }
+        matcher = VHOSTS_LIST_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.GET, path);
+            return new RouteResult(HandlerType.LIST_VHOSTS, null, null, null, null, null, queryParams);
+        }
+        return null;
     }
 
     /**
