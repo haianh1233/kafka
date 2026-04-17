@@ -518,19 +518,29 @@ cd /home/anh/kafka && ./gradlew :http-server:test --tests 'kafka.server.http.ws.
 
 ## Learning
 
-_To be filled by the executing agent._
+- `WsDeliveryTagTracker` exposes `ack`/`ackMultiple`/`nack` as state-transition APIs. Distinguishing "unknown tag" (PRECONDITION_FAILED per §5.9) from "already-acked tag" (idempotent success per §5.9) requires knowing the range of assigned tags. Added a `currentTagCounter()` accessor to the tracker; single-range check `tag >= 1 && tag <= currentTagCounter()` is the precise test.
+- The `OffsetCommitSink` pattern (injected functional interface) keeps the handler testable without pulling in a `RequestChannel` mock. Tests use a `RecordingSink` that captures commit calls and assert on the resulting watermark sequence.
+- Batched commits vs flush-on-ack is a single mode toggle via `commitIntervalMs`: `0` = flush-each, `>0` = scheduled flush. Both paths go through the same `flushSubscription` helper so behaviour is uniform and easy to reason about.
+- `WsSubscriptionManager` needed an `activeSubscriptionIds()` accessor so the scheduled flusher can iterate without reaching into the internal map; returned a `Set.copyOf` snapshot for concurrent safety.
+- For `nack(multiple=true)` the tracker only exposes single-tag nack, so we iterate `[1, deliveryTag]`. Pre-validating the range via `isTagWithinAssignedRange` avoids walking the loop for an unknown tag before surfacing the error.
+- The tracker's ack-bitmap guarantees that `nack(requeue=true)` holds the commit watermark back (offset is `NACKED_REQUEUE`, not terminal), so the redelivery hook can remain a log-only placeholder until the fetch loop exposes an active redeliver API: the fetch loop re-reads from the uncommitted offset on its next iteration anyway.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **RequestChannel wiring is deferred.** The `OffsetCommitSink` functional interface is a placeholder for the eventual `OffsetCommit` path through the broker's group coordinator. Integration with `RequestChannel` will be wired when the WebSocket frame handler (WS1.04) and full fetch-loop integration are in place.
+- **Redelivery trigger is passive.** `nack(requeue=true)` currently relies on the fetch loop re-reading the uncommitted offset on its next fetch iteration; no active redeliver call is made because `WsConsumerFetchLoop` does not yet expose such a hook. Semantics are still correct (offset stays uncommitted), only the timing is delayed by one fetch cycle.
+- **DLX path is a placeholder.** `nack(requeue=false)` currently logs and lets the tracker's `NACKED_DISCARD` state advance the watermark — the message is effectively dropped. Wiring to the DLX exchange publish is deferred to TASK-WS4.01.
+- **`multiple=true` nack is O(n) in the tag range.** For very large fan-out subscriptions a smarter bulk-nack on the tracker would help, but single-range scans are bounded by the number of in-flight (unacked) records which is credit-limited anyway.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Checkstyle caught one unused import on the first compile — worth running `:http-server:checkstyleTest` as part of the tight feedback loop when authoring new tests.
+- `@Timeout(5)` on the batched-commit test uses a 50ms interval and polls with a 10ms sleep up to 2s — this is generous enough for CI and tight enough for local dev.
+- The concurrency test drives 500 tags across 8 threads; it completes in well under a second locally and gives good confidence that the lock in the tracker serialises mutations correctly under contention.
 
 ---
 
