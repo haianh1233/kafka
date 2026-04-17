@@ -412,3 +412,10 @@ Created:
 Modified:
   - path/to/Existing.java — <what changed>
 -->
+
+### 2026-04-17 — HeadersMatcher + tests (commit e8446f67b2)
+Created:
+  - http-server/src/main/java/kafka/server/http/routing/HeadersMatcher.java — static `matches(bindingArgs, msgHeaders)` implementing x-match=all/any with null-safety and empty-criteria match-all
+  - http-server/src/test/java/kafka/server/http/routing/HeadersMatcherTest.java — 24 unit tests covering all/any modes, default x-match, empty criteria, null inputs, value mismatch, routing-key-ignored contract, multiple-binding independence, mutable-map inputs, and §7.4 design-doc examples
+Modified:
+  - (none)
