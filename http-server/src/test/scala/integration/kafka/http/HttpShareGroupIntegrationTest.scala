@@ -18,6 +18,8 @@ package kafka.http
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import kafka.http.HttpTestClient._
+import org.apache.kafka.clients.admin.{AlterConfigOp, AlterConfigsOptions}
+import org.apache.kafka.common.config.ConfigResource
 import org.junit.jupiter.api.{AfterEach, Assumptions, BeforeEach, Test, TestInfo, Timeout}
 import org.junit.jupiter.api.Assertions._
 
@@ -146,7 +148,7 @@ class HttpShareGroupIntegrationTest extends HttpIntegrationTestHarness {
     }
   }
 
-  // --- Scenario 3: REJECT Causes Re-Delivery ---
+  // --- Scenario 3: REJECT Archives Records (Not Re-Delivered) ---
 
   @Test
   def testRejectCausesReDelivery(): Unit = {
@@ -157,21 +159,25 @@ class HttpShareGroupIntegrationTest extends HttpIntegrationTestHarness {
     val rejectedOffsets = pollResult.records.map(r =>
       (r.get("topic").asText(), r.get("partition").asInt(), r.get("offset").asLong()))
 
-    // REJECT all records
+    // REJECT all records -- in the share group protocol, REJECT archives records
+    // (dead-letter behavior). Rejected records are NOT re-delivered.
     val acquireIds = pollResult.records.map(r =>
       (r.get("acquireId").asText(), "REJECT"))
     val ackResult = acknowledgeRecords(group, acquireIds)
     assertEquals(200, ackResult.statusCode)
 
-    // Poll again -- rejected records should be re-delivered
+    // Poll again -- rejected records should NOT appear (they are archived)
     val pollResult2 = pollShareGroup(group, Seq(topicName), maxRecords = 100, maxWaitMs = 5000)
     val newOffsets = pollResult2.records.map(r =>
       (r.get("topic").asText(), r.get("partition").asInt(), r.get("offset").asLong()))
 
     rejectedOffsets.foreach { rejected =>
-      assertTrue(newOffsets.contains(rejected),
-        s"Rejected record $rejected should be re-delivered")
+      assertFalse(newOffsets.contains(rejected),
+        s"Rejected record $rejected should be archived and NOT re-delivered")
     }
+
+    // The remaining records (not rejected) should be delivered
+    assertTrue(pollResult2.records.nonEmpty, "Other records should still be available")
   }
 
   // --- Scenario 4: RELEASE Re-Delivers Immediately ---
@@ -284,6 +290,28 @@ class HttpShareGroupIntegrationTest extends HttpIntegrationTestHarness {
   // --- Helper Methods ---
 
   /**
+   * Sets the share.auto.offset.reset to "earliest" for the given group
+   * via the Admin API. This ensures records produced before the share group
+   * was created are visible (the default is "latest").
+   */
+  private def setShareAutoOffsetResetEarliest(group: String): Unit = {
+    val admin = createAdminClient()
+    try {
+      val configResource = new ConfigResource(ConfigResource.Type.GROUP, group)
+      val alterEntries = new java.util.HashMap[ConfigResource, java.util.Collection[AlterConfigOp]]()
+      alterEntries.put(configResource, java.util.List.of(
+        new AlterConfigOp(
+          new org.apache.kafka.clients.admin.ConfigEntry(
+            "share.auto.offset.reset", "earliest"),
+          AlterConfigOp.OpType.SET)))
+      admin.incrementalAlterConfigs(alterEntries, new AlterConfigsOptions())
+        .all().get(30, TimeUnit.SECONDS)
+    } finally {
+      admin.close()
+    }
+  }
+
+  /**
    * Poll records from a share group via the HTTP endpoint.
    *
    * POST /v1/share-groups/{group}/records
@@ -300,6 +328,10 @@ class HttpShareGroupIntegrationTest extends HttpIntegrationTestHarness {
     maxRecords: Int,
     maxWaitMs: Int
   ): SharePollResult = {
+    // Ensure the share group uses "earliest" offset reset so records
+    // produced before group creation are visible.
+    setShareAutoOffsetResetEarliest(group)
+
     val topicsJson = topics.map(t => s""""$t"""").mkString(",")
     val body = s"""{"topics":[$topicsJson],"maxRecords":$maxRecords,"maxWaitMs":$maxWaitMs}"""
 

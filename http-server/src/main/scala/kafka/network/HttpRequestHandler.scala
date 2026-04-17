@@ -29,7 +29,7 @@ import org.apache.kafka.common.memory.MemoryPool
 import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.message.ShareGroupHeartbeatRequestData
-import org.apache.kafka.common.requests.{RequestContext, RequestHeader, ShareAcknowledgeRequest, ShareFetchRequest, ShareGroupHeartbeatRequest, ShareRequestMetadata}
+import org.apache.kafka.common.requests.{RequestContext, RequestHeader, ShareFetchRequest, ShareGroupHeartbeatRequest, ShareRequestMetadata}
 import org.apache.kafka.common.security.auth.{HttpAuthenticationContext, KafkaPrincipal, KafkaPrincipalBuilder, SecurityProtocol}
 import org.apache.kafka.common.utils.Time
 
@@ -537,7 +537,7 @@ class HttpRequestHandler(
       )
 
       // For share poll, register the member with the share group coordinator
-      // via heartbeat, then send the fetch with epoch=0
+      // via heartbeat, then send the fetch with epoch progression to acquire records.
       if (isPoll) {
         val topicsNode = json.get("topics")
         val topicNames = new java.util.ArrayList[String]()
@@ -562,55 +562,77 @@ class HttpRequestHandler(
           }
           if (!assigned) Thread.sleep(300)
         }
-      }
 
-      // Build the share fetch or acknowledge request
-      val (apiKey: ApiKeys, apiVersion: Short, buffer: java.nio.ByteBuffer, topicIdNames: java.util.Map[String, String]) = if (isPoll) {
-        buildShareFetchRequest(groupId, json, memberId, 0)
-      } else {
-        buildShareAcknowledgeRequest(groupId, json)
-      }
+        // Share group protocol requires multi-step session initialization:
+        //   epoch=0: opens a new share session (initializes share partitions, returns empty)
+        //   epoch=1+: subsequent fetches that actually acquire and return records
+        // We send the initial fetch internally, then retry with incrementing epochs
+        // until records are acquired or we exhaust retries.
+        val topicIdNames = {
+          val (_, _, _, names) = buildShareFetchRequest(groupId, json, memberId, 0)
+          names
+        }
 
-      // Build request context and enqueue (same pattern as offset requests)
-      val principal = buildPrincipal(ctx, req)
-      val connectionId = ctx.channel().id().asLongText()
-      val clientAddress = ctx.channel().remoteAddress().asInstanceOf[InetSocketAddress]
-      val clientId = HttpRouter.validateClientId(req.headers().get("X-Kafka-Client-ID"))
-      val correlationId = correlationIdCounter.getAndIncrement()
+        var fetchResponse: org.apache.kafka.common.requests.ShareFetchResponse = null
+        var hasRecords = false
+        val maxRetries = 5
+        var epoch = 0
 
-      val requestHeader = new RequestHeader(apiKey, apiVersion, clientId, correlationId)
-      val requestContext = new RequestContext(
-        requestHeader, connectionId, clientAddress.getAddress,
-        Optional.of(Integer.valueOf(clientAddress.getPort)),
-        principal, ListenerName.normalised("HTTP"), securityProtocol,
-        ClientInformation.EMPTY, false
-      )
+        var retry = 0
+        while (retry < maxRetries && !hasRecords) {
+          fetchResponse = sendInternalShareFetch(ctx, req, groupId, json, memberId, epoch, topicIdNames)
+          if (fetchResponse != null) {
+            hasRecords = shareFetchResponseHasRecords(fetchResponse)
+          }
+          if (!hasRecords) {
+            epoch += 1
+            if (retry < maxRetries - 1) Thread.sleep(200)
+          }
+          retry += 1
+        }
 
-      if (buffer.position() != 0) buffer.rewind()
-
-      val channelRequest = new RequestChannel.Request(
-        processor = httpProcessor.id(),
-        context = requestContext,
-        startTimeNanos = Time.SYSTEM.nanoseconds(),
-        memoryPool = MemoryPool.NONE,
-        buffer = buffer,
-        metrics = requestChannel.metrics,
-        envelope = None
-      )
-
-      // Store topic ID -> name mapping for response serialization
-      if (topicIdNames != null && !topicIdNames.isEmpty) {
-        channelRequest.requestLocalProperties.put("httpTopicIdNames", topicIdNames)
-      }
-
-      httpProcessor.registerChannel(connectionId, ctx)
-      val enqueued = requestChannel.tryEnqueue(channelRequest)
-      if (!enqueued) {
-        httpProcessor.unregisterChannel(connectionId)
-        sendErrorResponse(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE,
-          """{"errorCode":-1,"errorMessage":"Request queue full","detail":"SERVICE_UNAVAILABLE"}""")
+        // Serialize the final response and send directly to the client
+        if (fetchResponse != null) {
+          val httpResponse = kafka.server.http.HttpResponseSerializer.serialize(
+            fetchResponse, null, ApiKeys.SHARE_FETCH, -1, topicIdNames)
+          ctx.writeAndFlush(httpResponse)
+        } else {
+          // No response received at all — return an empty records response
+          sendErrorResponse(ctx, HttpResponseStatus.OK,
+            """{"records":[]}""")
+        }
         inFlightCount.decrementAndGet()
+        return
       }
+
+      // --- Acknowledge path ---
+      // Acknowledgements are piggybacked on a ShareFetch request because the
+      // share session (memberId + epoch) must match. The HTTP protocol is
+      // stateless, so we reuse the same deterministic memberId used for poll
+      // and let the internal fetch mechanism find the right epoch.
+      val ackResult = sendInternalShareAcknowledge(ctx, req, groupId, json, memberId)
+      if (ackResult != null) {
+        val topicIdNames = new java.util.HashMap[String, String]()
+        // Populate topic ID names from the acknowledge response
+        val ackRespIter = ackResult.data().responses().iterator()
+        while (ackRespIter.hasNext) {
+          val topicResp = ackRespIter.next()
+          if (topicIdSupplier != null) {
+            // Try to resolve topic name from topic ID
+            val topicId = topicResp.topicId()
+            if (topicId != null) {
+              topicIdNames.put(topicId.toString, topicId.toString) // fallback
+            }
+          }
+        }
+        val httpResponse = kafka.server.http.HttpResponseSerializer.serialize(
+          ackResult, null, ApiKeys.SHARE_FETCH, -1, topicIdNames)
+        ctx.writeAndFlush(httpResponse)
+      } else {
+        sendErrorResponse(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR,
+          """{"errorCode":-1,"errorMessage":"Failed to acknowledge records"}""")
+      }
+      inFlightCount.decrementAndGet()
     } catch {
       case e: org.apache.kafka.common.errors.InvalidRequestException =>
         sendErrorResponse(ctx, HttpResponseStatus.BAD_REQUEST,
@@ -694,6 +716,263 @@ class HttpRequestHandler(
   }
 
   /**
+   * Sends a ShareFetch request internally and waits for the response.
+   * Used to implement the multi-step share session initialization:
+   *   epoch=0 opens the session, epoch=1+ acquires records.
+   *
+   * Uses the same internal callback mechanism as sendInternalHeartbeat.
+   * A stable connectionId (derived from groupId) is used so that the
+   * SharePartitionManager can track the share session across fetches.
+   */
+  private def sendInternalShareFetch(
+    ctx: ChannelHandlerContext,
+    req: FullHttpRequest,
+    groupId: String,
+    json: JsonNode,
+    memberId: org.apache.kafka.common.Uuid,
+    epoch: Int,
+    topicIdNames: java.util.Map[String, String]
+  ): org.apache.kafka.common.requests.ShareFetchResponse = {
+    val (_, apiVersion, buffer, _) = buildShareFetchRequest(groupId, json, memberId, epoch)
+
+    val principal = buildPrincipal(ctx, req)
+    // Use a stable connectionId for the share session so the SharePartitionManager
+    // can correlate epoch=0 (session open) with epoch=1+ (record fetch).
+    val internalConnectionId = "internal-share-fetch-" + groupId + "-" + memberId.toString
+    val clientAddress = ctx.channel().remoteAddress().asInstanceOf[InetSocketAddress]
+    val clientId = HttpRouter.validateClientId(req.headers().get("X-Kafka-Client-ID"))
+    val correlationId = correlationIdCounter.getAndIncrement()
+
+    val header = new RequestHeader(ApiKeys.SHARE_FETCH, apiVersion, clientId, correlationId)
+    val context = new RequestContext(
+      header, internalConnectionId, clientAddress.getAddress,
+      Optional.of(Integer.valueOf(clientAddress.getPort)),
+      principal, ListenerName.normalised("HTTP"), securityProtocol,
+      ClientInformation.EMPTY, false
+    )
+
+    if (buffer.position() != 0) buffer.rewind()
+
+    val channelRequest = new RequestChannel.Request(
+      processor = httpProcessor.id(),
+      context = context,
+      startTimeNanos = Time.SYSTEM.nanoseconds(),
+      memoryPool = MemoryPool.NONE,
+      buffer = buffer,
+      metrics = requestChannel.metrics,
+      envelope = None
+    )
+
+    // Store topic ID -> name mapping so KafkaApis can resolve topic IDs
+    if (topicIdNames != null && !topicIdNames.isEmpty) {
+      channelRequest.requestLocalProperties.put("httpTopicIdNames", topicIdNames)
+    }
+
+    val responseFuture = httpProcessor.registerInternalCallback(internalConnectionId)
+    inFlightCount.incrementAndGet()
+
+    val enqueued = requestChannel.tryEnqueue(channelRequest)
+    if (!enqueued) {
+      inFlightCount.decrementAndGet()
+      return null
+    }
+
+    try {
+      val response = responseFuture.get(10, TimeUnit.SECONDS)
+      if (response != null) {
+        response.asInstanceOf[org.apache.kafka.common.requests.ShareFetchResponse]
+      } else {
+        null
+      }
+    } catch {
+      case _: Exception => null
+    }
+  }
+
+  /**
+   * Checks if a ShareFetchResponse contains any records.
+   * Iterates through all topic-partitions and checks for non-empty record batches.
+   */
+  private def shareFetchResponseHasRecords(
+    response: org.apache.kafka.common.requests.ShareFetchResponse
+  ): Boolean = {
+    val iter = response.data().responses().iterator()
+    while (iter.hasNext) {
+      val topicResponse = iter.next()
+      val partIter = topicResponse.partitions().iterator()
+      while (partIter.hasNext) {
+        val partData = partIter.next()
+        val baseRecords = partData.records()
+        if (baseRecords != null) {
+          baseRecords match {
+            case records: org.apache.kafka.common.record.internal.Records =>
+              val batchIter = records.batches().iterator()
+              if (batchIter.hasNext) return true
+            case _ => // not Records type, skip
+          }
+        }
+      }
+    }
+    false
+  }
+
+  /**
+   * Sends an acknowledge request by piggybacking acknowledgements on a ShareFetch
+   * request. This is necessary because the HTTP protocol is stateless but the share
+   * session requires a matching memberId and epoch.
+   *
+   * The method tries multiple epochs to find the current session epoch, since we
+   * don't track state across HTTP requests.
+   */
+  private def sendInternalShareAcknowledge(
+    ctx: ChannelHandlerContext,
+    req: FullHttpRequest,
+    groupId: String,
+    json: JsonNode,
+    memberId: org.apache.kafka.common.Uuid
+  ): org.apache.kafka.common.requests.ShareFetchResponse = {
+    // Parse acknowledgements from the JSON body
+    val acksNode = json.get("acknowledgements")
+    if (acksNode == null || !acksNode.isArray || acksNode.size() == 0) {
+      return null
+    }
+
+    // Build the acknowledgements map: TopicIdPartition -> List[AcknowledgementBatch]
+    val ackMap = new java.util.LinkedHashMap[
+      org.apache.kafka.common.TopicIdPartition,
+      java.util.List[org.apache.kafka.common.message.ShareFetchRequestData.AcknowledgementBatch]
+    ]()
+
+    val acksIter = acksNode.elements()
+    while (acksIter.hasNext) {
+      val ackEntry = acksIter.next()
+      val acquireId = ackEntry.get("acquireId").asText()
+      val ackTypeStr = ackEntry.get("type").asText()
+
+      // Parse acquireId: "topic:partition:offset"
+      val parts = acquireId.split(":")
+      if (parts.length < 3) return null
+
+      val topicName = parts.dropRight(2).mkString(":")
+      val partition = try { parts(parts.length - 2).toInt } catch { case _: NumberFormatException => return null }
+      val offset = try { parts(parts.length - 1).toLong } catch { case _: NumberFormatException => return null }
+
+      val ackType: Byte = ackTypeStr match {
+        case "ACCEPT" => 1
+        case "RELEASE" => 2
+        case "REJECT" => 3
+        case _ => return null
+      }
+
+      val topicId = if (topicIdSupplier != null) topicIdSupplier.apply(topicName) else null
+      if (topicId == null || topicId.equals(org.apache.kafka.common.Uuid.ZERO_UUID)) return null
+
+      val tip = new org.apache.kafka.common.TopicIdPartition(
+        topicId, new org.apache.kafka.common.TopicPartition(topicName, partition))
+
+      val batch = new org.apache.kafka.common.message.ShareFetchRequestData.AcknowledgementBatch()
+        .setFirstOffset(offset)
+        .setLastOffset(offset)
+        .setAcknowledgeTypes(java.util.Collections.singletonList(java.lang.Byte.valueOf(ackType)))
+
+      val batches = ackMap.computeIfAbsent(tip, _ =>
+        new java.util.ArrayList[org.apache.kafka.common.message.ShareFetchRequestData.AcknowledgementBatch]())
+      batches.add(batch)
+    }
+
+    // Build a ShareFetch request with piggybacked acknowledgements.
+    // Use maxRecords=0 and maxWaitMs=0 since we only want to acknowledge.
+    // Try multiple epochs to find the right one.
+    val maxEpochRetries = 10
+    var epoch = 1 // Start from 1 since 0 = INITIAL_EPOCH (creates new session)
+    var result: org.apache.kafka.common.requests.ShareFetchResponse = null
+
+    while (epoch <= maxEpochRetries && result == null) {
+      val metadata = new ShareRequestMetadata(memberId, epoch)
+      val version: Short = 1.toShort
+
+      val builder = ShareFetchRequest.Builder.forConsumer(
+        groupId,
+        metadata,
+        0, // maxWaitMs - no waiting, just acknowledge
+        0, // minBytes
+        0, // maxBytes
+        0, // maxRecords - no records needed
+        0, // batchSize
+        0.toByte, // shareAcquireMode
+        false, // isRenewAck
+        java.util.Collections.emptyList(), // send - no new partitions
+        java.util.Collections.emptyList(), // forget
+        ackMap // piggybacked acknowledgements
+      )
+
+      val request = builder.build(version)
+      val buffer = request.serialize().buffer()
+
+      val principal = buildPrincipal(ctx, req)
+      val internalConnectionId = "internal-share-fetch-" + groupId + "-" + memberId.toString
+      val clientAddress = ctx.channel().remoteAddress().asInstanceOf[InetSocketAddress]
+      val clientId = HttpRouter.validateClientId(req.headers().get("X-Kafka-Client-ID"))
+      val correlationId = correlationIdCounter.getAndIncrement()
+
+      val header = new RequestHeader(ApiKeys.SHARE_FETCH, version, clientId, correlationId)
+      val context = new RequestContext(
+        header, internalConnectionId, clientAddress.getAddress,
+        Optional.of(Integer.valueOf(clientAddress.getPort)),
+        principal, ListenerName.normalised("HTTP"), securityProtocol,
+        ClientInformation.EMPTY, false
+      )
+
+      if (buffer.position() != 0) buffer.rewind()
+
+      val channelRequest = new RequestChannel.Request(
+        processor = httpProcessor.id(),
+        context = context,
+        startTimeNanos = Time.SYSTEM.nanoseconds(),
+        memoryPool = MemoryPool.NONE,
+        buffer = buffer,
+        metrics = requestChannel.metrics,
+        envelope = None
+      )
+
+      val responseFuture = httpProcessor.registerInternalCallback(internalConnectionId)
+      inFlightCount.incrementAndGet()
+
+      val enqueued = requestChannel.tryEnqueue(channelRequest)
+      if (!enqueued) {
+        inFlightCount.decrementAndGet()
+        epoch += 1
+      } else {
+        try {
+          val response = responseFuture.get(5, TimeUnit.SECONDS)
+          if (response != null) {
+            val fetchResp = response.asInstanceOf[org.apache.kafka.common.requests.ShareFetchResponse]
+            // If the response has no error (or only partition-level errors, not session errors),
+            // consider it successful
+            if (fetchResp.error() == org.apache.kafka.common.protocol.Errors.NONE) {
+              result = fetchResp
+            } else if (fetchResp.error() == org.apache.kafka.common.protocol.Errors.INVALID_SHARE_SESSION_EPOCH ||
+                       fetchResp.error() == org.apache.kafka.common.protocol.Errors.SHARE_SESSION_NOT_FOUND) {
+              // Wrong epoch, try next
+              epoch += 1
+            } else {
+              // Some other error - return it
+              result = fetchResp
+            }
+          } else {
+            epoch += 1
+          }
+        } catch {
+          case _: Exception =>
+            epoch += 1
+        }
+      }
+    }
+
+    result
+  }
+
+  /**
    * Builds a ShareFetchRequest from the JSON body.
    *
    * Topics in the body are resolved to topic IDs via the topicIdSupplier.
@@ -734,7 +1013,6 @@ class HttpRequestHandler(
 
       // Store topic ID -> name mapping for response serialization
       topicIdNames.put(topicId.toString, topicName)
-      System.out.println(s"[SHARE-DEBUG] Topic '$topicName' resolved to topicId=$topicId")
 
       // Get partition count for the topic
       val partitionCount = if (metadataSupplier != null) {
@@ -774,110 +1052,6 @@ class HttpRequestHandler(
     val request = builder.build(version)
     val buffer = request.serialize().buffer()
     (ApiKeys.SHARE_FETCH, version, buffer, topicIdNames.asInstanceOf[java.util.Map[String, String]])
-  }
-
-  /**
-   * Builds a ShareAcknowledgeRequest from the JSON body.
-   *
-   * The acquireId format is "topic:partition:offset" which encodes the
-   * topic name, partition index, and offset for the record to acknowledge.
-   *
-   * Returns (apiKey, version, serializedBuffer, topicIdNamesMap).
-   */
-  private def buildShareAcknowledgeRequest(groupId: String, json: JsonNode): (ApiKeys, Short, java.nio.ByteBuffer, java.util.Map[String, String]) = {
-    val acksNode = json.get("acknowledgements")
-    if (acksNode == null || !acksNode.isArray || acksNode.size() == 0) {
-      throw new org.apache.kafka.common.errors.InvalidRequestException(
-        "'acknowledgements' array is required and must not be empty")
-    }
-
-    // Parse acknowledgements and group by TopicIdPartition
-    // acquireId format: "topic:partition:offset"
-    val ackMap = new java.util.LinkedHashMap[
-      org.apache.kafka.common.TopicIdPartition,
-      java.util.List[org.apache.kafka.common.message.ShareAcknowledgeRequestData.AcknowledgementBatch]
-    ]()
-
-    val acksIter = acksNode.elements()
-    while (acksIter.hasNext) {
-      val ackEntry = acksIter.next()
-      val acquireId = ackEntry.get("acquireId").asText()
-      val ackTypeStr = ackEntry.get("type").asText()
-
-      // Parse acquireId: "topic:partition:offset"
-      val parts = acquireId.split(":")
-      if (parts.length < 3) {
-        throw new org.apache.kafka.common.errors.InvalidRequestException(
-          s"Invalid acquireId format: '$acquireId'. Expected 'topic:partition:offset'")
-      }
-
-      val topicName = parts.dropRight(2).mkString(":") // Handle topic names with colons
-      val partition = try {
-        parts(parts.length - 2).toInt
-      } catch {
-        case _: NumberFormatException =>
-          throw new org.apache.kafka.common.errors.InvalidRequestException(
-            s"Invalid partition in acquireId: '$acquireId'")
-      }
-      val offset = try {
-        parts(parts.length - 1).toLong
-      } catch {
-        case _: NumberFormatException =>
-          throw new org.apache.kafka.common.errors.InvalidRequestException(
-            s"Invalid offset in acquireId: '$acquireId'")
-      }
-
-      // Map ack type string to wire protocol value
-      // 0:Gap, 1:Accept, 2:Release, 3:Reject, 4:Renew
-      val ackType: Byte = ackTypeStr match {
-        case "ACCEPT" => 1
-        case "RELEASE" => 2
-        case "REJECT" => 3
-        case _ => throw new org.apache.kafka.common.errors.InvalidRequestException(
-          s"Unknown acknowledge type: '$ackTypeStr'. Must be ACCEPT, REJECT, or RELEASE")
-      }
-
-      // Resolve topic ID
-      val topicId = if (topicIdSupplier != null) {
-        topicIdSupplier.apply(topicName)
-      } else {
-        org.apache.kafka.common.Uuid.ZERO_UUID
-      }
-
-      if (topicId == null || topicId.equals(org.apache.kafka.common.Uuid.ZERO_UUID)) {
-        throw new org.apache.kafka.common.errors.InvalidRequestException(
-          s"Topic '$topicName' not found")
-      }
-
-      val tip = new org.apache.kafka.common.TopicIdPartition(
-        topicId, new org.apache.kafka.common.TopicPartition(topicName, partition))
-
-      val batch = new org.apache.kafka.common.message.ShareAcknowledgeRequestData.AcknowledgementBatch()
-        .setFirstOffset(offset)
-        .setLastOffset(offset)
-        .setAcknowledgeTypes(java.util.Collections.singletonList(java.lang.Byte.valueOf(ackType)))
-
-      val batches = ackMap.computeIfAbsent(tip, _ =>
-        new java.util.ArrayList[org.apache.kafka.common.message.ShareAcknowledgeRequestData.AcknowledgementBatch]())
-      batches.add(batch)
-    }
-
-    val metadata = new ShareRequestMetadata(
-      org.apache.kafka.common.Uuid.ZERO_UUID, // memberId = ZERO_UUID
-      0 // shareSessionEpoch = 0
-    )
-
-    val version: Short = ApiKeys.SHARE_ACKNOWLEDGE.latestVersion()
-    val builder = ShareAcknowledgeRequest.Builder.forConsumer(
-      groupId,
-      metadata,
-      false, // isRenewAck
-      ackMap
-    )
-
-    val request = builder.build(version)
-    val buffer = request.serialize().buffer()
-    (ApiKeys.SHARE_ACKNOWLEDGE, version, buffer, null.asInstanceOf[java.util.Map[String, String]])
   }
 
   /**
