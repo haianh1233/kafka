@@ -567,3 +567,12 @@ Created:
 Modified:
   - path/to/Existing.java — <what changed>
 -->
+
+### 2026-04-17 — WS1.16 WsAckHandler + OffsetCommitSink (commit bc37bd90f7)
+Created:
+  - http-server/src/main/java/kafka/server/http/ws/WsAckHandler.java — ACK/NACK frame handler with batched offset commits; uses OffsetCommitSink functional interface as a RequestChannel placeholder
+  - http-server/src/test/java/kafka/server/http/ws/WsAckHandlerTest.java — 15 unit tests covering single/multiple ack, nack requeue/discard, unknown sub/tag errors, idempotent double-ack, batched commit flush, lifecycle, and 500-tag concurrency sweep
+Modified:
+  - http-server/src/main/java/kafka/server/http/ws/WsDeliveryTagTracker.java — added currentTagCounter() accessor for unknown-vs-already-acked discrimination (§5.9)
+  - http-server/src/main/java/kafka/server/http/ws/WsSubscriptionManager.java — added activeSubscriptionIds() snapshot for the scheduled flusher
+  - ivy-docs/tasks/TASK-WS1.16-ws-ack-handler.md — Learning / Limitations / Field Notes / File Manifest
