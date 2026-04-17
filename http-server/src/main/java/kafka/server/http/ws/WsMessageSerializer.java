@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 // Time: Created - TASK-WS1.09
+// Time: Update - TASK-WS4.04 - added poison protection
 package kafka.server.http.ws;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -80,6 +81,13 @@ public final class WsMessageSerializer {
     public static final String HDR_APP_ID = "_ws_app_id";
     public static final String HDR_EXPIRATION = "_ws_expiration";
     public static final String HDR_VHOST = "_ws_vhost";
+    /**
+     * Kafka-header name that carries the per-message redelivery count used by
+     * {@link WsPoisonMessageProtection}. Incremented before each redelivery; first
+     * delivery carries count {@code 1}. Not written by the publish path — only the
+     * redelivery / dead-letter path produces this header. See design doc §12.6.
+     */
+    public static final String HDR_DELIVERY_COUNT = "_ws_delivery_count";
 
     // --- Content types ---
     private static final String CT_JSON = "application/json";
