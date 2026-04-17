@@ -182,6 +182,11 @@ public final class HttpRequestTranslator {
                  PURGE_QUEUE, CREATE_BINDING, LIST_BINDINGS, DELETE_BINDING ->
                 throw new InvalidRequestException(
                     "REST routing requests are handled directly, not translated");
+            // WS2.07 admin handlers — dispatched directly too.
+            case LIST_CONNECTIONS, GET_CONNECTION, FORCE_CLOSE_CONNECTION,
+                 LIST_CONSUMERS, FORCE_CANCEL_CONSUMER ->
+                throw new InvalidRequestException(
+                    "Connection/consumer management requests are handled directly, not translated");
         };
     }
 
