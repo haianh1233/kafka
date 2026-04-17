@@ -366,19 +366,27 @@ cd /home/anh/kafka && ./gradlew :http-server:test --tests 'kafka.server.http.rou
 
 ## Learning
 
-_To be filled by the executing agent._
+- The ivy-ref algorithm ports cleanly to this codebase; the key insight is the `matchCount == criteriaCount` equality check for `x-match=all`, which lets a single pass over entries cover both modes without a second loop.
+- `Map.of()` literals in tests are concise but note they are immutable; the `mutableMapInputs_work` test guards against accidental reliance on immutable impls.
+- Checkstyle's `HeaderCheck` is enforced on every new `.java` in `http-server/` (both `main/` and `test/`), so the Apache license header must precede the `// Time:` marker and package statement. The task file skeleton omitted the license header.
+- The `HeadersMatcher.matches(args, headers)` signature intentionally takes no routing key — the headers-exchange contract forbids routing-key use — so "routing key ignored" is structural, not a runtime check. The `routingKeyIgnored_matchesByHeadersOnly` test documents this as a design note.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **No value-type coercion**: matching is pure string equality via `String.equals()`. AMQP 0-9-1 allows typed header values (int, bool, array); callers must serialize to string before calling this matcher. This mirrors the ivy-ref design and aligns with the `Map<String, String>` binding-arguments type already used by `Binding`.
+- **No glob / regex / numeric comparison**: RabbitMQ extensions like `x-match=all-with-x` or numeric operators are out of scope; this matcher only implements AMQP 0-9-1 headers-exchange semantics.
+- **RoutingEngine dispatch-table wiring deferred**: `RoutingEngine.java` still throws `UnsupportedOperationException` for HEADERS type; wiring `HeadersMatcher` in is a separate task (per the context note in TASK-WS2.03).
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- TDD cycle worked cleanly: 28 compile errors (RED) → 24 test PASSED (GREEN) after adding the production class.
+- Total wall-clock: ~2 min RED compile, ~16 s GREEN after checkstyle fix.
+- The skeleton in the task file used `// Time:` before `package` — that failed checkstyle `HeaderCheck` with `"Line does not match expected header line of '/*'."`. Fix: prepend the Apache ASF license header block. Future WS2.x task skeletons should include the license header to avoid this churn.
+- 24 tests implemented (spec listed ~13 methods). Extras cover: `emptyCriteriaAny_matchesEverything`, `nullMsgHeadersWithEmptyCriteria_matches`, `matchAll_valueMismatch`, `matchAny_valueMismatchOnAll`, `routingKeyIgnored_matchesByHeadersOnly`, `multipleBindings_evaluatedIndependently`, `mutableMapInputs_work`, plus split `defaultXMatch` positive/negative.
 
 ---
 
@@ -404,3 +412,10 @@ Created:
 Modified:
   - path/to/Existing.java — <what changed>
 -->
+
+### 2026-04-17 — HeadersMatcher + tests (commit e8446f67b2)
+Created:
+  - http-server/src/main/java/kafka/server/http/routing/HeadersMatcher.java — static `matches(bindingArgs, msgHeaders)` implementing x-match=all/any with null-safety and empty-criteria match-all
+  - http-server/src/test/java/kafka/server/http/routing/HeadersMatcherTest.java — 24 unit tests covering all/any modes, default x-match, empty criteria, null inputs, value mismatch, routing-key-ignored contract, multiple-binding independence, mutable-map inputs, and §7.4 design-doc examples
+Modified:
+  - (none)
