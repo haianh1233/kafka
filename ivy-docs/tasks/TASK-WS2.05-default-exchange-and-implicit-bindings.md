@@ -416,3 +416,10 @@ Created:
 Modified:
   - path/to/Existing.java — <what changed>
 -->
+
+### 2026-04-17 — WS2.05 default exchange + implicit bindings (commit e23ebc4ec9)
+Created:
+  - http-server/src/main/java/kafka/server/http/routing/DefaultExchangeManager.java — stateless facade: initialize(exchangeManager, vhost), onQueueDeclared(bindingManager, queue), onQueueDeleted(bindingManager, queue). Composes ExchangeManager + BindingManager; does not touch RoutingEngine.
+  - http-server/src/test/java/kafka/server/http/routing/DefaultExchangeManagerTest.java — 20 cases: default-exchange creation + direct type + idempotent init, implicit binding declare/delete/dedup, routing semantics (exact match, null param rejection, protection from deletion, surgical removal that spares amq.direct, multi-queue independence).
+Modified:
+  - ivy-docs/tasks/TASK-WS2.05-default-exchange-and-implicit-bindings.md — Learning / Limitations / Field Notes / File Manifest.
