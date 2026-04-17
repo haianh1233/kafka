@@ -17,6 +17,7 @@
 
 // Time: Created - TASK-WS1.15
 // Time: Update - TASK-WS3.08 - added metrics recording
+// Time: Update - TASK-WS4.02 - added per-message TTL check at delivery
 
 package kafka.server.http.ws;
 
@@ -24,10 +25,12 @@ import io.netty.channel.Channel;
 import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
 
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.header.Header;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -224,6 +227,76 @@ public final class WsConsumerFetchLoop implements Runnable {
                 metrics.redeliveryRate.mark();
             }
         }
+    }
+
+    /**
+     * Delivery entry point that applies the per-message TTL check
+     * (design doc §12.4) before handing off to {@link #deliverRecord}.
+     *
+     * <p>If the record has a {@code _ws_expiration} header and the record is
+     * older than the TTL, the record is <b>silently skipped</b>: no deliver
+     * frame is written, no credit is consumed, no delivery tag is assigned,
+     * but the per-partition offset watermark still advances so the record
+     * will not be redelivered on the next fetch. The WS4.01 dead-letter
+     * integration will eventually route expired records to the configured
+     * DLX before skipping — that integration lives on top of this method.
+     *
+     * <p>Non-expired records are delivered exactly as through
+     * {@link #deliverRecord}. The TTL check is cheap: a single iteration
+     * over the record's headers looking for {@code _ws_expiration}.
+     *
+     * @param tp               topic-partition of the record
+     * @param offset           record offset
+     * @param exchange         exchange name recorded by the publisher
+     * @param routingKey       routing key recorded by the publisher
+     * @param messageJson      message payload as pre-serialised JSON
+     * @param redelivered      whether this record is a redelivery
+     * @param headers          Kafka record headers (non-null; may be empty)
+     * @param recordTimestampMs  Kafka record timestamp (ms since epoch)
+     * @param nowMs            wall-clock "now" in ms since epoch
+     * @return {@code true} if the record was delivered, {@code false} if it
+     *         was skipped as expired (caller may emit a drop metric)
+     */
+    boolean maybeDeliverRecord(TopicPartition tp,
+                               long offset,
+                               String exchange,
+                               String routingKey,
+                               String messageJson,
+                               boolean redelivered,
+                               Iterable<Header> headers,
+                               long recordTimestampMs,
+                               long nowMs) {
+        Iterable<Header> safeHeaders = headers == null ? Collections.emptyList() : headers;
+        if (WsMessageTtl.isExpired(safeHeaders, recordTimestampMs, nowMs)) {
+            // Expired: do not deliver. Do not consume a credit. Do not assign
+            // a tag. But DO advance the watermark so the next fetch skips this
+            // record. WS4.01 will hook dead-letter routing in here.
+            if (log.isDebugEnabled()) {
+                log.debug("Skipping expired record: sub={} tp={} offset={} ts={} now={}",
+                    subscriptionId, tp, offset, recordTimestampMs, nowMs);
+            }
+            currentOffsets.put(tp, offset + 1);
+            return false;
+        }
+        deliverRecord(tp, offset, exchange, routingKey, messageJson, redelivered);
+        return true;
+    }
+
+    /**
+     * Convenience overload that uses {@link System#currentTimeMillis()} as the
+     * reference "now" — the production path. Tests inject an explicit clock
+     * via {@link #maybeDeliverRecord(TopicPartition, long, String, String, String, boolean, Iterable, long, long)}.
+     */
+    boolean maybeDeliverRecord(TopicPartition tp,
+                               long offset,
+                               String exchange,
+                               String routingKey,
+                               String messageJson,
+                               boolean redelivered,
+                               Iterable<Header> headers,
+                               long recordTimestampMs) {
+        return maybeDeliverRecord(tp, offset, exchange, routingKey, messageJson,
+            redelivered, headers, recordTimestampMs, System.currentTimeMillis());
     }
 
     /**
