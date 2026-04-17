@@ -269,3 +269,8 @@ Created:
 Modified:
   - path/to/Existing.java — <what changed>
 -->
+
+### 2026-04-17 — FanoutMatcher + tests (commit 33788de005)
+Created:
+  - http-server/src/main/java/kafka/server/http/routing/FanoutMatcher.java — stateless utility that returns all bound queue names as a deduplicated Set, ignoring routing key; O(K) HashSet copy with Set.of() fast-path for empty input.
+  - http-server/src/test/java/kafka/server/http/routing/FanoutMatcherTest.java — 7 JUnit 5 tests covering empty bindings, single/multiple queues, duplicate dedup, routing-key invariance across keys, null routing key, and the extract-from-Binding caller pattern (headers/arguments ignored).
