@@ -701,3 +701,10 @@ Created:
 Modified:
   - path/to/Existing.java — <what changed>
 -->
+
+### 2026-04-17 — WsDeliveryTagTracker + tests (commit 3c6fa1946f)
+Created:
+  - http-server/src/main/java/kafka/server/http/ws/WsDeliveryTagTracker.java — per-subscription tag → (TopicPartition, offset) tracker with per-partition ack bitmap (`TreeMap<Long, AckState>`), gap-aware `getCommittableOffsets`, and `NACKED_REQUEUE → PENDING` redelivery merge. Public `PendingDelivery` record. Thread-safe via a private lock object; volatile `cleared` fast-path.
+  - http-server/src/test/java/kafka/server/http/ws/WsDeliveryTagTrackerTest.java — 20 tests covering monotonic tag assignment, single/multiple ack semantics, requeue vs discard nack, §13.4 gap preservation and gap-fill redelivery, multi-partition tracking, clear/post-clear no-ops, and two concurrency smoke tests (8 threads × 500 tags; 4 threads × 200 tags).
+Modified:
+  - (none)
