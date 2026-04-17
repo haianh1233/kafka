@@ -18,13 +18,15 @@
 // Time: Created - TASK-WS1.15
 // Time: Update - TASK-WS3.03 - added competing consumer / group integration
 // Time: Update - TASK-WS3.04 - added exclusive consumer semantics
+// Time: Update - TASK-WS3.05 - added ACL checks (WsAuthorizationHelper)
 // Time: Update - TASK-WS4.06 - test-hook subscribeWithTracker for ack-timeout sweeper tests
 
 package kafka.server.http.ws;
 
-import io.netty.channel.Channel;
-
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.acl.AclOperation;
+import org.apache.kafka.common.resource.ResourceType;
+import org.apache.kafka.common.security.auth.KafkaPrincipal;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,6 +38,8 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+
+import io.netty.channel.Channel;
 
 /**
  * Manages the lifecycle of all subscriptions for a single WebSocket connection.
@@ -109,6 +113,31 @@ public final class WsSubscriptionManager {
     /** Returns the (optional) exclusive-consumer manager configured on this manager. */
     public ExclusiveConsumerManager exclusiveManager() {
         return exclusiveManager;
+    }
+
+    /**
+     * TASK-WS3.05: checks that the authenticated principal has
+     * {@link AclOperation#READ} on the backing topic of {@code queueName}. Called
+     * by frame handlers BEFORE invoking any of the {@code subscribe*} methods —
+     * keeping the check out of {@link #subscribe} preserves the broad contract
+     * of that method (which is also invoked in response to internal rebalances,
+     * where authorization has already been validated).
+     *
+     * <p>The helper argument may be {@code null}: the method then returns
+     * {@code true} (no-op) to stay compatible with unit-test wiring that doesn't
+     * configure authorization.
+     *
+     * @return {@code true} if authorized or helper is {@code null}
+     */
+    public static boolean checkSubscribeAuthorized(WsAuthorizationHelper helper,
+                                                   KafkaPrincipal principal,
+                                                   String topic) {
+        if (helper == null) {
+            return true;
+        }
+        Objects.requireNonNull(principal, "principal");
+        Objects.requireNonNull(topic, "topic");
+        return helper.authorize(principal, ResourceType.TOPIC, topic, AclOperation.READ);
     }
 
     /**

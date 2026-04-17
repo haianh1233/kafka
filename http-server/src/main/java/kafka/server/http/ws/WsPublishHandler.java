@@ -17,22 +17,28 @@
 // Time: Created - TASK-WS1.11
 // Time: Update - TASK-WS3.01 - recordPending via WsPublisherConfirmTracker
 // Time: Update - TASK-WS3.02 - enhanced mandatory return semantics
+// Time: Update - TASK-WS3.05 - added ACL checks (WsAuthorizationHelper)
 // Time: Update - TASK-WS3.08 - added metrics recording
 // Time: Update - TASK-WS4.05 - integrated dedup cache
 package kafka.server.http.ws;
+
+import kafka.server.http.HttpRequestTranslator;
+import kafka.server.http.routing.ExchangeManager;
+import kafka.server.http.routing.RoutingEngine;
+
+import org.apache.kafka.common.acl.AclOperation;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import kafka.server.http.HttpRequestTranslator;
-import kafka.server.http.routing.ExchangeManager;
-import kafka.server.http.routing.RoutingEngine;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -102,6 +108,8 @@ public final class WsPublishHandler {
     private static final String FIELD_HEADERS = "headers";
     /** TASK-WS4.05: AMQP {@code messageId} property — used as the dedup key. */
     private static final String FIELD_MESSAGE_ID = "messageId";
+    /** TASK-WS3.05: AMQP {@code userId} property — validated against the authenticated principal. */
+    private static final String FIELD_USER_ID = "userId";
 
     // --- Error codes (string tokens mirrored elsewhere in the WS layer) ---
     private static final String ERR_INVALID = "INVALID_REQUEST";
@@ -126,6 +134,12 @@ public final class WsPublishHandler {
      * complete no-op on the dedup path.
      */
     private final WsDeduplicationCache dedupCache;
+    /**
+     * TASK-WS3.05: optional ACL authorization helper. {@code null} disables ACL
+     * checks entirely (convenient for unit tests that focus on routing rather
+     * than authorization). In production wiring this is always supplied.
+     */
+    private final WsAuthorizationHelper authorizationHelper;
 
     /**
      * Convenience constructor for tests that do not care about metrics. Delegates
@@ -137,7 +151,7 @@ public final class WsPublishHandler {
                             WsMessageSerializer messageSerializer,
                             Function<String, String> queueToTopicFn,
                             ProduceRequestSink sink) {
-        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, null, null);
+        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, null, null, null);
     }
 
     /**
@@ -150,7 +164,21 @@ public final class WsPublishHandler {
                             Function<String, String> queueToTopicFn,
                             ProduceRequestSink sink,
                             WsMetrics metrics) {
-        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, metrics, null);
+        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, metrics, null, null);
+    }
+
+    /**
+     * Backwards-compatible 7-arg constructor (with dedup, no authorization helper).
+     * Used by tests written before TASK-WS3.05.
+     */
+    public WsPublishHandler(ExchangeManager exchangeManager,
+                            RoutingEngine routingEngine,
+                            WsMessageSerializer messageSerializer,
+                            Function<String, String> queueToTopicFn,
+                            ProduceRequestSink sink,
+                            WsMetrics metrics,
+                            WsDeduplicationCache dedupCache) {
+        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, metrics, dedupCache, null);
     }
 
     /**
@@ -175,6 +203,19 @@ public final class WsPublishHandler {
      *                           enabled) emits a {@code published} confirm so
      *                           the publisher sees the same outcome it would
      *                           have for a successful first send.
+     * @param authorizationHelper optional ACL authorization helper (TASK-WS3.05).
+     *                            When non-null, every publish performs
+     *                            <ol>
+     *                              <li>userId validation against the principal,</li>
+     *                              <li>a multi-queue TOPIC:WRITE check — if ANY target
+     *                                  queue's backing topic fails the check the
+     *                                  ENTIRE publish is rejected (no partial
+     *                                  routing, per design §19.2).</li>
+     *                            </ol>
+     *                            Denials emit a {@code ACCESS_REFUSED} error frame
+     *                            and suppress both routing and the publisher
+     *                            confirm. {@code null} disables ACL checks
+     *                            entirely — only appropriate for tests.
      */
     public WsPublishHandler(ExchangeManager exchangeManager,
                             RoutingEngine routingEngine,
@@ -182,7 +223,8 @@ public final class WsPublishHandler {
                             Function<String, String> queueToTopicFn,
                             ProduceRequestSink sink,
                             WsMetrics metrics,
-                            WsDeduplicationCache dedupCache) {
+                            WsDeduplicationCache dedupCache,
+                            WsAuthorizationHelper authorizationHelper) {
         this.exchangeManager = Objects.requireNonNull(exchangeManager, "exchangeManager");
         this.routingEngine = Objects.requireNonNull(routingEngine, "routingEngine");
         this.messageSerializer = Objects.requireNonNull(messageSerializer, "messageSerializer");
@@ -190,6 +232,7 @@ public final class WsPublishHandler {
         this.sink = Objects.requireNonNull(sink, "sink");
         this.metrics = metrics; // nullable by design — see Javadoc
         this.dedupCache = dedupCache; // nullable by design — see Javadoc
+        this.authorizationHelper = authorizationHelper; // nullable by design — see Javadoc
     }
 
     // ------------------------------------------------------------------
@@ -211,6 +254,13 @@ public final class WsPublishHandler {
         ParsedPublish parsed = parsePublishFrame(publishFrame, ctx, publishId);
         if (parsed == null) {
             return; // error frame already emitted
+        }
+
+        // TASK-WS3.05: validate optional message.userId against the authenticated
+        // principal. Runs BEFORE any broker-side work (existence check, routing,
+        // dedup) so a user cannot trigger even a probe on another user's exchange.
+        if (!isUserIdAuthorized(parsed, ctx, publishId)) {
+            return; // ACCESS_REFUSED frame already emitted
         }
 
         String vhost = ctx.vhost();
@@ -244,21 +294,21 @@ public final class WsPublishHandler {
         // slot). A hit is treated as "the broker already accepted this message"
         // and therefore mirrors the success path: silently confirm if confirms
         // are enabled, no error frame, no returned frame.
-        if (dedupCache != null && parsed.messageId != null
-                && dedupCache.isDuplicate(parsed.exchange, parsed.messageId)) {
-            log.debug("Dedup hit on exchange={} messageId={} publishId={}",
-                parsed.exchange, parsed.messageId, publishId);
-            emitPublishedIfConfirmsEnabled(ctx, publishId);
+        if (isDedupHit(parsed, ctx, publishId)) {
             return;
         }
 
         Set<String> matchedQueues = runRoute(parsed, ctx, publishId);
-        if (matchedQueues == null) {
-            return; // routing threw — error already emitted
+        if (!hasQueuesToRouteTo(matchedQueues, ctx, publishId, parsed)) {
+            return; // routing threw OR no matches (unrouted path emitted or silent)
         }
-        if (matchedQueues.isEmpty()) {
-            handleUnrouted(ctx, publishId, parsed);
-            return;
+
+        // TASK-WS3.05: per-queue WRITE ACL check. Multi-queue publishes are atomic
+        // w.r.t. authorization — if ANY target queue denies WRITE, the ENTIRE
+        // publish is rejected (no partial routing). The check runs on the RESOLVED
+        // backing topic names because ACLs live on topics, not on queues.
+        if (!isAuthorizedForAllQueues(matchedQueues, ctx, publishId)) {
+            return; // ACCESS_REFUSED frame already emitted
         }
 
         WsMessageSerializer.SerializedMessage serialized = serializeOrError(parsed, ctx, publishId, vhost);
@@ -317,9 +367,12 @@ public final class WsPublishHandler {
      *
      * @param messageId TASK-WS4.05 — extracted {@code message.messageId}
      *                  (nullable). Used as the dedup key. Empty/missing → null.
+     * @param userId    TASK-WS3.05 — extracted {@code message.userId}
+     *                  (nullable). Validated against the authenticated principal
+     *                  before routing.
      */
     private record ParsedPublish(String exchange, String routingKey, JsonNode message,
-                                 boolean mandatory, String messageId) { }
+                                 boolean mandatory, String messageId, String userId) { }
 
     /**
      * Extracts and validates the required fields from the raw frame. Emits an
@@ -346,7 +399,103 @@ public final class WsPublishHandler {
         // TASK-WS4.05: lift message.messageId for the dedup path. Absent or
         // empty values disable dedup for this publish (publisher opt-out).
         String messageId = textOrNull(message, FIELD_MESSAGE_ID);
-        return new ParsedPublish(exchange, routingKey, message, mandatory, messageId);
+        // TASK-WS3.05: lift message.userId for the principal-match check.
+        String userId = textOrNull(message, FIELD_USER_ID);
+        return new ParsedPublish(exchange, routingKey, message, mandatory, messageId, userId);
+    }
+
+    /**
+     * Routing post-processing: returns {@code true} when {@code matchedQueues}
+     * is non-null and non-empty (i.e., there are queues to fan out to). When
+     * {@code matchedQueues} is {@code null} the caller MUST return immediately
+     * (routing threw and an error frame is already on the wire). When the set
+     * is empty this helper emits the unrouted-path frames (returned /
+     * published) and also returns {@code false}.
+     */
+    private boolean hasQueuesToRouteTo(Set<String> matchedQueues,
+                                       WsConnectionContext ctx, Long publishId, ParsedPublish parsed) {
+        if (matchedQueues == null) {
+            return false;
+        }
+        if (matchedQueues.isEmpty()) {
+            handleUnrouted(ctx, publishId, parsed);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * TASK-WS4.05: runs the dedup cache probe. Returns {@code true} when the
+     * message is a duplicate (the caller must short-circuit) and emits a
+     * {@code published} confirm frame if confirms are enabled for this
+     * connection.
+     *
+     * <p>Extracted from {@link #handlePublish} so the NPath complexity of the
+     * multi-branch dispatch path fits the checkstyle budget.
+     */
+    private boolean isDedupHit(ParsedPublish parsed, WsConnectionContext ctx, Long publishId) {
+        if (dedupCache == null || parsed.messageId == null) {
+            return false;
+        }
+        if (!dedupCache.isDuplicate(parsed.exchange, parsed.messageId)) {
+            return false;
+        }
+        log.debug("Dedup hit on exchange={} messageId={} publishId={}",
+            parsed.exchange, parsed.messageId, publishId);
+        emitPublishedIfConfirmsEnabled(ctx, publishId);
+        return true;
+    }
+
+    /**
+     * TASK-WS3.05: runs the {@code message.userId} principal-match check. Returns
+     * {@code true} when authorization passes (including the "no helper wired"
+     * and "userId absent" cases). On mismatch, emits an {@code ACCESS_REFUSED}
+     * error frame and returns {@code false}.
+     *
+     * <p>An absent or empty userId is always allowed — see
+     * {@link WsAuthorizationHelper#validateUserId}.
+     */
+    private boolean isUserIdAuthorized(ParsedPublish parsed, WsConnectionContext ctx, Long publishId) {
+        if (authorizationHelper == null) {
+            return true;
+        }
+        if (authorizationHelper.validateUserId(ctx.principal(), parsed.userId)) {
+            return true;
+        }
+        emitError(ctx, publishId, ERR_ACCESS_REFUSED,
+            "message.userId '" + parsed.userId + "' does not match authenticated principal");
+        return false;
+    }
+
+    /**
+     * TASK-WS3.05: runs the multi-queue WRITE authorization check. Returns
+     * {@code true} when authorization passes (including the "no helper wired"
+     * case). On denial, emits an {@code ACCESS_REFUSED} error frame and returns
+     * {@code false}.
+     *
+     * <p>Extracted from {@link #handlePublish} to keep that method within the
+     * project's cyclomatic-complexity budget.
+     */
+    private boolean isAuthorizedForAllQueues(Set<String> matchedQueues,
+                                             WsConnectionContext ctx, Long publishId) {
+        if (authorizationHelper == null) {
+            return true;
+        }
+        Set<String> topicsToCheck = new LinkedHashSet<>();
+        for (String queue : matchedQueues) {
+            String topic = queueToTopicFn.apply(queue);
+            if (topic != null && !topic.isEmpty()) {
+                topicsToCheck.add(topic);
+            }
+        }
+        Set<String> denied = authorizationHelper.filterUnauthorizedQueues(
+            ctx.principal(), topicsToCheck, AclOperation.WRITE);
+        if (!denied.isEmpty()) {
+            emitError(ctx, publishId, ERR_ACCESS_REFUSED,
+                "Not authorized to WRITE to topic(s): " + denied);
+            return false;
+        }
+        return true;
     }
 
     /**

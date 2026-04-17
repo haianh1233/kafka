@@ -196,32 +196,53 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsAuthoriz
 
 ## Learning
 
-_To be filled by the executing agent._
+- The spec file names `WsAuthorizationHelperTest` but the parent message wanted `WsAclAuthorizationTest`; aligned on the latter to match the run-command, while using the same ACL-helper focus.
+- Kafka's `Authorizer.authorize(AuthorizableRequestContext, List<Action>)` is the ONLY public entry point — no `authorize(principal, resource, op)` shortcut exists. The helper synthesises a minimal `AuthorizableRequestContext` backed by the WS connection's principal + a fixed `"WS"` listener name (stays consistent with Kafka's listener-name-aware audit logging).
+- `ResourcePattern` must be built with `PatternType.LITERAL` for the authorizer to do exact-match lookups against stored LITERAL ACLs; wildcard/prefix patterns are reserved for filter-style ACL queries.
+- The cyclomatic/NPath complexity rule on `WsPublishHandler.handlePublish` is tight: each new `if` on the main path roughly doubles NPath. Splitting each added branch into a private method (`isUserIdAuthorized`, `isAuthorizedForAllQueues`, `isDedupHit`, `hasQueuesToRouteTo`) was necessary to keep the file under the checkstyle budget AND ended up improving readability of the publish pipeline.
+- Keeping the helper/field `null`able in handlers matters — existing tests across WS1.04 / WS1.11 / WS1.15 never pass an authorizer, so the "no helper → permissive" degenerate path must be a hot path without changing observable behaviour.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- The `AuthorizableRequestContext` built by the helper uses placeholder values for `clientAddress` (0.0.0.0), `requestType`/`requestVersion` (`-1`), and `clientId` ("ws"). This is fine for `StandardAuthorizer` (only principal + host matters) but authorizers that audit these fields will see placeholder data for every WS call. Production wiring should derive the real peer address from `WsConnectionContext.remoteAddress()` — left for the integration task that plumbs `WsAuthorizationHelper` through `WsUpgradeOrHttpHandler`.
+- `WsFrameHandler.requireExchangeAdmin` / `requireQueueAccess` are hooks — they are NOT called from the existing `handleDeclareExchange` / `handleDeclareQueue` / etc. stubs (those still throw `UnsupportedOperationException`). Wiring them into the real implementations belongs to the per-operation tasks (WS2.06 REST + later WS frame-handler fleshing).
+- `WsSubscriptionManager.checkSubscribeAuthorized` is a static utility; the subscribe call sites (frame handler's `handleSubscribe`) do not yet call it — same reasoning as above.
+- Group-level `GROUP:READ` check for subscribe (design §19.2) is not implemented — the WS consumer-group coordinator is still under construction (WS3.03); adding the check before the coordinator exists would require a stub `consumerGroupId` that isn't meaningful. Deferred to the subscribe-handler implementation task.
+- `bind`/`unbind` maps to `TOPIC:ALTER` on the backing topic `ws.<queue>` per the task-file mapping. The design doc also contemplates an exchange-level ALTER check for the exchange side of the binding; the skeleton task spec only lists the queue side, so the helper models exactly that.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Wired authorization through backward-compatible constructors: each impacted class (`WsPublishHandler`, `WsFrameHandler`) gained a new constructor overload taking a nullable `WsAuthorizationHelper`; the existing overloads delegate with `null`. Zero existing test had to change.
+- `WsPublishHandler.handlePublish` drifted over the NPath complexity budget (512) the moment the second ACL branch (`isAuthorizedForAllQueues`) landed. Consolidating unrelated existing branches (`runRoute` → `null`/empty) into a `hasQueuesToRouteTo` helper bought back the budget while also making the main method read as a linear sequence of guards.
+- `isAuthorizedForAllQueues` resolves queue names → topic names VIA the injected `queueToTopicFn` before asking the authorizer, so the ACL check runs on exactly the same resource string the Kafka core layer will authorize later. Any queue whose topic resolution is `null`/empty is silently omitted — matches the `fanOut` behaviour below.
+- `FakeAuthorizer` in the test file is ~60 lines and suffices for every scenario; avoided bringing in `MockedStatic` / `StandardAuthorizer` to keep the tests pure unit-level. The fake records every context + action for assertions (`authorize_passesPrincipalThroughRequestContext`, `authorize_buildsLiteralResourcePattern`).
+- Mandatory worktree reset: worktree was at `f95a1f995d`; reset to `origin/feature/http-protocol` @ `417ea132fc` before starting. All subsequent work is on top of that HEAD.
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] `timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsAuthorizationHelperTest' -x spotlessCheck` exits 0
-- [ ] `grep -r "WsAuthorizationHelper" http-server/src/main/java/` returns at least 4 hits
-- [ ] Multi-queue publish authorization checks ALL target queues
-- [ ] userId validation rejects mismatch with ACCESS_REFUSED
-- [ ] Learning section filled with at least one entry
+- [x] `timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsAclAuthorizationTest' -x spotlessCheck` exits 0 (32/32 passed)
+- [x] `grep -r "WsAuthorizationHelper" http-server/src/main/java/` returns at least 4 hits (15 hits across 4 files)
+- [x] Multi-queue publish authorization checks ALL target queues (`publishHandler_multiQueueOneDenied_rejectsEntirePublish`)
+- [x] userId validation rejects mismatch with ACCESS_REFUSED (`publishHandler_userIdMismatch_emitsAccessRefusedFrame`)
+- [x] Learning section filled with at least one entry
 
 ---
 
 ## File Manifest
 
-_To be filled by the executing agent._
+**Created:**
+- `http-server/src/main/java/kafka/server/http/ws/WsAuthorizationHelper.java` — ACL helper class with `authorize`, `filterUnauthorizedQueues`, `validateUserId` methods; bundles a minimal `AuthorizableRequestContext` impl (`WsAuthorizableRequestContext`) carrying the connection's principal into the authorizer call.
+- `http-server/src/test/java/kafka/server/http/ws/WsAclAuthorizationTest.java` — 32 unit tests: helper-level per-operation authorized/denied coverage + integration tests against `WsPublishHandler` (userId + multi-queue), `WsFrameHandler` (requireExchangeAdmin / requireQueueAccess hooks), `WsSubscriptionManager.checkSubscribeAuthorized`.
+
+**Modified:**
+- `http-server/src/main/java/kafka/server/http/ws/WsPublishHandler.java` — added nullable `authorizationHelper` field, new 8-arg constructor, `FIELD_USER_ID`/`userId` in `ParsedPublish`, userId + multi-queue WRITE checks in `handlePublish`, extracted `isUserIdAuthorized` / `isAuthorizedForAllQueues` / `isDedupHit` / `hasQueuesToRouteTo` helpers.
+- `http-server/src/main/java/kafka/server/http/ws/WsFrameHandler.java` — added nullable `authorizationHelper` field + 4-arg constructor overload; added `ERR_ACCESS_REFUSED` / `CLUSTER_RESOURCE_NAME` / `WS_TOPIC_PREFIX` constants and `requireAuthorized` / `requireExchangeAdmin` / `requireQueueAccess` hooks for later-task handler impls.
+- `http-server/src/main/java/kafka/server/http/ws/WsSubscriptionManager.java` — added static `checkSubscribeAuthorized(helper, principal, topic)` utility (TOPIC:READ check).
+
+**Commit:** _(filled after commit)_
