@@ -310,19 +310,22 @@ class WsMetricsTest {
     }
 
     @Test
-    void publishHandler_unknownExchange_incrementsErrorRate() {
+    void publishHandler_missingRoutingKey_incrementsErrorRate() {
+        // Per WS3.02: unknown exchange now routes as unrouted (silent drop / returned)
+        // rather than error. Schema-validation errors (missing required field) still
+        // emit error frames — exercise that path for errorRate.
         ExchangeManager em = mock(ExchangeManager.class);
         RoutingEngine re = mock(RoutingEngine.class);
-        when(em.getExchange("/", "ghost")).thenReturn(null);
 
         WsPublishHandler.ProduceRequestSink sink = (topic, s, pid, c, ctx) -> { };
         WsPublishHandler handler = new WsPublishHandler(em, re, new WsMessageSerializer(),
             q -> "ws." + q, sink, metrics);
 
         long before = metrics.errorRate.count();
-        handler.handlePublish(buildPublishFrame("ghost", "rk", "x", 1L, false), newConnectionContext());
+        // buildPublishFrame with null routingKey -> missing required field -> error frame
+        handler.handlePublish(buildPublishFrame("ex", null, "x", 1L, false), newConnectionContext());
         assertEquals(before + 1, metrics.errorRate.count(),
-            "errorRate must tick when publish emits an error frame");
+            "errorRate must tick when publish emits a schema-validation error frame");
     }
 
     @Test
