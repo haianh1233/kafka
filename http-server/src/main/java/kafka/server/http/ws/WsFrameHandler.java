@@ -68,6 +68,7 @@ import java.util.Objects;
  *
  * // Time: Created - TASK-WS1.04
  * // Time: Update - TASK-WS3.01 - added enable-confirms handling
+ * // Time: Update - TASK-WS3.08 - added metrics recording
  */
 public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame> {
 
@@ -111,10 +112,16 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
 
     private final WsConnectionContext connectionContext;
     private final WsConfigs wsConfigs;
+    private final WsMetrics metrics;
 
     public WsFrameHandler(WsConnectionContext connectionContext, WsConfigs wsConfigs) {
+        this(connectionContext, wsConfigs, null);
+    }
+
+    public WsFrameHandler(WsConnectionContext connectionContext, WsConfigs wsConfigs, WsMetrics metrics) {
         this.connectionContext = Objects.requireNonNull(connectionContext, "connectionContext");
         this.wsConfigs = Objects.requireNonNull(wsConfigs, "wsConfigs");
+        this.metrics = metrics;
     }
 
     // ------------------------------------------------------------------
@@ -123,6 +130,12 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, TextWebSocketFrame frame) {
+        if (metrics != null) {
+            // Count every inbound text frame as a control message — this includes
+            // publish and subscribe frames, matching the §11.5 definition of the
+            // ws.control.message.rate metric.
+            metrics.controlMessageRate.mark();
+        }
         JsonNode msg = parseFrame(frame.text());
         if (msg == null) {
             return; // parseFrame already emitted the error frame
@@ -413,6 +426,9 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
             // pipeline because we couldn't render an error frame.
             log.warn("Failed to serialise error frame for session {}",
                     connectionContext.sessionId(), e);
+        }
+        if (metrics != null) {
+            metrics.errorRate.mark();
         }
     }
 

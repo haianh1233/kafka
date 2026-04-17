@@ -220,32 +220,59 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsMetricsT
 
 ## Learning
 
-_To be filled by the executing agent._
+- `KafkaMetricsGroup.newGauge` **returns** a `Gauge<T>` (it isn't void), but modern checkstyle with `UnusedLocalVariable` rejects `Gauge<X> ignored = …`. Either use `var` plus `@SuppressWarnings`, or simply drop the assignment — the gauge is registered as a side effect of the call.
+- JMX tag keys are preserved verbatim in the MBean name — the `queue=<name>` tag on per-queue gauges is emitted exactly as written by `KafkaMetricsGroup`, so tests can assert `mbean.getMBeanName().contains("queue=orders")`.
+- Existing Kafka `HttpMetrics` uses `close()` + `removeMetric(...)` with the full tag map, not the raw metric name, because `KafkaMetricsGroup.removeMetric` rebuilds the `MetricName` from the same tag set used on creation. Using the wrong tag map silently no-ops — the test `close_removesAllMetrics` would have caught that.
+- Adding an additional-arg constructor with a nullable `WsMetrics` avoided touching every existing test: the previous-signature constructor still exists and delegates with `metrics=null`, so the handler skips every `metrics.*.mark()` call.
+- `controlMessageRate` is counted on **every** inbound text frame (including invalid ones that parse to no message), matching the "inbound message" definition in design doc §11.5. The `errorRate` then also ticks when that frame produces an error response — both counters move in the same call, which is the correct operator view (error rate is always <= control rate).
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- `ConfirmRate`, `DlxRate`, and `RedeliveryRate` meters are wired at known call sites (`WsAckHandler` for nack+dlx, `WsConsumerFetchLoop.deliverRecord` for redelivered flag), but `ConfirmRate` is **not** yet wired into `WsPublisherConfirmTracker`. The meter is registered and `close()` tears it down, but no production call site invokes it. Full wiring depends on whether confirm emission happens inside or outside `handleWsResponse`; left for a follow-up.
+- Per-queue `QueueDepth` and `QueueConsumers` gauges are plumbed (register/remove) but **no production site calls them**. The intended callers are a queue-lifecycle manager (queue declare/delete) that does not exist in the current codebase; the unit tests verify the plumbing works, and production wiring can land in the task that introduces the queue manager.
+- `ConnectionCount` / `SubscriptionCount` gauges use `Supplier<Integer>` — production wiring (`WsConnectionRegistry`, `WsSubscriptionManager`) is trivial (lambda over `registry.size()`) but not wired here to keep the diff minimal.
+- `WsMetrics` is not yet owned by any process (no `HttpProcessor`-level singleton) — production integration should wire it the same way `HttpMetrics` is wired.
+- Yammer `Meter` does not expose a `reset()` method, so tests that assert "incremented by N" read the counter before and after each action instead of resetting. Harmless but requires per-test `before` snapshots.
+- `CreditExhaustedRate` is only marked when the loop observes `credits.available() == 0` after `awaitCredits` returns 0 — if the cause was channel un-writability rather than credit starvation, the meter does not tick (by design per the metric's name).
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Followed the `HttpMetrics` pattern exactly: constant strings for metric names, `KafkaMetricsGroup` with `PACKAGE_NAME="kafka.server.http.ws"` + `CLASS_NAME="WsMetrics"`, eager Meter construction in the constructor, lazy Gauge registration with per-queue cleanup via `ConcurrentHashMap` bookkeeping.
+- The `UnusedLocalVariable` checkstyle rule caught `Gauge<Integer> ignored = ...` in four places during the first gradle run; resolved by dropping the assignment since `newGauge` registers as a side effect. Shipped `WsMetricsTest` green before touching handlers.
+- Added a new metrics-aware constructor to each handler with the previous signature preserved as a delegating convenience — this meant zero changes to the 4 existing test classes for publish/fetch/ack/frame while the new `WsMetricsTest` exercises the wiring.
+- The `frameHandler_inboundFrame_incrementsControlMessageRate` test sends an `enable-confirms` frame because it has no dependencies beyond `WsConnectionContext`. Other frame types would require stubbed routing/exchange/subscription managers.
+- `buildPublishFrame` in `WsMetricsTest` mirrors the helper in `WsPublishHandlerTest`; a small amount of duplication (~12 lines) is acceptable because the test packages a richer publish frame that exercises the full handler path.
+- Final commit hash recorded in "Return" section below (filled by the executing agent on commit).
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] `timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsMetricsTest' -x spotlessCheck` exits 0
-- [ ] `grep -r "WsMetrics" http-server/src/main/java/` returns at least 5 hits (used in multiple handlers)
-- [ ] At least 11 meters defined with protocol=ws tag
-- [ ] close() removes all metrics
-- [ ] Learning section filled with at least one entry
+- [x] `timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsMetricsTest' -x spotlessCheck` exits 0 — 26 tests PASS
+- [x] `grep -r "WsMetrics" http-server/src/main/java/` returns at least 5 hits — returns 11 hits across `WsMetrics`, `WsPublishHandler`, `WsConsumerFetchLoop`, `WsAckHandler`, `WsFrameHandler`.
+- [x] At least 11 meters defined with `protocol=ws` tag — exactly 11: publishRate, deliverRate, ackRate, nackRate, errorRate, creditExhaustedRate, redeliveryRate, dlxRate, mandatoryReturnRate, confirmRate, controlMessageRate. The `atLeastElevenMeters_registered` test guards this count.
+- [x] `close()` removes all metrics — `close_removesAllMetrics` test verifies zero WS metrics remain in the Yammer registry after close.
+- [x] Learning section filled with five entries.
 
 ---
 
 ## File Manifest
 
-_To be filled by the executing agent._
+**Created:**
+- `http-server/src/main/java/kafka/server/http/ws/WsMetrics.java` — 11 meters + 4 gauge-registration paths + close() teardown.
+- `http-server/src/test/java/kafka/server/http/ws/WsMetricsTest.java` — 26 tests: meter registration, gauge registration, per-queue gauge lifecycle, close cleanup, and integration with `WsPublishHandler`, `WsConsumerFetchLoop`, `WsAckHandler`, `WsFrameHandler`.
+
+**Modified:**
+- `http-server/src/main/java/kafka/server/http/ws/WsPublishHandler.java` — added `WsMetrics`-aware constructor; records `publishRate` on successful enqueue, `mandatoryReturnRate` on NO_ROUTE mandatory returns, `errorRate` on `emitError`.
+- `http-server/src/main/java/kafka/server/http/ws/WsConsumerFetchLoop.java` — added `WsMetrics`-aware constructor; records `deliverRate` on each `deliverRecord`, `redeliveryRate` when the record is a redelivery, `creditExhaustedRate` when awaitCredits returns 0 due to credit starvation.
+- `http-server/src/main/java/kafka/server/http/ws/WsAckHandler.java` — added `WsMetrics`-aware constructor; records `ackRate` on successful ack, `nackRate` on successful nack, `dlxRate` when nack has `requeue=false`.
+- `http-server/src/main/java/kafka/server/http/ws/WsFrameHandler.java` — added `WsMetrics`-aware constructor; records `controlMessageRate` on every inbound text frame, `errorRate` on every emitted error frame.
+
+**Not modified (deferred):**
+- `WsCreditManager.java` — credit-exhaustion is recorded from the fetch loop where full context is available; keeping the credit manager unaware keeps the class pure.
+- `WsConnectionContext.java` — connection count gauge is `Supplier`-based; the context does not need to touch metrics.
+- `WsPublisherConfirmTracker.java` — `confirmRate` meter is registered but not wired; see Limitations.

@@ -16,6 +16,7 @@
  */
 
 // Time: Created - TASK-WS1.15
+// Time: Update - TASK-WS3.08 - added metrics recording
 
 package kafka.server.http.ws;
 
@@ -82,8 +83,14 @@ public final class WsConsumerFetchLoop implements Runnable {
     private final WsDeliveryTagTracker tagTracker;
     private final Channel channel;
     private final boolean noAck;
+    private final WsMetrics metrics;
     private final AtomicBoolean active = new AtomicBoolean(true);
 
+    /**
+     * Convenience constructor with no metrics — equivalent to passing {@code null}
+     * to the metrics-aware constructor. Used by unit tests that don't care about
+     * metric emission.
+     */
     public WsConsumerFetchLoop(String subscriptionId,
                                String topic,
                                Map<TopicPartition, Long> startOffsets,
@@ -91,6 +98,17 @@ public final class WsConsumerFetchLoop implements Runnable {
                                WsDeliveryTagTracker tagTracker,
                                Channel channel,
                                boolean noAck) {
+        this(subscriptionId, topic, startOffsets, creditManager, tagTracker, channel, noAck, null);
+    }
+
+    public WsConsumerFetchLoop(String subscriptionId,
+                               String topic,
+                               Map<TopicPartition, Long> startOffsets,
+                               WsCreditManager creditManager,
+                               WsDeliveryTagTracker tagTracker,
+                               Channel channel,
+                               boolean noAck,
+                               WsMetrics metrics) {
         this.subscriptionId = Objects.requireNonNull(subscriptionId, "subscriptionId");
         this.topic = Objects.requireNonNull(topic, "topic");
         Objects.requireNonNull(startOffsets, "startOffsets");
@@ -99,6 +117,7 @@ public final class WsConsumerFetchLoop implements Runnable {
         this.tagTracker = Objects.requireNonNull(tagTracker, "tagTracker");
         this.channel = Objects.requireNonNull(channel, "channel");
         this.noAck = noAck;
+        this.metrics = metrics; // nullable; null means no-op metric recording
     }
 
     @Override
@@ -110,6 +129,11 @@ public final class WsConsumerFetchLoop implements Runnable {
                 if (budget <= 0) {
                     // Either no credits or channel not writable. awaitCredits has already
                     // parked for up to CREDIT_WAIT_TIMEOUT_MS — loop re-checks active flag.
+                    // Record credit-exhausted only when credits are the blocker (not when
+                    // the channel is simply not writable or we're being shut down).
+                    if (metrics != null && active.get() && creditManager.available() == 0) {
+                        metrics.creditExhaustedRate.mark();
+                    }
                     continue;
                 }
                 if (!active.get()) {
@@ -194,6 +218,12 @@ public final class WsConsumerFetchLoop implements Runnable {
         channel.writeAndFlush(new TextWebSocketFrame(frame));
         creditManager.consume();
         currentOffsets.put(tp, offset + 1);
+        if (metrics != null) {
+            metrics.deliverRate.mark();
+            if (redelivered) {
+                metrics.redeliveryRate.mark();
+            }
+        }
     }
 
     /**
