@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 // Time: Created - TASK-WS1.02
+// Time: Update - TASK-WS3.01 - added WsPublisherConfirmTracker field
 package kafka.server.http.ws;
 
 import io.netty.channel.ChannelFutureListener;
@@ -60,6 +61,7 @@ public final class WsConnectionContext {
     private final InetSocketAddress remoteAddress;
     private final ConcurrentHashMap<String, Object> subscriptions;
     private final AtomicBoolean publishConfirmsEnabled;
+    private final WsPublisherConfirmTracker confirmTracker;
 
     public WsConnectionContext(
             String sessionId,
@@ -75,6 +77,7 @@ public final class WsConnectionContext {
         this.connectTime = Instant.now();
         this.subscriptions = new ConcurrentHashMap<>();
         this.publishConfirmsEnabled = new AtomicBoolean(false);
+        this.confirmTracker = new WsPublisherConfirmTracker(this);
     }
 
     // --- Immutable accessors ---
@@ -114,10 +117,22 @@ public final class WsConnectionContext {
     }
 
     /**
-     * Idempotent — calling more than once is a no-op.
+     * Idempotent — calling more than once is a no-op. Also enables the
+     * per-connection {@link WsPublisherConfirmTracker} so publishId lifecycle
+     * accounting is kept in sync with the boolean flag observed by
+     * {@link kafka.server.http.HttpProcessor#handleWsResponse}.
      */
     public void enablePublishConfirms() {
         publishConfirmsEnabled.set(true);
+        confirmTracker.enable();
+    }
+
+    /**
+     * The per-connection publisher-confirm tracker. Never {@code null}; remains
+     * in the disabled state until {@link #enablePublishConfirms()} is called.
+     */
+    public WsPublisherConfirmTracker confirmTracker() {
+        return confirmTracker;
     }
 
     // --- Channel operations ---

@@ -376,6 +376,63 @@ class WsFrameHandlerTest {
         // complicating the setup; behavioural proof is the subscription clear.
     }
 
+    // ------------------------------------------------------------------
+    //  enable-confirms — behavioural (not just dispatch)
+    //  Added: TASK-WS3.01
+    // ------------------------------------------------------------------
+
+    @Test
+    void enableConfirms_flipsConfirmFlagOnContext() {
+        WsFrameHandler handler = new WsFrameHandler(connCtx, wsConfigs);
+        assertTrue(!connCtx.isPublishConfirmsEnabled(),
+                "confirms must start disabled");
+
+        deliver(handler, "{\"type\":\"enable-confirms\"}");
+
+        assertTrue(connCtx.isPublishConfirmsEnabled(),
+                "enable-confirms frame must flip the ctx flag");
+    }
+
+    @Test
+    void enableConfirms_emitsConfirmsEnabledFrame() throws Exception {
+        WsFrameHandler handler = new WsFrameHandler(connCtx, wsConfigs);
+        deliver(handler, "{\"type\":\"enable-confirms\",\"id\":\"ec-1\"}");
+
+        assertEquals(1, writtenFrames.size(),
+                "expect exactly one confirms-enabled frame, got: " + writtenFrames);
+        JsonNode frame = MAPPER.readTree(writtenFrames.get(0));
+        assertEquals("confirms-enabled", frame.get("type").asText());
+        // Correlation id echoed when provided.
+        assertEquals("ec-1", frame.get("id").asText());
+    }
+
+    @Test
+    void enableConfirms_omitsCorrelationId_whenAbsent() throws Exception {
+        WsFrameHandler handler = new WsFrameHandler(connCtx, wsConfigs);
+        deliver(handler, "{\"type\":\"enable-confirms\"}");
+
+        assertEquals(1, writtenFrames.size());
+        JsonNode frame = MAPPER.readTree(writtenFrames.get(0));
+        assertEquals("confirms-enabled", frame.get("type").asText());
+        assertNull(frame.get("id"),
+                "id field should be absent when client omits it");
+    }
+
+    @Test
+    void enableConfirms_isIdempotent() throws Exception {
+        WsFrameHandler handler = new WsFrameHandler(connCtx, wsConfigs);
+        deliver(handler, "{\"type\":\"enable-confirms\"}");
+        deliver(handler, "{\"type\":\"enable-confirms\"}");
+
+        assertTrue(connCtx.isPublishConfirmsEnabled());
+        assertEquals(2, writtenFrames.size(),
+                "each enable-confirms frame still gets a confirms-enabled reply");
+        JsonNode f2 = MAPPER.readTree(writtenFrames.get(1));
+        assertEquals("confirms-enabled", f2.get("type").asText());
+    }
+
+    // ------------------------------------------------------------------
+
     @Test
     void exceptionCaught_closesChannel() {
         AtomicBoolean closed = new AtomicBoolean(false);

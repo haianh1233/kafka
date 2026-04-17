@@ -402,6 +402,118 @@ class WsPublishHandlerTest {
     }
 
     // ------------------------------------------------------------------
+    //  Publisher confirms — TASK-WS3.01
+    // ------------------------------------------------------------------
+
+    @Test
+    void handlePublish_confirmsEnabled_recordsPublishIdAsPending() {
+        connCtx.enablePublishConfirms();
+        when(exchangeManager.getExchange("/", "events"))
+            .thenReturn(new ExchangeMetadata("events", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("events"), eq("k"), any()))
+            .thenReturn(Set.of("q"));
+
+        assertEquals(0, connCtx.confirmTracker().pendingCount());
+        handler.handlePublish(buildPublishFrame("events", "k", "payload", 101L, false), connCtx);
+
+        assertEquals(1, connCtx.confirmTracker().pendingCount(),
+            "publishId should be recorded as pending for confirm");
+    }
+
+    @Test
+    void handlePublish_confirmsDisabled_doesNotRecordPending() {
+        // confirms not enabled on ctx
+        when(exchangeManager.getExchange("/", "events"))
+            .thenReturn(new ExchangeMetadata("events", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("events"), eq("k"), any()))
+            .thenReturn(Set.of("q"));
+
+        handler.handlePublish(buildPublishFrame("events", "k", "payload", 42L, false), connCtx);
+
+        assertEquals(0, connCtx.confirmTracker().pendingCount(),
+            "nothing should be recorded when confirms are disabled");
+    }
+
+    @Test
+    void handlePublish_multiplePublishes_recordMonotonic() {
+        connCtx.enablePublishConfirms();
+        when(exchangeManager.getExchange("/", "events"))
+            .thenReturn(new ExchangeMetadata("events", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("events"), eq("k"), any()))
+            .thenReturn(Set.of("q"));
+
+        handler.handlePublish(buildPublishFrame("events", "k", "m1", 1L, false), connCtx);
+        handler.handlePublish(buildPublishFrame("events", "k", "m2", 2L, false), connCtx);
+        handler.handlePublish(buildPublishFrame("events", "k", "m3", 3L, false), connCtx);
+
+        assertEquals(3, connCtx.confirmTracker().pendingCount());
+        // Verify the captured publishIds are strictly increasing (monotonic).
+        assertEquals(3, captured.size());
+        assertEquals(Long.valueOf(1L), captured.get(0).publishId);
+        assertEquals(Long.valueOf(2L), captured.get(1).publishId);
+        assertEquals(Long.valueOf(3L), captured.get(2).publishId);
+    }
+
+    @Test
+    void handlePublish_multiQueueFanout_recordsPendingOnce() {
+        // Multi-queue: publishId should be recorded once, not per-queue. That
+        // way a single "published" confirm covers the whole fanout.
+        connCtx.enablePublishConfirms();
+        when(exchangeManager.getExchange("/", "fan"))
+            .thenReturn(new ExchangeMetadata("fan", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("fan"), eq("b"), any()))
+            .thenReturn(new java.util.LinkedHashSet<>(List.of("q1", "q2", "q3")));
+
+        handler.handlePublish(buildPublishFrame("fan", "b", "msg", 55L, false), connCtx);
+
+        assertEquals(3, captured.size(), "sink still sees one enqueue per matched queue");
+        assertEquals(1, connCtx.confirmTracker().pendingCount(),
+            "tracker should record publishId exactly once even with fanout");
+    }
+
+    @Test
+    void handlePublish_confirmsEnabled_confirmSuccess_emitsPublishedFrame() throws Exception {
+        // End-to-end tracker integration: after a successful produce callback
+        // calls confirmSuccess via the tracker, a "published" frame lands on
+        // the WS channel.
+        connCtx.enablePublishConfirms();
+        when(exchangeManager.getExchange("/", "events"))
+            .thenReturn(new ExchangeMetadata("events", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("events"), eq("k"), any()))
+            .thenReturn(Set.of("q"));
+
+        handler.handlePublish(buildPublishFrame("events", "k", "payload", 77L, false), connCtx);
+        assertEquals(0, writtenFrames.size(), "no frames emitted yet — produce not complete");
+
+        // Simulate the produce callback.
+        connCtx.confirmTracker().confirmSuccess(77L);
+
+        assertEquals(1, writtenFrames.size());
+        String frame = writtenFrames.get(0);
+        assertTrue(frame.contains("\"type\":\"published\""), "frame=" + frame);
+        assertTrue(frame.contains("\"publishId\":77"), "frame=" + frame);
+    }
+
+    @Test
+    void handlePublish_confirmsEnabled_confirmFailure_emitsPublishFailedFrame() {
+        connCtx.enablePublishConfirms();
+        when(exchangeManager.getExchange("/", "events"))
+            .thenReturn(new ExchangeMetadata("events", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("events"), eq("k"), any()))
+            .thenReturn(Set.of("q"));
+
+        handler.handlePublish(buildPublishFrame("events", "k", "payload", 88L, false), connCtx);
+        connCtx.confirmTracker().confirmFailure(88L, "NOT_ENOUGH_REPLICAS", "ISR below min");
+
+        assertEquals(1, writtenFrames.size());
+        String frame = writtenFrames.get(0);
+        assertTrue(frame.contains("\"type\":\"publish-failed\""), "frame=" + frame);
+        assertTrue(frame.contains("\"publishId\":88"), "frame=" + frame);
+        assertTrue(frame.contains("NOT_ENOUGH_REPLICAS"), "frame=" + frame);
+        assertTrue(frame.contains("ISR below min"), "frame=" + frame);
+    }
+
+    // ------------------------------------------------------------------
     //  Helpers
     // ------------------------------------------------------------------
 

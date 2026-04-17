@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 // Time: Created - TASK-WS1.11
+// Time: Update - TASK-WS3.01 - recordPending via WsPublisherConfirmTracker
 package kafka.server.http.ws;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -245,6 +246,14 @@ public final class WsPublishHandler {
                         WsMessageSerializer.SerializedMessage serialized,
                         WsConnectionContext ctx, Long publishId) {
         boolean confirmsEnabled = ctx.isPublishConfirmsEnabled();
+        // If confirms are enabled and the client stamped a publishId, record it
+        // as pending so the produce-completion callback can emit the confirm.
+        // No-op when confirmsEnabled is false or publishId is null. Recording
+        // happens before enqueue to avoid a race where the response fires before
+        // the pending slot is populated.
+        if (confirmsEnabled && publishId != null) {
+            ctx.confirmTracker().recordPending(publishId);
+        }
         for (String queue : matchedQueues) {
             String topic = queueToTopicFn.apply(queue);
             if (topic == null || topic.isEmpty()) {
