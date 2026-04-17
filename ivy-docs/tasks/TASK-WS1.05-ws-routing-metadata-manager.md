@@ -636,3 +636,14 @@ timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.ws.WsRoutingM
 
 > Filled by the executing agent after each commit.
 > Run: `git diff --name-status HEAD~1 HEAD -- '*.java' '*.xml' '*.json' '*.yaml' '*.yml'`
+
+### Commit `708a44abd2` (worktree-agent-ae9098fc)
+
+```
+A	http-server/src/main/java/kafka/server/http/ws/BindingMetadata.java
+A	http-server/src/main/java/kafka/server/http/ws/ExchangeMetadata.java
+A	http-server/src/main/java/kafka/server/http/ws/QueueMetadata.java
+A	http-server/src/main/java/kafka/server/http/ws/WsRoutingMetadataManager.java
+A	http-server/src/test/java/kafka/server/http/ws/WsRoutingMetadataManagerTest.java
+M	ivy-docs/tasks/TASK-WS1.05-ws-routing-metadata-manager.md
+```
