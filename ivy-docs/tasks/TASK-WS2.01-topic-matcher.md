@@ -539,3 +539,10 @@ Created:
 Modified:
   - path/to/Existing.java — <what changed>
 -->
+
+### 2026-04-17 — WS2.01 TopicMatcher (commit 68293756d1)
+Created:
+  - http-server/src/main/java/kafka/server/http/routing/TopicMatcher.java — AMQP topic-exchange wildcard matcher (`matches`, `splitByDot`)
+  - http-server/src/test/java/kafka/server/http/routing/TopicMatcherTest.java — 32 test methods / 42 executions covering exact, `*`, `#` (including mid-pattern), empty-string, case-sensitivity, and `splitByDot` edges
+Modified:
+  - (none under *.java/*.xml/*.json/*.yaml/*.yml; Learning / Limitations / Field Notes filled in this task file)
