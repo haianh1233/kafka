@@ -16,6 +16,7 @@
  */
 
 // Time: Created - TASK-WS1.15
+// Time: Update - TASK-WS3.03 - added competing consumer / group integration
 
 package kafka.server.http.ws;
 
@@ -318,6 +319,48 @@ class WsSubscriptionManagerTest {
             workers.shutdownNow();
             workers.awaitTermination(2, TimeUnit.SECONDS);
         }
+    }
+
+    // ---- TASK-WS3.03: group coordinator wiring ----
+
+    @Test
+    void constructor_withGroupCoordinator_storesReference() {
+        WsConsumerGroupCoordinator coord = new WsConsumerGroupCoordinator();
+        WsSubscriptionManager mgr = new WsSubscriptionManager(executor, coord);
+        assertNotNull(mgr.groupCoordinator());
+    }
+
+    @Test
+    void constructor_withoutGroupCoordinator_returnsNull() {
+        assertNull(manager.groupCoordinator());
+    }
+
+    @Test
+    void invalidateRevokedPartitions_dropsTagsForAffectedSubscription() {
+        manager.subscribe("sub-1", "orders", "ws.orders",
+            Set.of(tp0), Map.of(tp0, 0L), 10, false, channel);
+        SubscriptionContext ctx = manager.getSubscription("sub-1");
+
+        ctx.fetchLoop().deliverRecord(tp0, 0L, "ex", "rk", "{}", false);
+        ctx.fetchLoop().deliverRecord(tp0, 1L, "ex", "rk", "{}", false);
+        assertEquals(2, ctx.deliveryTagTracker().pendingCount());
+
+        int dropped = manager.invalidateRevokedPartitions("sub-1", Set.of(tp0));
+        assertEquals(2, dropped);
+        assertEquals(0, ctx.deliveryTagTracker().pendingCount());
+    }
+
+    @Test
+    void invalidateRevokedPartitions_unknownSubscription_returnsZero() {
+        assertEquals(0, manager.invalidateRevokedPartitions("nope", Set.of(tp0)));
+    }
+
+    @Test
+    void invalidateRevokedPartitions_emptyOrNull_returnsZero() {
+        manager.subscribe("sub-1", "orders", "ws.orders",
+            Set.of(tp0), Map.of(tp0, 0L), 10, false, channel);
+        assertEquals(0, manager.invalidateRevokedPartitions("sub-1", null));
+        assertEquals(0, manager.invalidateRevokedPartitions("sub-1", Set.of()));
     }
 
     @Test

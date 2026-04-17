@@ -16,6 +16,7 @@
  */
 
 // Time: Created - TASK-WS1.13
+// Time: Update - TASK-WS3.03 - added competing consumer / group integration
 
 package kafka.server.http.ws;
 
@@ -27,6 +28,7 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -331,5 +333,70 @@ class WsDeliveryTagTrackerTest {
         assertEquals(0, tracker.pendingCount());
         // All nacked-with-requeue → nothing committable
         assertTrue(tracker.getCommittableOffsets().isEmpty());
+    }
+
+    // ------------------------------------------------------------------
+    // TASK-WS3.03: invalidatePartitions
+    // ------------------------------------------------------------------
+
+    @Test
+    void invalidatePartitions_dropsPendingTagsOnlyForRevokedPartitions() {
+        long tag0a = tracker.assign(tp0, 10L);
+        long tag0b = tracker.assign(tp0, 11L);
+        long tag1 = tracker.assign(tp1, 100L);
+
+        int dropped = tracker.invalidatePartitions(Set.of(tp0));
+
+        assertEquals(2, dropped);
+        // Revoked partition's pending tags are no longer ackable
+        assertFalse(tracker.ack(tag0a));
+        assertFalse(tracker.ack(tag0b));
+        // Non-revoked partition's tag is still ackable
+        assertTrue(tracker.ack(tag1));
+    }
+
+    @Test
+    void invalidatePartitions_emptyOrNull_isNoOp() {
+        tracker.assign(tp0, 1L);
+        assertEquals(0, tracker.invalidatePartitions(null));
+        assertEquals(0, tracker.invalidatePartitions(Set.of()));
+        assertEquals(1, tracker.pendingCount());
+    }
+
+    @Test
+    void invalidatePartitions_afterClear_returnsZero() {
+        tracker.assign(tp0, 1L);
+        tracker.clear();
+        assertEquals(0, tracker.invalidatePartitions(Set.of(tp0)));
+    }
+
+    @Test
+    void invalidatePartitions_preservesTagMonotonicity() {
+        long tag1 = tracker.assign(tp0, 1L);
+        tracker.invalidatePartitions(Set.of(tp0));
+        long tag2 = tracker.assign(tp0, 2L);
+        // Tag counter MUST NOT roll back — the invariant is that currentTagCounter() is
+        // monotonically increasing so WsAckHandler can distinguish "unknown" from
+        // "already-transitioned" tags.
+        assertTrue(tag2 > tag1);
+        assertEquals(tag2, tracker.currentTagCounter());
+    }
+
+    @Test
+    void invalidatePartitions_resetsCommittedWatermark() {
+        // Deliver and ack some records for tp0
+        tracker.assign(tp0, 10L);
+        tracker.ack(1L);
+        Map<TopicPartition, Long> first = tracker.getCommittableOffsets();
+        assertEquals(11L, first.get(tp0));
+
+        // Partition is revoked and later re-assigned. After re-assignment, new deliveries
+        // should produce committable offsets again — the internal lastCommittedOffsets
+        // watermark must not lock this partition out.
+        tracker.invalidatePartitions(Set.of(tp0));
+        tracker.assign(tp0, 20L);
+        tracker.ack(2L);
+        Map<TopicPartition, Long> second = tracker.getCommittableOffsets();
+        assertEquals(21L, second.get(tp0));
     }
 }

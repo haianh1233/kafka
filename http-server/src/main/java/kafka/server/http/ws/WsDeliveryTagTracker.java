@@ -16,6 +16,7 @@
  */
 
 // Time: Created - TASK-WS1.13
+// Time: Update - TASK-WS3.03 - added competing consumer / group integration
 
 package kafka.server.http.ws;
 
@@ -24,6 +25,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -269,6 +271,53 @@ public final class WsDeliveryTagTracker {
             }
         }
         return result;
+    }
+
+    /**
+     * Invalidates all pending delivery tags and ack state for the given partitions.
+     *
+     * <p>Invoked by {@link WsConsumerGroupCoordinator.RebalanceListener#onPartitionsRevoked}
+     * when the consumer group reassigns partitions away from this member (TASK-WS3.03).
+     * After invalidation, ACKs for delivery tags bound to a revoked partition are silently
+     * ignored — a return of {@code false} from {@link #ack}/{@link #ackMultiple} is the
+     * correct outcome and callers MUST NOT translate that into an error frame. The
+     * underlying records will be redelivered to the new owner per at-least-once contract.
+     *
+     * <p>No-op when the tracker is cleared, when {@code revoked} is empty, or when the
+     * partition has no outstanding state. Safe to call from the Netty event loop.
+     *
+     * @param revoked the partitions to invalidate
+     * @return the number of pending tags that were dropped as a result
+     */
+    public int invalidatePartitions(Collection<TopicPartition> revoked) {
+        if (revoked == null || revoked.isEmpty()) {
+            return 0;
+        }
+        int dropped = 0;
+        synchronized (lock) {
+            if (cleared) {
+                return 0;
+            }
+            // Drop pending deliveries bound to any revoked partition. The tag counter is
+            // NOT rolled back — assigning new tags after a revoke keeps the monotonic
+            // invariant callers (notably WsAckHandler) rely on.
+            Iterator<Map.Entry<Long, PendingDelivery>> it = pendingDeliveries.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<Long, PendingDelivery> entry = it.next();
+                if (revoked.contains(entry.getValue().topicPartition())) {
+                    it.remove();
+                    dropped++;
+                }
+            }
+            for (TopicPartition tp : revoked) {
+                partitionAckMaps.remove(tp);
+                lastCommittedOffsets.remove(tp);
+            }
+        }
+        if (dropped > 0 && log.isDebugEnabled()) {
+            log.debug("invalidatePartitions revoked={} dropped={} pending tags", revoked, dropped);
+        }
+        return dropped;
     }
 
     /**

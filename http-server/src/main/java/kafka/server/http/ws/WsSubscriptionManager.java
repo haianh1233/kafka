@@ -16,6 +16,7 @@
  */
 
 // Time: Created - TASK-WS1.15
+// Time: Update - TASK-WS3.03 - added competing consumer / group integration
 
 package kafka.server.http.ws;
 
@@ -26,6 +27,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -58,6 +60,7 @@ public final class WsSubscriptionManager {
 
     private final ConcurrentHashMap<String, SubscriptionContext> subscriptions = new ConcurrentHashMap<>();
     private final Executor wsConsumerExecutor;
+    private final WsConsumerGroupCoordinator groupCoordinator;
 
     /**
      * @param wsConsumerExecutor shared executor on which fetch loops are scheduled.
@@ -65,7 +68,24 @@ public final class WsSubscriptionManager {
      *                           with {@code num.ws.consumer.threads} threads.
      */
     public WsSubscriptionManager(Executor wsConsumerExecutor) {
+        this(wsConsumerExecutor, null);
+    }
+
+    /**
+     * @param wsConsumerExecutor shared executor on which fetch loops are scheduled.
+     * @param groupCoordinator   optional consumer-group coordinator (TASK-WS3.03) used to
+     *                           form competing-consumer groups per queue. When {@code null},
+     *                           subscriptions are single-member and no rebalance callbacks
+     *                           are wired.
+     */
+    public WsSubscriptionManager(Executor wsConsumerExecutor, WsConsumerGroupCoordinator groupCoordinator) {
         this.wsConsumerExecutor = Objects.requireNonNull(wsConsumerExecutor, "wsConsumerExecutor");
+        this.groupCoordinator = groupCoordinator;
+    }
+
+    /** Returns the (optional) consumer-group coordinator configured on this manager. */
+    public WsConsumerGroupCoordinator groupCoordinator() {
+        return groupCoordinator;
     }
 
     /**
@@ -209,5 +229,33 @@ public final class WsSubscriptionManager {
      */
     public Set<String> activeSubscriptionIds() {
         return Set.copyOf(subscriptions.keySet());
+    }
+
+    /**
+     * Invalidates delivery-tag state for a subscription after a consumer-group rebalance
+     * revokes partitions (TASK-WS3.03). This is the subscription-manager entry point for
+     * {@link WsConsumerGroupCoordinator.RebalanceListener#onPartitionsRevoked}.
+     *
+     * <p>No-op when the subscription is unknown (it may have unsubscribed concurrently).
+     * ACKs that arrive after this call for the dropped tags return {@code false} from
+     * {@link WsDeliveryTagTracker#ack} and MUST be silently ignored per the at-least-once
+     * contract — the revoked partitions will be redelivered to the new owner.
+     *
+     * @param subscriptionId the affected subscription
+     * @param revoked        the partitions to invalidate
+     * @return number of pending tags that were dropped; {@code 0} when subscription unknown
+     */
+    public int invalidateRevokedPartitions(String subscriptionId,
+                                           Collection<TopicPartition> revoked) {
+        SubscriptionContext ctx = subscriptions.get(subscriptionId);
+        if (ctx == null || revoked == null || revoked.isEmpty()) {
+            return 0;
+        }
+        int dropped = ctx.deliveryTagTracker().invalidatePartitions(revoked);
+        if (log.isDebugEnabled()) {
+            log.debug("Rebalance revoke: sub={} revoked={} dropped={} pending tags",
+                subscriptionId, revoked, dropped);
+        }
+        return dropped;
     }
 }
