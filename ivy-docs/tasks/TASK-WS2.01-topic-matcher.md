@@ -493,19 +493,26 @@ cd /home/anh/kafka && ./gradlew :http-server:test --tests 'kafka.server.http.rou
 
 ## Learning
 
-_To be filled by the executing agent._
+- The ivy-ref `topicMatches` shortcut (early `return true` on encountering any `#`) is **wrong** for mid-pattern `#`: `foo.#.bar` would incorrectly match `foo.x.baz` because it returns on the `#` without verifying the `bar` anchor. The recursive algorithm from design doc §7.2 is mandatory — not an optimization.
+- `splitByDot("")` intentionally returns `[""]` (length 1) rather than `[]` (length 0). This is what lets `"*"` match the empty routing key as "one empty word" (per AMQP spec and design doc §7.2 edge case). The implementation achieves this by initializing `count = 1` and always writing a final trailing segment after the last dot (or the entire string if there are no dots).
+- For mid-pattern `#` the recursive attempt range is `ri` through `routing.length` **inclusive** (not exclusive). The upper-bound `routing.length` is what lets `#` consume zero remaining words; forgetting this off-by-one breaks `foo.#.bar` matching `foo.bar`.
+- The fast path (`indexOf('*') < 0 && indexOf('#') < 0`) short-circuits the majority of real-world bindings (most topic bindings are literal multi-segment keys like `order.created`) and avoids allocating two `String[]` arrays per non-wildcard binding on the publish hot path.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- No trie-based pre-compilation (design doc §7.2 mentions this as a future optimization). Current implementation is O(P * R) per match where P = pattern word count and R = routing word count (worst-case O(P * R^2) with mid-pattern `#` due to the skip loop). For Phase 1 with ~tens of bindings per exchange this is fine; revisit if profiling shows topic dispatch as a hotspot.
+- `RoutingEngine` dispatch table is **not** wired to use this matcher in this task. `RoutingEngine.java` still throws `UnsupportedOperationException` for `TOPIC` exchanges. A later wiring task must inject `TopicMatcher.matches` into the TOPIC dispatch branch (scope explicitly excluded by the task spec).
+- Input is assumed non-null; passing `null` for either argument throws `NullPointerException` from `indexOf`/`equals`. Matches the existing `DirectMatcher` posture but callers must validate upstream.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Task-spec signature `matches(String pattern, String routingKey)` is a pure pattern-matching utility — narrower than the `match(vhost, exchange, routingKey, headers, bindings)` orchestration signature the higher-level matchers (like `DirectMatcher.match(bindings, routingKey)`) expose. Followed the task file as authoritative; the binding-iteration loop will live in whatever wires `TopicMatcher` into `RoutingEngine`.
+- Used `@ParameterizedTest` with `@CsvSource` only for the design-doc example table (test-runner count 42 vs. method count 32 reflects the 7 CSV row expansions plus a handful of assertion-per-row tests). Avoided splitting each CSV row into a separate method per test-design hygiene.
+- Verified no-regex rule with `grep -E "Pattern|regex|\.split\("` on the production file — the only hits are inside comments/Javadoc ("Pattern exhausted", "without regex"). No runtime `String.split()` or `java.util.regex.Pattern` reference.
 
 ---
 
