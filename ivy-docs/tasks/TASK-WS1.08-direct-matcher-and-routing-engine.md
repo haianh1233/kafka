@@ -709,9 +709,13 @@ private void routeRecursive(String exchange, String routingKey, Map<String, Stri
 
 > Filled by the executing agent after each commit.
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-17 — WS1.08 DirectMatcher + RoutingEngine initial implementation (commit 1602d0df4e)
+
 Created:
-  - path/to/NewFile.java — <what it does>
+  - http-server/src/main/java/kafka/server/http/routing/DirectMatcher.java — stateless matcher that returns the set of queues whose binding routing key exactly equals the message routing key; rebuilds a `HashMap<String, List<String>>` index per call
+  - http-server/src/main/java/kafka/server/http/routing/RoutingEngine.java — top-level router with functional dependencies on ExchangeManager / BindingManager; dispatches per exchange type; recurses into e2e destinations with a `Set<String>` cycle guard; throws `IllegalArgumentException` on unknown root exchange and `UnsupportedOperationException` on Phase 1 stub types (topic/fanout/headers)
+  - http-server/src/test/java/kafka/server/http/routing/DirectMatcherTest.java — 10 unit tests covering exact match, no match, multi-queue same key, multi-binding single match, empty bindings, empty-string key, case sensitivity, null rejection, dedup
+  - http-server/src/test/java/kafka/server/http/routing/RoutingEngineTest.java — 20 unit tests covering direct routing, headers-ignored pass-through, unknown exchange, all three Phase 1 stub types, e2e recurse/no-recurse/cycle/combined/dangling, null exchange/routingKey/headers, and constructor null-fn rejection
+
 Modified:
-  - path/to/Existing.java — <what changed>
--->
+  - ivy-docs/tasks/TASK-WS1.08-direct-matcher-and-routing-engine.md — filled Learning / Limitations / Field Notes / File Manifest sections
