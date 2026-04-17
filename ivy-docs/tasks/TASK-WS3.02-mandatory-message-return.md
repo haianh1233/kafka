@@ -155,19 +155,67 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsMandator
 
 ## Learning
 
-_To be filled by the executing agent._
+- WS1.11's `WsPublishHandler` already emitted a `returned` frame with
+  `replyCode=312` / `replyText=NO_ROUTE` and the original `message` body for
+  mandatory + empty-route. Shipping the WS3.02 enhancements was additive on
+  top of that, not a rewrite.
+- The only "unrouted" branches are (a) exchange missing and (b) routing
+  engine returned an empty set. `RoutingEngine.route()` already folds the
+  alternate-exchange fallback into its return value, so the handler does not
+  need to re-try. I pulled both branches through a single
+  `handleUnrouted(...)` helper to keep the confirm + returned matrix
+  consistent.
+- Publisher-confirm + mandatory-return interplay follows AMQP semantics: a
+  `basic.return` does NOT suppress `basic.ack`. The handler records the
+  publishId and immediately calls `confirmSuccess` after emitting the
+  returned frame — same tracker as real produce callbacks, so the published
+  frame shape is identical.
+- Internal-exchange rejection is a hard rejection, not a return. It is
+  emitted BEFORE routing so the routing engine never sees the publish, and
+  it suppresses the published confirm (broker did not accept the message).
+- TASK-WS3.02 quietly changes the semantics of "unknown exchange" from
+  WS1.11's `NOT_FOUND` error to the spec-mandated silent-drop (non-mandatory)
+  / returned-frame (mandatory). The WsPublishHandlerTest that codified the
+  old behaviour was replaced with two new tests that match the new spec.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- `handleUnrouted` emits confirm and returned frames sequentially on the
+  Netty event loop. A partially-failed flush (e.g., the returned frame
+  writes succeed but the subsequent published frame write fails because the
+  channel closed between them) is not atomic; the client could observe a
+  returned frame without the matching published. Acceptable given confirms
+  are advisory and the connection is torn down anyway.
+- The alternate-exchange test verifies handler behaviour when the routing
+  engine returns a non-empty set, but does not exercise an actual
+  alternate-exchange chain end-to-end — that is covered by `RoutingEngineTest`.
+- We do not distinguish AMQP reply code 313 (`NO_CONSUMERS`) from 312
+  (`NO_ROUTE`). The design doc says consumer-aware returns are deferred; a
+  queue with no consumers is still "routed" as far as the broker is
+  concerned. If/when mandatory-with-consumers semantics are added, the
+  handler will need to query consumer presence post-routing.
+- `WsPublisherConfirmTracker` has no way to surface "mandatory return
+  happened" in a single frame — we emit two separate frames (returned +
+  published). Clients that want to correlate them must use the publishId.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Added a 13-test `WsMandatoryReturnTest` focused on the
+  mandatory/internal/confirms matrix. Keeping it separate from the broader
+  `WsPublishHandlerTest` made RED → GREEN quicker to read: each new test
+  maps to a one-line change in `handlePublish`.
+- Broke one existing `WsPublishHandlerTest` case
+  (`handlePublish_unknownExchange_emitsErrorFrame`) by design — it encoded
+  the pre-WS3.02 `NOT_FOUND` behaviour. Replaced with two new cases covering
+  mandatory=true and mandatory=false paths.
+- `WsMessageSerializer` is left alone. The returned frame emits the original
+  JSON `message` object; only actual routing runs serialization.
+- `WsFrameHandler` required no changes: publish parsing (including the
+  `mandatory` bool) is owned by `WsPublishHandler.parsePublishFrame`.
 
 ---
 
@@ -182,4 +230,24 @@ _To be filled by the executing agent._
 
 ## File Manifest
 
-_To be filled by the executing agent._
+### Modified (main)
+- `http-server/src/main/java/kafka/server/http/ws/WsPublishHandler.java`
+  - Added `ERR_ACCESS_REFUSED` constant.
+  - Removed `ERR_NOT_FOUND` (unused after semantics change).
+  - Rewrote `handlePublish` to (a) treat missing exchange as unroutable,
+    (b) reject internal exchanges, (c) funnel all unrouted cases through
+    a new `handleUnrouted` helper.
+  - Added `handleUnrouted` + `emitPublishedIfConfirmsEnabled` helpers.
+  - Refreshed class Javadoc error-handling table.
+  - Added WS3.02 "Time: Update" header.
+
+### Added (tests)
+- `http-server/src/test/java/kafka/server/http/ws/WsMandatoryReturnTest.java`
+  — 13 tests covering every branch of the mandatory/internal/confirms matrix.
+
+### Modified (tests)
+- `http-server/src/test/java/kafka/server/http/ws/WsPublishHandlerTest.java`
+  - Replaced `handlePublish_unknownExchange_emitsErrorFrame` with
+    `handlePublish_unknownExchange_nonMandatory_silentDrop` and
+    `handlePublish_unknownExchange_mandatory_emitsReturnedFrame`.
+  - Added WS3.02 "Time: Update" header.

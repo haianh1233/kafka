@@ -16,6 +16,7 @@
  */
 // Time: Created - TASK-WS1.11
 // Time: Update - TASK-WS3.01 - recordPending via WsPublisherConfirmTracker
+// Time: Update - TASK-WS3.02 - enhanced mandatory return semantics
 package kafka.server.http.ws;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -50,12 +51,20 @@ import java.util.function.Function;
  * <ul>
  *   <li>Missing {@code exchange}/{@code routingKey}/{@code message} → {@code error}
  *       frame with {@code INVALID_REQUEST}.</li>
- *   <li>Unknown exchange → {@code error} frame with {@code NOT_FOUND}.</li>
+ *   <li>Unknown exchange + {@code mandatory=true} → {@code returned} frame
+ *       (design doc §5.7: missing exchange is treated as "unroutable").</li>
+ *   <li>Unknown exchange + {@code mandatory=false} → silent drop.</li>
+ *   <li>Internal exchange ({@code internal=true}) → {@code error} frame with
+ *       {@code ACCESS_REFUSED}. Takes precedence over mandatory: no returned
+ *       frame, no published confirm (TASK-WS3.02).</li>
  *   <li>Routing engine threw (e.g. unsupported exchange type) → {@code error}
  *       frame with {@code INTERNAL_ERROR}.</li>
  *   <li>No matching queues + {@code mandatory=true} → {@code returned} frame
  *       (AMQP reply code 312 / {@code NO_ROUTE}).</li>
  *   <li>No matching queues + {@code mandatory=false} → silent drop.</li>
+ *   <li>Any unroutable case + publisher confirms enabled → additionally emits
+ *       a {@code published} confirm (AMQP: mandatory return does not negate
+ *       basic.ack).</li>
  * </ul>
  *
  * <h3>Threading</h3>
@@ -92,8 +101,9 @@ public final class WsPublishHandler {
 
     // --- Error codes (string tokens mirrored elsewhere in the WS layer) ---
     private static final String ERR_INVALID = "INVALID_REQUEST";
-    private static final String ERR_NOT_FOUND = "NOT_FOUND";
     private static final String ERR_INTERNAL = "INTERNAL_ERROR";
+    /** TASK-WS3.02: reject attempts to publish to an {@code internal=true} exchange. */
+    private static final String ERR_ACCESS_REFUSED = "ACCESS_REFUSED";
 
     /** AMQP 0.9.1 NO_ROUTE reply code (returned-frame replyCode). */
     private static final int AMQP_NO_ROUTE = 312;
@@ -152,9 +162,26 @@ public final class WsPublishHandler {
         }
 
         String vhost = ctx.vhost();
-        if (exchangeManager.getExchange(vhost, parsed.exchange) == null) {
-            emitError(ctx, publishId, ERR_NOT_FOUND,
-                "Exchange not found: '" + parsed.exchange + "' in vhost '" + vhost + "'");
+        ExchangeMetadata exchange = exchangeManager.getExchange(vhost, parsed.exchange);
+
+        // TASK-WS3.02: Non-existent exchange behaviour differs from WS1.11:
+        //   - mandatory=true  → emit returned frame (NO_ROUTE)
+        //   - mandatory=false → silent drop (no error frame)
+        // In both cases, if confirms are enabled the message is still acknowledged
+        // as accepted via a published confirm (design doc §5.7 parity with
+        // unroutable-but-known-exchange behaviour).
+        if (exchange == null) {
+            handleUnrouted(ctx, publishId, parsed);
+            return;
+        }
+
+        // TASK-WS3.02: Internal exchanges (`internal=true`) cannot be published to
+        // by clients. This check runs BEFORE routing and supersedes the mandatory
+        // flag — the message is rejected, not returned. Produces no published
+        // confirm because the broker never accepted the message.
+        if (exchange.internal()) {
+            emitError(ctx, publishId, ERR_ACCESS_REFUSED,
+                "Cannot publish to internal exchange '" + parsed.exchange + "'");
             return;
         }
 
@@ -163,11 +190,7 @@ public final class WsPublishHandler {
             return; // routing threw — error already emitted
         }
         if (matchedQueues.isEmpty()) {
-            if (parsed.mandatory) {
-                emitReturned(ctx, publishId, parsed.exchange, parsed.routingKey, parsed.message);
-            }
-            // Non-mandatory drop is silent — no confirms to emit either since
-            // no produce was issued.
+            handleUnrouted(ctx, publishId, parsed);
             return;
         }
 
@@ -177,6 +200,46 @@ public final class WsPublishHandler {
         }
 
         fanOut(matchedQueues, serialized, ctx, publishId);
+    }
+
+    /**
+     * TASK-WS3.02: centralises the "message was accepted but could not be routed"
+     * path, shared between "exchange missing" and "routing returned empty set".
+     *
+     * <p>Emission matrix:</p>
+     * <pre>
+     *   mandatory | confirms | frames emitted
+     *   ----------+----------+---------------------------------------
+     *   false     | false    | (silent)
+     *   false     | true     | published
+     *   true      | false    | returned
+     *   true      | true     | returned + published
+     * </pre>
+     *
+     * <p>The {@code published} confirm reflects AMQP semantics: a mandatory
+     * return does not negate the basic.ack. The broker accepted responsibility
+     * for the message; it just had no queue to deliver it to.</p>
+     */
+    private void handleUnrouted(WsConnectionContext ctx, Long publishId, ParsedPublish parsed) {
+        if (parsed.mandatory) {
+            emitReturned(ctx, publishId, parsed.exchange, parsed.routingKey, parsed.message);
+        }
+        emitPublishedIfConfirmsEnabled(ctx, publishId);
+    }
+
+    /**
+     * Record + immediately confirm the publishId so the client sees a
+     * {@code published} frame, if confirms are enabled and the client stamped
+     * a publishId on this publish. Safe to call with {@code null} publishId
+     * (no-op) or when confirms are disabled (no-op).
+     */
+    private static void emitPublishedIfConfirmsEnabled(WsConnectionContext ctx, Long publishId) {
+        if (publishId == null || !ctx.isPublishConfirmsEnabled()) {
+            return;
+        }
+        WsPublisherConfirmTracker tracker = ctx.confirmTracker();
+        tracker.recordPending(publishId);
+        tracker.confirmSuccess(publishId);
     }
 
     /** Fully parsed + validated publish frame. */
