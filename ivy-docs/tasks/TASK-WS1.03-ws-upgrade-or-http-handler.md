@@ -382,19 +382,59 @@ timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.ws.WsUpgradeO
 
 ## Learning
 
-_To be filled by the executing agent._
+- Netty's `WebSocketServerHandshaker.handshake()` writes an HTTP 101 `FullHttpResponse`.
+  For this to succeed the pipeline needs an `HttpServerCodec` upstream of the upgrade
+  handler — `HttpObjectAggregator` alone is not enough. Production satisfies this via
+  `HttpChannelInitializer.configureHttp11Pipeline`, but tests must mirror it or the
+  handshake future silently fails and the pipeline never rewires.
+- `SimpleChannelInboundHandler` auto-releases the incoming `FullHttpRequest` after
+  `channelRead0` returns. Forwarding non-upgrade requests therefore requires
+  `ctx.fireChannelRead(req.retain())` — otherwise the downstream handler receives a
+  released buffer.
+- The `Connection` header is case-insensitive AND comma-separated (e.g.
+  `keep-alive, Upgrade`); a simple `equalsIgnoreCase("Upgrade")` over the raw value
+  misses real-world browser requests. Splitting on `,` and trimming each element is
+  the robust check.
+- `QueryStringDecoder.path()` is the right way to separate path from query string
+  when validating the upgrade target — `FullHttpRequest.uri()` returns the raw URI.
+- SpotBugs flagged `remote == null` after a non-null fallback: removed the
+  defensive check and dropped the unused `FullHttpRequest` parameter from the
+  private `buildPrincipal` helper.
+- Added a small companion `WsAttributes` class with the `AttributeKey<WsConnectionContext>`
+  so later tasks (WS1.04 frame handler, WS1.13 delivery-tag tracker, …) have a
+  single well-known handoff point.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- The `ws-handler` placeholder is a no-op `ChannelInboundHandlerAdapter` — real
+  frame dispatch lands in TASK-WS1.04.
+- Authentication for upgrade requests currently runs through `KafkaPrincipalBuilder`
+  with only the client address + security protocol. Authorization header parsing
+  (Bearer/Basic) is not yet wired — production integration will either reuse
+  `HttpRequestHandler.extractAuthContext` or extract it into a shared helper.
+- The `connected` JSON payload is hand-built; if the schema evolves (e.g. more
+  capabilities, localized strings) a Jackson-based serializer will be needed.
+- This task does NOT modify `HttpChannelInitializer.scala`. Wiring the handler
+  into the live pipeline is a separate integration task.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Initial red flag: the parallel agent started on commit `f95a1f995d` (not
+  `feature/http-protocol`). `git reset --hard origin/feature/http-protocol` got
+  the worktree onto `f89cbe575b`. Always check first.
+- The first test run failed SpotBugs because of the redundant null-check on the
+  `InetSocketAddress` returned by a fallback-returning helper. Lesson: if a helper
+  has a non-null fallback, do not add a null-check at the call site.
+- First EmbeddedChannel upgrade test failed because I omitted `HttpServerCodec`
+  from the test pipeline. Added it to the test setup; all upgrade assertions
+  then passed (pipeline rewire + connected frame + max-frame-size propagation).
+- `HttpServerCodec` in the test pipeline encodes the 404 error response into a
+  raw `ByteBuf`; the disabled-ws test had to collect bytes and assert the status
+  line rather than reading back a `FullHttpResponse`.
 
 ---
 
@@ -417,3 +457,10 @@ _To be filled by the executing agent._
 
 > Filled by the executing agent after each commit.
 > Run: `git diff --name-status HEAD~1 HEAD -- '*.java' '*.xml' '*.json' '*.yaml' '*.yml'`
+
+```
+A  http-server/src/main/java/kafka/server/http/ws/WsAttributes.java
+A  http-server/src/main/java/kafka/server/http/ws/WsUpgradeOrHttpHandler.java
+A  http-server/src/test/java/kafka/server/http/ws/WsUpgradeOrHttpHandlerTest.java
+M  ivy-docs/tasks/TASK-WS1.03-ws-upgrade-or-http-handler.md
+```
