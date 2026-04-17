@@ -191,19 +191,32 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsServerNo
 
 ## Learning
 
-_To be filled by the executing agent._
+- `WsConnectionContext.sendFrame(String)` is the canonical way to push a server-initiated frame — Netty serialises writes per channel, so the writer does not need additional synchronisation. The registry lookup is `ConcurrentHashMap#get`, also lock-free.
+- `WsConsumerGroupCoordinator` already fires `RebalanceListener.onPartitionsRevoked` *before* `onPartitionsAssigned` for members that are losing partitions, so the adapter can buffer the revoked set and emit a single `rebalance` frame on the assign callback.
+- `WsDeliveryTagTracker.invalidatePartitions` is the load-bearing piece for the "ACKs for revoked partitions silently ignored" contract. After invalidation, subsequent `ack(tag)` returns `false` and — crucially — `peek(tag)` also returns `null`, which gives the rebalance-adapter / ack-handler a quick way to detect "this tag was revoked, do nothing".
+- The spec mentioned `QueueManager.java` in the files-to-modify list but the project stores queue metadata via `WsRoutingMetadataManager`; the queue-deletion notification wiring will need a follow-up task that subscribes a listener to `WsRoutingMetadataManager.deleteQueue` tombstones.
+- Checkstyle is stricter than I expected — unused imports cause the whole `:http-server:test` task to fail. Always clean imports after stubbing out test code.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **Not wired into queue deletion:** `WsRoutingMetadataManager.deleteQueue` does not yet emit `subscription-cancelled` frames for subscribers of the deleted queue. A follow-up task should introduce a `QueueDeletionListener` that walks `WsSubscriptionManager` instances per connection and calls `WsServerNotificationWriter.sendSubscriptionCancelled(..., REASON_QUEUE_DELETED, ...)` + `unsubscribe`.
+- **Not wired into `WsConsumerGroupCoordinator` by default:** the coordinator's `RebalanceListener` is supplied per-`joinGroup` call. TASK-WS4.08 only proves the adapter contract in a test (`WsServerCancelTest`). Production wiring (inject the adapter from the subscription-manager glue) lives in the next wiring task, because `WsSubscriptionManager.subscribe` does not currently call `joinGroup` — TASK-WS3.03 left that wiring to a future integration task.
+- **Exclusive-eviction reason not yet fired:** `ExclusiveConsumerManager.onConnectionClose` cascades queue deletion per design §11.3, but the cascade does not yet call the notification writer. Same follow-up as queue deletion.
+- **Topic-deleted reason not yet fired:** there is no Kafka-topic-deletion listener on the HTTP server side; needs an admin-client hook.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- The `WsServerNotificationWriter` is intentionally a *stateless* output class. It has no knowledge of subscriptions or delivery tags; callers are expected to have already invalidated tracker state before sending a rebalance frame. This keeps the dependency graph shallow and the class trivially testable.
+- Chose `Collection<Integer>` rather than `Set<Integer>` for the rebalance partition lists because coordinator callbacks deliver ordered `Collection<TopicPartition>` — no point forcing a re-copy into a `Set`. The frame serialisation preserves iteration order.
+- `null` partition entries are defensively skipped in the rebalance serialiser — this is belt-and-braces since the coordinator never produces null entries, but it keeps the writer robust to third-party listener plumbing.
+- Inactive-channel silent-no-op matters in the teardown race: the admin REST DELETE can arrive microseconds after the WebSocket channel closed. Without the guard we'd log a stack trace on every racing force-cancel.
+- Kept the existing `ConsumerRestHandler` 2-arg constructor to preserve source compatibility with the broker wiring — added a 3-arg overload that injects a shared notification writer.
+
+---
 
 ---
 
@@ -219,4 +232,13 @@ _To be filled by the executing agent._
 
 ## File Manifest
 
-_To be filled by the executing agent._
+**Created:**
+- `http-server/src/main/java/kafka/server/http/ws/WsServerNotificationWriter.java` — stateless writer for `subscription-cancelled` and `rebalance` frames; looks up the target connection via `WsConnectionRegistry`.
+- `http-server/src/test/java/kafka/server/http/ws/WsServerNotificationWriterTest.java` — 17 unit tests (frame shape, all 4 cancel reasons, empty / unknown / inactive connection paths, null-arg rejection).
+- `http-server/src/test/java/kafka/server/http/ws/WsServerCancelTest.java` — 7 integration-style tests that exercise the rebalance-adapter contract and confirm ACKs for invalidated tags are silently ignored.
+
+**Modified:**
+- `http-server/src/main/java/kafka/server/http/rest/ConsumerRestHandler.java` — delegates `subscription-cancelled` frame construction to `WsServerNotificationWriter` instead of the previous inline `cancelledFrameJson` helper. New 3-arg constructor overload accepts an injected writer.
+
+**Untouched but verified still green:**
+- `WsFrameHandlerTest`, `WsSubscriptionManagerTest`, `WsConsumerGroupCoordinatorTest`, `ConsumerRestHandlerTest` (117 passing test methods across the targeted classes).
