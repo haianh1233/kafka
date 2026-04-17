@@ -38,6 +38,7 @@ import org.apache.kafka.coordinator.transaction.TransactionLogConfig;
 import org.apache.kafka.coordinator.transaction.TransactionStateManagerConfig;
 import org.apache.kafka.network.HttpServerConfigs;
 import org.apache.kafka.network.SocketServerConfigs;
+import org.apache.kafka.network.WsServerConfigs;
 import org.apache.kafka.raft.KRaftConfigs;
 import org.apache.kafka.raft.MetadataLogConfig;
 import org.apache.kafka.raft.QuorumConfig;
@@ -88,7 +89,9 @@ public abstract class AbstractKafkaConfig extends AbstractConfig {
         BrokerSecurityConfigs.CONFIG_DEF,
         DelegationTokenManagerConfigs.CONFIG_DEF,
         AddPartitionsToTxnConfig.CONFIG_DEF,
-        HttpServerConfigs.CONFIG_DEF
+        HttpServerConfigs.CONFIG_DEF,
+        // Time: Update - TASK-WS1.01 - registered WsServerConfigs.CONFIG_DEF
+        WsServerConfigs.CONFIG_DEF
     ));
 
     public AbstractKafkaConfig(ConfigDef definition, Map<?, ?> originals, Map<String, ?> configProviderProps, boolean doLog) {

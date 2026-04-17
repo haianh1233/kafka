@@ -916,19 +916,30 @@ timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.ws.WsConfigsT
 
 ## Learning
 
-_To be filled by the executing agent._
+- `ConfigDef.ValidString.in(...)` is the idiomatic enum-like validator for string-valued config keys. Used here for `ws.consumer.start.offset` accepting only `"earliest"` and `"latest"`. Importing via `import static org.apache.kafka.common.config.ConfigDef.ValidString.in;` keeps the `CONFIG_DEF` block readable.
+- `atLeast(0)` vs `atLeast(1)` differentiates "zero disables the feature" (e.g. `ws.connection.max.idle.ms=0` disables idle-closing; `ws.max.redelivery.count=0` disables DLX routing) from "zero is invalid" (e.g. replication factor, dedup cache size/TTL, consumer threads).
+- `HttpServerConfigs.CONFIG_DEF` is merged into the broker's consolidated `CONFIG_DEF` inside `server/src/main/java/org/apache/kafka/server/config/AbstractKafkaConfig.java` (not `KafkaConfig.scala` as the task brief suggested). Any new broker-level `ConfigDef` goes into the `Utils.mergeConfigs(List.of(...))` list there.
+- Checkstyle's `ParameterNumber` check caps method signatures at 13 parameters; the `WsConfigs` constructor has 28. Suppressed by adding `WsConfigs` to the filename regex of the existing `ParameterNumber` suppression in `checkstyle/suppressions.xml`.
+- The Kafka checkstyle `LeftCurly` rule rejects single-line method bodies like `public int foo() { return foo; }` — each accessor must be formatted on its own multi-line block.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- `WsServerConfigs.CONFIG_DEF` is merged into `AbstractKafkaConfig.CONFIG_DEF`, but no typed accessors on `AbstractKafkaConfig` / `KafkaConfig` are added yet (e.g. no `wsEnabled(): Boolean` convenience method). Downstream tasks can add these as needed.
+- `WsConfigs.fromKafkaConfig(AbstractKafkaConfig)` factory was not implemented despite being hinted at in the top-level "Context" paragraph of the task brief — the `## Specification` skeleton only specified the 28-arg constructor and `withDefaults()` factory. Runtime wiring from `AbstractKafkaConfig` into `WsConfigs` will need to be added when the WS layer is assembled in `BrokerServer`.
+- Pre-existing Scala compile failure on branch `feature/http-protocol`: duplicate `HttpRouter`/`HttpRequestTranslator` defined both as Java classes in `http-server/src/main/java/kafka/server/http/` and as Scala objects in `http-server/src/main/scala/kafka/server/http/`. This prevents `./gradlew :http-server:test` from running unless `-x :http-server:compileScala -x :http-server:compileTestScala` is passed. Not caused by this task; flagged here for the next maintainer.
+- Pre-existing test failure on branch `feature/http-protocol`: `SocketServerConfigsTest.testDefaultNameToSecurityProto` expects 4 security protocols but `SecurityProtocol` now has 6 (HTTP/HTTPS added). Not caused by this task.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- The worktree originally pointed at an orphan branch (`worktree-agent-aa3d82ed`) based on an old commit (`f95a1f995d`) that predated the `http-server` module. Had to `git reset --hard feature/http-protocol` to pull in the current state before the required files/paths existed.
+- The task brief's test skeleton for `WsConfigsTest` exercised only one `null`-check via `nullTopicPrefix_throwsNPE`, but the constructor has three `Objects.requireNonNull` calls (`topicPrefix`, `metadataTopic`, `consumerStartOffset`). Added three explicit null-param tests to cover each.
+- `ws.topic.prefix` and `ws.metadata.topic` are `STRING` type without a validator. A future task should consider adding a `Topic.validate(...)`-based validator to catch invalid topic-name characters early.
+- `num.ws.consumer.threads` uses the `num.` prefix rather than `ws.`, mirroring the existing convention of `num.network.threads` / `num.http.network.threads`. This is intentional per the task Rules section.
+- Running `:http-server:test` requires `-x :http-server:compileScala -x :http-server:compileTestScala` until the Java/Scala `HttpRouter`/`HttpRequestTranslator` duplication is resolved in a separate task.
 
 ---
 
