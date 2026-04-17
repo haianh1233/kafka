@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 // Time: Created - TASK-WS2.07
+// Time: Update - TASK-WS4.08 - delegate cancel frame to WsServerNotificationWriter
 package kafka.server.http.rest;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -30,6 +31,7 @@ import io.netty.handler.codec.http.HttpVersion;
 import kafka.server.http.ws.SubscriptionContext;
 import kafka.server.http.ws.WsConnectionContext;
 import kafka.server.http.ws.WsConnectionRegistry;
+import kafka.server.http.ws.WsServerNotificationWriter;
 import kafka.server.http.ws.WsSubscriptionManager;
 
 import java.nio.charset.StandardCharsets;
@@ -69,11 +71,25 @@ public final class ConsumerRestHandler {
 
     private final WsConnectionRegistry registry;
     private final SubscriptionManagerLookup managers;
+    private final WsServerNotificationWriter notifications;
 
     public ConsumerRestHandler(WsConnectionRegistry registry,
                                SubscriptionManagerLookup managers) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.managers = Objects.requireNonNull(managers, "managers");
+        this.notifications = new WsServerNotificationWriter(registry);
+    }
+
+    /**
+     * TASK-WS4.08 overload: inject a pre-built {@link WsServerNotificationWriter}
+     * (typically shared with the rebalance-callback wiring). Useful in tests.
+     */
+    public ConsumerRestHandler(WsConnectionRegistry registry,
+                               SubscriptionManagerLookup managers,
+                               WsServerNotificationWriter notifications) {
+        this.registry = Objects.requireNonNull(registry, "registry");
+        this.managers = Objects.requireNonNull(managers, "managers");
+        this.notifications = Objects.requireNonNull(notifications, "notifications");
     }
 
     /**
@@ -123,14 +139,23 @@ public final class ConsumerRestHandler {
                 "Connection '" + connectionId + "' does not exist");
         }
         WsSubscriptionManager mgr = managers.forConnection(connectionId);
-        if (mgr == null || mgr.getSubscription(subscriptionId) == null) {
+        if (mgr == null) {
+            return errorResponse(HttpResponseStatus.NOT_FOUND,
+                "Subscription '" + subscriptionId
+                    + "' does not exist on connection '" + connectionId + "'");
+        }
+        SubscriptionContext sub = mgr.getSubscription(subscriptionId);
+        if (sub == null) {
             return errorResponse(HttpResponseStatus.NOT_FOUND,
                 "Subscription '" + subscriptionId
                     + "' does not exist on connection '" + connectionId + "'");
         }
 
         // 1) Notify the client: subscription-cancelled, reason=ADMIN_CANCEL.
-        connCtx.sendFrame(cancelledFrameJson(subscriptionId));
+        //    TASK-WS4.08: delegate frame construction to WsServerNotificationWriter
+        //    so the wire format stays in one place.
+        notifications.sendSubscriptionCancelled(connectionId, subscriptionId,
+            WsServerNotificationWriter.REASON_ADMIN_CANCEL, sub.queueName());
 
         // 2) Stop the fetch loop and drop tracker state. The returned committable
         //    offsets are intentionally discarded — administrative cancel must
@@ -143,14 +168,6 @@ public final class ConsumerRestHandler {
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
-
-    private static String cancelledFrameJson(String subscriptionId) {
-        ObjectNode node = MAPPER.createObjectNode();
-        node.put("type", "subscription-cancelled");
-        node.put("subscriptionId", subscriptionId);
-        node.put("reason", "ADMIN_CANCEL");
-        return node.toString();
-    }
 
     private ObjectNode toConsumerJson(String connId,
                                       WsConnectionContext connCtx,
