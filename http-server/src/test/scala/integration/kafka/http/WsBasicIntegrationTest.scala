@@ -18,7 +18,7 @@
 package kafka.http
 
 import org.junit.jupiter.api.Assertions._
-import org.junit.jupiter.api.{AfterEach, BeforeEach, Disabled, Test, TestInfo}
+import org.junit.jupiter.api.{AfterEach, BeforeEach, Test, TestInfo}
 
 /**
  * Phase 1 WebSocket integration test: full round-trip on a single broker.
@@ -100,7 +100,7 @@ class WsBasicIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   @Test
-  @Disabled("Data-plane Kafka wiring pending: handlePublish needs Kafka produce, handleSubscribe needs real consumer + doFetchIteration. Deferred until RequestChannel integration or in-process KafkaProducer/Consumer wiring.")
+  // T9: enabled — WS publish/subscribe wired via in-process KafkaProducer/Consumer.
   def testPublishSubscribeDeliver(): Unit = {
     wsClient.connect()
 
@@ -123,7 +123,7 @@ class WsBasicIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   @Test
-  @Disabled("Requires data-plane Kafka wiring: publish/subscribe/ack need real Kafka produce/fetch/commit round-trip.")
+  // T9: enabled.
   def testAckCommitsOffset(): Unit = {
     wsClient.connect()
 
@@ -150,7 +150,7 @@ class WsBasicIntegrationTest extends HttpIntegrationTestHarness {
   }
 
   @Test
-  @Disabled("Requires data-plane Kafka wiring: full produce→broker→consumer round-trip.")
+  // T9: enabled.
   def testFullRoundTrip(): Unit = {
     wsClient.connect()
 

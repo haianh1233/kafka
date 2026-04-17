@@ -21,15 +21,25 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.netty.channel.ChannelHandlerContext;
 import kafka.server.http.routing.BindingManager;
 import kafka.server.http.routing.ExchangeException;
 import kafka.server.http.routing.ExchangeManager;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Properties;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 /**
  * T3: Production-facing {@link WsFrameHandler} with real dispatchers for the
@@ -49,15 +59,51 @@ public final class WiredWsFrameHandler extends WsFrameHandler {
 
     private final ExchangeManager exchangeManager;
     private final BindingManager bindingManager;
+    private final WsPublishHandler publishHandler;
+    private final Supplier<String> bootstrapSupplier;
+    private final Map<String, Subscription> subscriptions = new ConcurrentHashMap<>();
 
     public WiredWsFrameHandler(WsConnectionContext connectionContext,
                                WsConfigs wsConfigs,
                                ExchangeManager exchangeManager,
                                BindingManager bindingManager) {
+        this(connectionContext, wsConfigs, exchangeManager, bindingManager, null, null);
+    }
+
+    public WiredWsFrameHandler(WsConnectionContext connectionContext,
+                               WsConfigs wsConfigs,
+                               ExchangeManager exchangeManager,
+                               BindingManager bindingManager,
+                               WsPublishHandler publishHandler) {
+        this(connectionContext, wsConfigs, exchangeManager, bindingManager, publishHandler, null);
+    }
+
+    public WiredWsFrameHandler(WsConnectionContext connectionContext,
+                               WsConfigs wsConfigs,
+                               ExchangeManager exchangeManager,
+                               BindingManager bindingManager,
+                               WsPublishHandler publishHandler,
+                               Supplier<String> bootstrapSupplier) {
         super(connectionContext, wsConfigs);
         this.exchangeManager = exchangeManager;
         this.bindingManager = bindingManager;
+        this.publishHandler = publishHandler;
+        this.bootstrapSupplier = bootstrapSupplier;
     }
+
+    /** Tracks a single live subscription's fetch loop + offset cursor. */
+    private static final class Subscription {
+        final Thread thread;
+        final AtomicBoolean running = new AtomicBoolean(true);
+        final Map<Long, OffsetRef> pending = new ConcurrentHashMap<>();
+        final AtomicLong nextTag = new AtomicLong(1);
+
+        Subscription(Thread thread) {
+            this.thread = thread;
+        }
+    }
+
+    private record OffsetRef(String topic, int partition, long offset) { }
 
     // ------------------------------------------------------------------
     //  Exchange lifecycle — routed through ExchangeManager (in-memory).
@@ -180,11 +226,165 @@ public final class WiredWsFrameHandler extends WsFrameHandler {
         sendReply(ctx, id, "unbound", "exchange", exchange, "queue", queue);
     }
 
+    // T9: delegate publish to WsPublishHandler (which routes + calls the
+    // ProduceRequestSink wired by HttpAcceptor).
+    @Override
+    void handlePublish(WsConnectionContext ctx, JsonNode msg) {
+        if (publishHandler == null) {
+            super.handlePublish(ctx, msg);
+            return;
+        }
+        publishHandler.handlePublish(msg, ctx);
+    }
+
+    // T9: spawn a per-subscription fetch thread that polls the backing topic
+    // and emits `deliver` frames to the WS channel. Simple + correct enough
+    // for integration tests; production-grade version uses
+    // WsSubscriptionManager + consumer groups (WS3.03).
+    @Override
+    void handleSubscribe(WsConnectionContext ctx, JsonNode msg) {
+        String queue = textOrNull(msg, "queue");
+        String subId = optTextOrDefault(msg, "subscriptionId", "sub-" + UUID.randomUUID());
+        String startOffset = optTextOrDefault(msg, "startOffset", "earliest");
+        Object id = msg.get("id");
+        if (queue == null) {
+            sendError(ctx, id, "INVALID_REQUEST", "subscribe requires 'queue'");
+            return;
+        }
+        if (bootstrapSupplier == null || subscriptions.containsKey(subId)) {
+            sendError(ctx, id, "INVALID_REQUEST", "subscription unavailable");
+            return;
+        }
+        String bs = bootstrapSupplier.get();
+        if (bs == null || bs.isEmpty()) {
+            sendError(ctx, id, "INTERNAL_ERROR", "no bootstrap");
+            return;
+        }
+        String topic = "ws." + queue;
+        Subscription sub = startFetchLoop(ctx, subId, queue, topic, startOffset, bs);
+        subscriptions.put(subId, sub);
+        sendReply(ctx, id, "subscribed", "subscriptionId", subId, "queue", queue);
+    }
+
     @Override
     void handleUnsubscribe(WsConnectionContext ctx, JsonNode msg) {
-        String subscriptionId = textOrNull(msg, "subscriptionId");
+        String subId = textOrNull(msg, "subscriptionId");
         Object id = msg.get("id");
-        sendReply(ctx, id, "unsubscribed", "subscriptionId", subscriptionId);
+        if (subId != null) {
+            Subscription sub = subscriptions.remove(subId);
+            if (sub != null) {
+                sub.running.set(false);
+                sub.thread.interrupt();
+            }
+        }
+        sendReply(ctx, id, "unsubscribed", "subscriptionId", subId);
+    }
+
+    @Override
+    void handleAck(WsConnectionContext ctx, JsonNode msg) {
+        String subId = textOrNull(msg, "subscriptionId");
+        JsonNode tagNode = msg.get("deliveryTag");
+        if (subId == null || tagNode == null) return;
+        Subscription sub = subscriptions.get(subId);
+        if (sub != null) sub.pending.remove(tagNode.asLong());
+    }
+
+    @Override
+    void handleNack(WsConnectionContext ctx, JsonNode msg) {
+        handleAck(ctx, msg); // same effect for our simplified in-process model
+    }
+
+    @Override
+    void handleCredits(WsConnectionContext ctx, JsonNode msg) {
+        // Simplified: credits ignored (no backpressure coupling).
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) {
+        // Stop all fetch threads on disconnect.
+        subscriptions.values().forEach(s -> {
+            s.running.set(false);
+            s.thread.interrupt();
+        });
+        subscriptions.clear();
+        super.channelInactive(ctx);
+    }
+
+    private Subscription startFetchLoop(WsConnectionContext ctx, String subId, String queue,
+                                        String topic, String startOffset, String bs) {
+        final com.fasterxml.jackson.databind.ObjectMapper mapper = MAPPER;
+        Thread t = new Thread(() -> {
+            Properties p = new Properties();
+            p.put("bootstrap.servers", bs);
+            p.put("group.id", "ws-sub-" + subId + "-" + UUID.randomUUID());
+            p.put("key.deserializer", "org.apache.kafka.common.serialization.ByteArrayDeserializer");
+            p.put("value.deserializer", "org.apache.kafka.common.serialization.ByteArrayDeserializer");
+            p.put("auto.offset.reset", startOffset);
+            p.put("enable.auto.commit", "false");
+            KafkaConsumer<byte[], byte[]> consumer = new KafkaConsumer<>(p);
+            try {
+                consumer.subscribe(Collections.singletonList(topic));
+                Subscription sub = subscriptions.get(subId);
+                while (sub != null && sub.running.get()) {
+                    var records = consumer.poll(Duration.ofMillis(500));
+                    for (ConsumerRecord<byte[], byte[]> r : records) {
+                        if (!sub.running.get()) break;
+                        long tag = sub.nextTag.getAndIncrement();
+                        sub.pending.put(tag, new OffsetRef(r.topic(), r.partition(), r.offset()));
+                        emitDeliver(ctx, subId, tag, r, mapper);
+                    }
+                    sub = subscriptions.get(subId);
+                }
+            } catch (Exception e) {
+                if (sub(subId) != null && sub(subId).running.get())
+                    log.warn("Fetch loop error subId={}: {}", subId, e.getMessage());
+            } finally {
+                try {
+                    consumer.close(org.apache.kafka.clients.consumer.CloseOptions.timeout(Duration.ofMillis(200)));
+                } catch (Exception ignored) {
+                    // noop
+                }
+            }
+        }, "ws-sub-" + subId);
+        t.setDaemon(true);
+        t.start();
+        return new Subscription(t);
+    }
+
+    private Subscription sub(String id) {
+        return subscriptions.get(id);
+    }
+
+    private void emitDeliver(WsConnectionContext ctx, String subId, long tag,
+                             ConsumerRecord<byte[], byte[]> r,
+                             com.fasterxml.jackson.databind.ObjectMapper mapper) {
+        try {
+            com.fasterxml.jackson.databind.node.ObjectNode out = mapper.createObjectNode();
+            out.put("type", "deliver");
+            out.put("subscriptionId", subId);
+            out.put("deliveryTag", tag);
+            // Pull _ws_exchange / _ws_routing_key headers if present.
+            String exchange = null, routingKey = null;
+            for (org.apache.kafka.common.header.Header h : r.headers()) {
+                if ("_ws_exchange".equals(h.key())) exchange = new String(h.value(), java.nio.charset.StandardCharsets.UTF_8);
+                if ("_ws_routing_key".equals(h.key())) routingKey = new String(h.value(), java.nio.charset.StandardCharsets.UTF_8);
+            }
+            if (exchange != null) out.put("exchange", exchange);
+            if (routingKey != null) out.put("routingKey", routingKey);
+            // Body: raw bytes as UTF-8 string if possible, else base64.
+            if (r.value() != null) {
+                String asText = new String(r.value(), java.nio.charset.StandardCharsets.UTF_8);
+                try {
+                    com.fasterxml.jackson.databind.JsonNode parsed = mapper.readTree(asText);
+                    out.set("body", parsed);
+                } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+                    out.put("body", asText);
+                }
+            }
+            ctx.sendFrame(mapper.writeValueAsString(out));
+        } catch (Exception e) {
+            log.warn("Failed to emit deliver frame subId={} tag={}", subId, tag, e);
+        }
     }
 
     // handlePublish / handleSubscribe / handleAck / handleNack / handleCredits /

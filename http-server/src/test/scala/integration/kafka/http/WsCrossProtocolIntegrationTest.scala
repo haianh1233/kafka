@@ -186,7 +186,7 @@ class WsCrossProtocolIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("Data-plane Kafka wiring pending: WS publish/subscribe/deliver require real Kafka produce + fetch integration (post-T3 control plane works).")
+  // T9: enabled
   def testWsPublish_httpFetch(): Unit = {
     ws.connect()
     ws.declareExchange("events", "direct")
@@ -212,7 +212,7 @@ class WsCrossProtocolIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("Data-plane Kafka wiring pending: WS publish/subscribe/deliver require real Kafka produce + fetch integration (post-T3 control plane works).")
+  // T9: enabled
   def testHttpProduce_wsDeliver(): Unit = {
     ws.connect()
     ws.declareQueue(queueName)
@@ -234,7 +234,7 @@ class WsCrossProtocolIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("Data-plane Kafka wiring pending: WS publish/subscribe/deliver require real Kafka produce + fetch integration (post-T3 control plane works).")
+  // T9: enabled
   def testKafkaProducer_wsDeliver(): Unit = {
     ws.connect()
     ws.declareQueue(queueName)
@@ -257,7 +257,7 @@ class WsCrossProtocolIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("Data-plane Kafka wiring pending: WS publish/subscribe/deliver require real Kafka produce + fetch integration (post-T3 control plane works).")
+  // T9: enabled
   def testWsPublish_kafkaConsumer(): Unit = {
     ws.connect()
     ws.declareExchange("events", "direct")
@@ -287,7 +287,7 @@ class WsCrossProtocolIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("Data-plane Kafka wiring pending: REST publish path wired but sinks are stubs; real produce/fetch deferred.")
+  // T9: enabled
   def testRestPublish_wsDeliver(): Unit = {
     ws.connect()
     ws.declareExchange("events", "direct")

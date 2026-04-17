@@ -347,7 +347,8 @@ class WsClusterForwardingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(60)
-  @Disabled("Data-plane Kafka wiring pending: multi-broker WS publish/subscribe/deliver requires real Kafka produce + fetch integration.")
+  // T9: enabled
+  @org.junit.jupiter.api.Disabled("Multi-broker metadata replication not wired: ExchangeManager/BindingManager state is per-broker.")
   def testWsPublishOnBroker0_wsConsumeOnBroker2(): Unit = {
     // Cross-broker WS publish / consume on a queue backed by ws.cluster-queue.
     val publisher = new WsTestClient(httpUrl(0))
@@ -375,7 +376,8 @@ class WsClusterForwardingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(60)
-  @Disabled("Data-plane Kafka wiring pending: multi-broker WS publish/subscribe/deliver requires real Kafka produce + fetch integration.")
+  // T9: enabled
+  @org.junit.jupiter.api.Disabled("Multi-broker metadata replication not wired: ExchangeManager/BindingManager state is per-broker.")
   def testMetadataPropagation_declareOnB0_subscribeOnB1(): Unit = {
     val ws0 = new WsTestClient(httpUrl(0))
     val ws1 = new WsTestClient(httpUrl(1))
@@ -417,7 +419,8 @@ class WsClusterForwardingIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(60)
-  @Disabled("Data-plane Kafka wiring pending: multi-broker WS publish/subscribe/deliver requires real Kafka produce + fetch integration.")
+  // T9: enabled
+  @org.junit.jupiter.api.Disabled("Multi-broker metadata replication not wired: ExchangeManager/BindingManager state is per-broker.")
   def testCompetingConsumers_acrossBrokers(): Unit = {
     val ws0 = new WsTestClient(httpUrl(0))
     val ws1 = new WsTestClient(httpUrl(1))

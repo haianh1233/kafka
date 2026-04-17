@@ -29,7 +29,7 @@ import io.netty.handler.ssl.SslContext
 import kafka.server.http.HttpProcessor
 import kafka.server.http.rest.{BindingRestHandler, ConnectionRestHandler, ConsumerRestHandler, ExchangeRestHandler, MessageRestHandler, QueueRestHandler, VhostRestHandler}
 import kafka.server.http.routing.{BindingManager, ExchangeManager, RoutingEngine, VhostManager}
-import kafka.server.http.ws.{WiredWsFrameHandler, WsConfigs, WsConnectionContext, WsConnectionRegistry, WsMessageSerializer, WsRoutingMetadataManager, WsUpgradeOrHttpHandler}
+import kafka.server.http.ws.{WiredWsFrameHandler, WsConfigs, WsConnectionContext, WsConnectionRegistry, WsMessageSerializer, WsPublishHandler, WsRoutingMetadataManager, WsUpgradeOrHttpHandler}
 import io.netty.channel.ChannelHandler
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder
@@ -247,13 +247,43 @@ class HttpAcceptor(
       stubAckSink
     )
 
-    // T3: frame-handler factory — constructs WiredWsFrameHandler per connection.
-    // Only control-plane (declare-exchange / declare-queue / bind / unbind /
-    // unsubscribe) is wired; publish/subscribe/ack/nack/credits/get remain
-    // stubbed and return INTERNAL_ERROR via WsFrameHandler's catch arm.
+    // T9: real WsPublishHandler with a Kafka-producer-backed sink.
+    val wsProduceSink: WsPublishHandler.ProduceRequestSink =
+      (topic: String, serialized, publishId, confirmsEnabled, ctx) => {
+        val bs = bootstrapServers()
+        if (bs == null || bs.isEmpty) {
+          warn(s"WS publish skipped — no bootstrap yet for topic=$topic")
+        } else {
+          try {
+            ensureTopicExists(topic, bs)
+            val producer = getOrCreateKafkaProducer(bs)
+            val headers = new org.apache.kafka.common.header.internals.RecordHeaders()
+            serialized.headers().forEach(h => headers.add(h))
+            val record = new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte], Array[Byte]](
+              topic, null, null, serialized.key(), serialized.value(), headers)
+            producer.send(record, (_: org.apache.kafka.clients.producer.RecordMetadata, ex: Exception) => {
+              if (ex != null) warn(s"WS publish async failed topic=$topic: ${ex.getMessage}")
+              // Publisher-confirm callback wiring is separate (HttpProcessor.handleWsResponse);
+              // for now publishId is lost. TODO when confirms are exercised.
+            })
+          } catch {
+            case e: Exception =>
+              warn(s"WS publish send failed topic=$topic: ${e.getMessage}")
+          }
+        }
+      }
+    val wsPublishHandler = new WsPublishHandler(
+      exchangeManager, routingEngine, new WsMessageSerializer(),
+      (q: String) => "ws." + q, wsProduceSink)
+
+    // T3/T9: frame-handler factory — constructs WiredWsFrameHandler per
+    // connection. Control-plane (declare/bind) is wired via managers; publish
+    // now delegates to WsPublishHandler; subscribe/ack remain stubbed.
+    val bootstrapSupplierForFrameHandler: java.util.function.Supplier[String] = () => bootstrapServers()
     val frameHandlerFactory: java.util.function.Function[WsConnectionContext, ChannelHandler] =
       (connCtx: WsConnectionContext) =>
-        new WiredWsFrameHandler(connCtx, wsConfigs, exchangeManager, bindingManager)
+        new WiredWsFrameHandler(connCtx, wsConfigs, exchangeManager, bindingManager,
+          wsPublishHandler, bootstrapSupplierForFrameHandler)
     _wsUpgradeHandlerFactory = () => new WsUpgradeOrHttpHandler(
       wsConfigs, brokerId, clusterId,
       new DefaultKafkaPrincipalBuilder(null, null),
