@@ -18,6 +18,7 @@
 // Time: Created - TASK-WS1.15
 // Time: Update - TASK-WS3.03 - added competing consumer / group integration
 // Time: Update - TASK-WS3.04 - added exclusive consumer semantics
+// Time: Update - TASK-WS4.06 - test-hook subscribeWithTracker for ack-timeout sweeper tests
 
 package kafka.server.http.ws;
 
@@ -132,14 +133,34 @@ public final class WsSubscriptionManager {
                           int initialCredits,
                           boolean noAck,
                           Channel channel) {
+        subscribe(subscriptionId, queueName, topic, partitions, startOffsets,
+            initialCredits, noAck, channel, new WsDeliveryTagTracker());
+    }
+
+    /**
+     * Subscribe variant that accepts a pre-built delivery-tag tracker (test hook
+     * TASK-WS4.06). Production callers should use
+     * {@link #subscribe(String, String, String, Set, Map, int, boolean, Channel)}
+     * which constructs a default tracker. Tests inject a clock-driven tracker so
+     * the ack-timeout sweeper can be exercised without wall-clock sleep.
+     */
+    public void subscribe(String subscriptionId,
+                          String queueName,
+                          String topic,
+                          Set<TopicPartition> partitions,
+                          Map<TopicPartition, Long> startOffsets,
+                          int initialCredits,
+                          boolean noAck,
+                          Channel channel,
+                          WsDeliveryTagTracker tagTracker) {
         Objects.requireNonNull(subscriptionId, "subscriptionId");
         Objects.requireNonNull(queueName, "queueName");
         Objects.requireNonNull(topic, "topic");
         Objects.requireNonNull(partitions, "partitions");
         Objects.requireNonNull(startOffsets, "startOffsets");
         Objects.requireNonNull(channel, "channel");
+        Objects.requireNonNull(tagTracker, "tagTracker");
 
-        WsDeliveryTagTracker tagTracker = new WsDeliveryTagTracker();
         WsCreditManager creditManager = new WsCreditManager(initialCredits, channel);
         WsConsumerFetchLoop fetchLoop = new WsConsumerFetchLoop(
             subscriptionId, topic, startOffsets, creditManager, tagTracker, channel, noAck);

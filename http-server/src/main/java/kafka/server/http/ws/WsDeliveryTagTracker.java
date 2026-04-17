@@ -19,6 +19,7 @@
 // Time: Update - TASK-WS3.03 - added competing consumer / group integration
 // Time: Update - TASK-WS4.01 - added peek() so DLX path can look up record location
 //                              without flipping ack state
+// Time: Update - TASK-WS4.06 - added ack timeout sweeper (assignedAt timestamps + snapshot)
 
 package kafka.server.http.ws;
 
@@ -28,12 +29,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
 /**
  * Per-subscription delivery tag tracker with ack bitmap for gap-safe offset commits.
@@ -78,6 +82,15 @@ public final class WsDeliveryTagTracker {
     /** tag → PendingDelivery. Guarded by {@link #lock}. */
     private final Map<Long, PendingDelivery> pendingDeliveries = new HashMap<>();
 
+    /**
+     * tag → millis timestamp at which the tag was assigned (WS4.06 ack-timeout sweeper).
+     * Stored in a parallel map instead of on {@link PendingDelivery} to preserve the
+     * record's public shape (it is consumed as a parameter type by {@link WsAckHandler}
+     * hooks and must remain a lightweight {@code (tp, offset)} pair per design §21.3).
+     * Guarded by {@link #lock}.
+     */
+    private final Map<Long, Long> assignedAtMillis = new HashMap<>();
+
     /** partition → (offset → AckState). TreeMap for ordered iteration. Guarded by {@link #lock}. */
     private final Map<TopicPartition, TreeMap<Long, AckState>> partitionAckMaps = new HashMap<>();
 
@@ -94,6 +107,29 @@ public final class WsDeliveryTagTracker {
     private volatile boolean cleared = false;
 
     /**
+     * Clock source for {@link #assign} timestamps. Injected to let tests (and the
+     * WS4.06 ack-timeout sweeper tests specifically) drive time deterministically
+     * without sleeps. Defaults to {@link System#currentTimeMillis}.
+     */
+    private final LongSupplier timeSource;
+
+    /**
+     * Default constructor — tags are timestamped with {@link System#currentTimeMillis}.
+     */
+    public WsDeliveryTagTracker() {
+        this(System::currentTimeMillis);
+    }
+
+    /**
+     * @param timeSource clock used to timestamp each assigned delivery tag; consulted
+     *                   only by the WS4.06 ack-timeout sweeper. Tests pass a fixed
+     *                   clock so timeouts can be triggered without wall-clock sleep.
+     */
+    public WsDeliveryTagTracker(LongSupplier timeSource) {
+        this.timeSource = Objects.requireNonNull(timeSource, "timeSource");
+    }
+
+    /**
      * Assigns a delivery tag for a record at the given partition and offset.
      *
      * @param tp     the topic partition
@@ -108,6 +144,8 @@ public final class WsDeliveryTagTracker {
                 return tag;
             }
             pendingDeliveries.put(tag, new PendingDelivery(tp, offset));
+            // Record the assignment timestamp for the WS4.06 ack-timeout sweeper.
+            assignedAtMillis.put(tag, timeSource.getAsLong());
             // Redelivery semantics: if the offset was previously NACKED_REQUEUE, the caller
             // has redelivered it — reset to PENDING so a new ack can advance the watermark.
             // If it is currently PENDING or a terminal state (ACKED/NACKED_DISCARD), leave it:
@@ -139,6 +177,7 @@ public final class WsDeliveryTagTracker {
             if (delivery == null) {
                 return false;
             }
+            assignedAtMillis.remove(deliveryTag);
             TreeMap<Long, AckState> ackMap = partitionAckMaps.get(delivery.topicPartition());
             if (ackMap != null) {
                 AckState current = ackMap.get(delivery.offset());
@@ -182,6 +221,7 @@ public final class WsDeliveryTagTracker {
                             ackMap.put(delivery.offset(), AckState.ACKED);
                         }
                     }
+                    assignedAtMillis.remove(entry.getKey());
                     it.remove();
                 }
             }
@@ -210,6 +250,7 @@ public final class WsDeliveryTagTracker {
             if (delivery == null) {
                 return null;
             }
+            assignedAtMillis.remove(deliveryTag);
             TreeMap<Long, AckState> ackMap = partitionAckMaps.get(delivery.topicPartition());
             if (ackMap != null) {
                 ackMap.put(delivery.offset(), requeue ? AckState.NACKED_REQUEUE : AckState.NACKED_DISCARD);
@@ -326,6 +367,7 @@ public final class WsDeliveryTagTracker {
             while (it.hasNext()) {
                 Map.Entry<Long, PendingDelivery> entry = it.next();
                 if (revoked.contains(entry.getValue().topicPartition())) {
+                    assignedAtMillis.remove(entry.getKey());
                     it.remove();
                     dropped++;
                 }
@@ -350,6 +392,7 @@ public final class WsDeliveryTagTracker {
         synchronized (lock) {
             cleared = true;
             pendingDeliveries.clear();
+            assignedAtMillis.clear();
             partitionAckMaps.clear();
             lastCommittedOffsets.clear();
         }
@@ -374,5 +417,40 @@ public final class WsDeliveryTagTracker {
      */
     public long currentTagCounter() {
         return tagCounter.get();
+    }
+
+    /**
+     * Returns the millis timestamp at which the given tag was assigned, or
+     * {@code -1} if the tag is not currently pending (never assigned, already
+     * acked/nacked, or revoked). Added for the WS4.06 ack-timeout sweeper.
+     *
+     * <p>Returns {@code -1} (and never throws) after {@link #clear()}.
+     */
+    public long assignedAt(long deliveryTag) {
+        synchronized (lock) {
+            if (cleared) {
+                return -1L;
+            }
+            Long ts = assignedAtMillis.get(deliveryTag);
+            return ts == null ? -1L : ts;
+        }
+    }
+
+    /**
+     * Returns an unmodifiable snapshot of {@code tag → assignedAtMillis} for every
+     * pending (unacked, un-nacked, un-revoked) delivery tag. Intended for
+     * {@link WsAckTimeoutChecker} (WS4.06) which iterates the snapshot outside
+     * the lock so ack/nack calls are not blocked for the scan's duration.
+     *
+     * <p>Returns an empty map after {@link #clear()}. Safe to call from any thread.
+     */
+    public Map<Long, Long> snapshotAssignedAtMillis() {
+        synchronized (lock) {
+            if (cleared || assignedAtMillis.isEmpty()) {
+                return Map.of();
+            }
+            // Defensive copy so iteration is not affected by concurrent mutations.
+            return Collections.unmodifiableMap(new HashMap<>(assignedAtMillis));
+        }
     }
 }
