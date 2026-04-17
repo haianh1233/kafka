@@ -507,19 +507,41 @@ timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.routing.Excha
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Synthetic defaults via `applyRecord`.** `WsRoutingMetadataManager.writeExchange()` always invokes the record-writer callback, which would cause the 5 built-in exchanges to be published to `__ws_routing_metadata` on every broker startup. The task mandates that defaults are NOT written. The cleanest fix without adding new public API is to feed a synthetic JSON payload into `applyRecord()` — that method only updates the cache and never touches the writer. This keeps the defaults zero-cost at startup and makes them behave identically to replayed records on a subsequent restart.
+- **Default exchange name `""` is a real entry.** The empty string is a valid exchange name — it's the AMQP "default exchange" with routing-key-is-queue-name semantics. It has to live in the same cache keyed by `vhost + ":" + name`, which means the cache key produced for vhost `/` is `"/:"`. This works cleanly with `ConcurrentHashMap` but is worth flagging for anyone auditing key formats.
+- **Passive declare ignores caller-supplied type.** The spec says passive declare is a pure lookup. A caller that passes a wrong type with `passive=true` gets back the stored metadata, not a mismatch error. This is exercised by `declareExchange_passive_typeIgnoredWhenExisting`.
+- **Idempotent re-declare at quota limit.** When `maxExchangesPerVhost` is already reached, a same-name same-type re-declare still has to succeed (it's a no-op, no new slot is consumed). Putting the limit check after the "existing exchange" check — not before — gets this right. `declareExchange_atLimit_idempotentReDeclareAllowed` pins the behaviour.
+- **Cascade on unconditional delete.** `WsRoutingMetadataManager.deleteExchange()` already removes the per-exchange bindings list from its cache, so `ifUnused=false` delete naturally cascades. We verify this in `deleteExchange_ifUnusedFalseWithBindings_cascades`.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **No name-format validation.** The executor prompt mentions alphanumeric + `.-_` validation, but the task spec in this file does not define a validator and the design doc §5.4.1 is silent on character restrictions. I kept the manager permissive to match the spec; any format validation belongs in a future task (likely at the control-frame parsing layer where the string comes off the wire).
+- **`amq.*` prefix rule not enforced on declare.** The spec only protects the five literal default names. It does not reserve the broader `amq.*` namespace, so `declareExchange("/", "amq.custom", ...)` currently succeeds. If that later turns out to be wrong, `isDefaultExchange` is the single point to extend.
+- **Per-vhost locking, not per-exchange.** `declareExchange` / `deleteExchange` serialize on a per-vhost monitor. This is simpler and deadlock-free but means two threads declaring different exchanges in the same vhost are sequenced. Given the control-plane nature of these calls (low frequency, not on the hot path), the trade-off favours simplicity.
+- **No JSON library in `serializeSynthetic`.** Rather than pulling in Jackson for the ~40-byte synthetic payloads, I hand-rolled a tiny JSON string. The default exchange names are safe ASCII so this is robust; a basic escape loop guards against future changes.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- The worktree was initially rooted at `trunk` (`f95a1f995d`). `git reset --hard origin/feature/http-protocol` was required to line up with the task's base (`f89cbe575b`). Cross-check the starting commit in every worktree.
+- The executor prompt pointed at package `kafka.server.http.ws` but the task file is authoritative and uses `kafka.server.http.routing`. Followed the task file.
+- The test skeleton in the task spec used a 29-arg `WsConfigs` constructor; the current constructor is 28 args (no explicit `maxSchemaRegistrySessions` or similar). Built the `lowLimitConfigs` helper using `WsConfigs.withDefaults()` as the source of truth to avoid hard-coding numbers that drift.
+- `WsRoutingMetadataManager.EXCHANGE_PREFIX` is package-private. Rather than relax its visibility for a single caller, I mirrored the `"exchange:"` constant in `ExchangeManager` with a Javadoc note pointing at the source of truth. A follow-up WS task that touches both classes may want to promote this to a shared `WsMetadataKeys` class.
+
+---
+
+## File Manifest
+
+| Path | Change |
+|------|--------|
+| `http-server/src/main/java/kafka/server/http/routing/ExchangeException.java` | added |
+| `http-server/src/main/java/kafka/server/http/routing/ExchangeManager.java` | added |
+| `http-server/src/test/java/kafka/server/http/routing/ExchangeManagerTest.java` | added |
+
+Commit hash: _filled after commit_
 
 ---
 
