@@ -67,6 +67,7 @@ import java.util.Objects;
  * for this task and will be added in a later task.
  *
  * // Time: Created - TASK-WS1.04
+ * // Time: Update - TASK-WS3.01 - added enable-confirms handling
  */
 public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame> {
 
@@ -332,8 +333,41 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
         throw new UnsupportedOperationException("Not yet implemented: credits");
     }
 
+    /**
+     * Handle an {@code enable-confirms} frame: flip the connection-level
+     * publisher-confirms flag (idempotent) and emit a {@code confirms-enabled}
+     * reply, echoing the client's correlation id when present.
+     *
+     * <p>After this frame, every subsequent {@code publish} with a
+     * {@code publishId} will trigger a {@code published} or
+     * {@code publish-failed} reply once the underlying produce completes
+     * (produced by {@link kafka.server.http.HttpProcessor#handleWsResponse}).
+     *
+     * <p>Per design doc §5.7, confirms cannot be disabled on a live
+     * connection — the client must close and reopen.
+     */
     void handleEnableConfirms(WsConnectionContext ctx, JsonNode msg) {
-        throw new UnsupportedOperationException("Not yet implemented: enable-confirms");
+        ctx.enablePublishConfirms();
+        sendConfirmsEnabledFrame(textOrNull(msg, FIELD_ID));
+    }
+
+    /**
+     * Build and emit the {@code confirms-enabled} reply. Correlation id is
+     * omitted from the frame when {@code correlationId} is {@code null}.
+     */
+    private void sendConfirmsEnabledFrame(String correlationId) {
+        ObjectNode frame = MAPPER.createObjectNode();
+        frame.put(FIELD_TYPE, "confirms-enabled");
+        if (correlationId != null) {
+            frame.put(FIELD_ID, correlationId);
+        }
+        try {
+            connectionContext.sendFrame(MAPPER.writeValueAsString(frame));
+        } catch (JsonProcessingException e) {
+            // Should be impossible for a freshly-built ObjectNode.
+            log.warn("Failed to serialise confirms-enabled frame for session {}",
+                    connectionContext.sessionId(), e);
+        }
     }
 
     // ------------------------------------------------------------------
