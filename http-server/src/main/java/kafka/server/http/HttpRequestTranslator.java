@@ -74,7 +74,7 @@ import java.util.function.Function;
 public final class HttpRequestTranslator {
 
     // --- Jackson ObjectMapper (shared, thread-safe) ---
-    static final ObjectMapper MAPPER;
+    public static final ObjectMapper MAPPER;
     static {
         JsonFactory factory = JsonFactory.builder()
             .streamReadConstraints(StreamReadConstraints.builder()

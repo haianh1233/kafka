@@ -587,19 +587,28 @@ static {
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Jackson tree-serialization for headers JSON.** `MAPPER.writeValueAsString(appHeaders)` on a `JsonNode` round-trips through the same ObjectMapper — no manual traversal required, and `asText()` on a non-scalar returns `""` which is wrong, so the full `writeValueAsString` call is the correct path for the `_ws_headers` JSON encoding.
+- **`body.asText()` is a quiet trap.** For string-typed text bodies `asText()` gives you the raw characters, but for JSON objects/arrays it returns `""`. The serializer explicitly checks `body.isObject() || body.isArray()` first to fall through to `writeValueAsBytes` even when the `contentType` header is absent (the "auto-detect" branch).
+- **Empty routing key behaviour is asymmetric.** The record **key** is `null` when `routingKey.isEmpty()` (triggers Kafka's round-robin partition assignment), but the `_ws_routing_key` **header** is still added as an empty string so that consumers see a faithful round-trip.
+- **`_content-type` header intentionally lacks the `_ws_` prefix** to match the HTTP layer's value-type conventions — documented directly in code via a Javadoc `@link` pointing callers at the design doc.
+- **MAPPER visibility.** `HttpRequestTranslator.MAPPER` was package-private; since `ws` is a sub-package it could not reach the parent package. I promoted it to `public static final` — the field is already immutable and thread-safe, so widening visibility is safe and avoids duplicating the StreamReadConstraints configuration.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- `message.timestamp` is mentioned in the design doc as mapping to the Kafka record timestamp rather than a header. This serializer returns only `key` / `value` / `headers`; the caller (WsPublishHandler, TASK-WS1.11) is responsible for threading the timestamp through to the Kafka record builder. No timestamp plumbing in `SerializedMessage`.
+- The application headers map (`message.headers`) is serialized as an opaque JSON blob rather than flattened into per-key Kafka headers. This keeps the header count bounded but means consumers must parse the JSON to recover individual values. Cross-protocol consumers (HTTP, native Kafka) need to know the `_ws_headers` convention.
+- Input validation is intentionally minimal — the serializer trusts that upstream JSON-schema validation has already happened in the frame handler. Callers passing malformed structures (e.g. a `deliveryMode` object instead of an integer) will get an `asText()` of the node, which is rarely meaningful but never throws.
+- `headers` in the returned `SerializedMessage` is `List.copyOf(…)` — immutable — but the backing `byte[]` arrays in each `RecordHeader` are not defensively copied. Callers must not mutate `key`, `value`, or header byte arrays.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Cross-contamination from parallel agents: a WS1.01 agent had placed `WsConfigs.java` and `WsConfigsTest.java` into the main working tree (`/home/anh/kafka/http-server/src/…/ws/`) in an incomplete state referencing a non-existent `WsServerConfigs` class. These untracked files broke `compileTestJava` and `checkstyleMain` for my task. I moved them aside with `.bak` extensions during verification so the build could complete; they were not restored afterwards because they were untracked and cannot be reliably attributed to a specific task. The owning agent can recreate them in its own worktree.
+- The `worktree` the harness placed me in (`/home/anh/kafka/.claude/worktrees/agent-a6e07ca8`) was based on commit `f95a1f995d`, which predates the entire `http-server` module. All work had to happen in the main checkout `/home/anh/kafka` on branch `feature/http-protocol` — where it actually belonged.
+- Avoided running the full `:http-server:test` suite (per project memory); only ran `--tests 'kafka.server.http.ws.WsMessageSerializerTest'`. Also excluded `:server:compileTestJava` via `-x` to dodge an unrelated pre-existing compilation failure in `org.apache.kafka.network.WsServerConfigsTest` that is part of another in-progress task (WS1.01).
 
 ---
 
