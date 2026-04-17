@@ -417,3 +417,13 @@ timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.ws.WsConnecti
 
 > Filled by the executing agent after each commit.
 > Run: `git diff --name-status HEAD~1 HEAD -- '*.java' '*.xml' '*.json' '*.yaml' '*.yml'`
+
+### Commit `db26df7e93` — feat: WS1.02 — WsConnectionContext
+
+```
+A	http-server/src/main/java/kafka/server/http/ws/WsConnectionContext.java
+A	http-server/src/test/java/kafka/server/http/ws/WsConnectionContextTest.java
+```
+
+- `WsConnectionContext.java` — per-connection state holder (final class, Netty+KafkaPrincipal, ConcurrentHashMap subscriptions, AtomicBoolean publish-confirms, sendFrame/close/isActive helpers).
+- `WsConnectionContextTest.java` — 19 tests; `:http-server:test --tests 'kafka.server.http.ws.WsConnectionContextTest'` BUILD SUCCESSFUL.
