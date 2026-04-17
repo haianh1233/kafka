@@ -16,6 +16,7 @@
  */
 // Time: Created - TASK-WS1.04
 // Time: Update - TASK-WS3.05 - added ACL checks (WsAuthorizationHelper)
+// Time: Update - TASK-WS3.06 - added control message rate limiting (WsQuotaManager)
 package kafka.server.http.ws;
 
 import org.apache.kafka.common.acl.AclOperation;
@@ -99,6 +100,8 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
     static final String ERR_INTERNAL = "INTERNAL_ERROR";
     /** TASK-WS3.05: emitted on any ACL denial. */
     static final String ERR_ACCESS_REFUSED = "ACCESS_REFUSED";
+    /** TASK-WS3.06: emitted when the per-connection control-message rate is exceeded. */
+    static final String ERR_QUOTA_EXCEEDED = "QUOTA_EXCEEDED";
     /** TASK-WS3.05: conventional CLUSTER resource name used by existing Kafka authorizers. */
     static final String CLUSTER_RESOURCE_NAME = "kafka-cluster";
     /** TASK-WS3.05: queue → topic prefix (mirrors the placeholder mapping used by {@link WsPublishHandler}). */
@@ -131,21 +134,38 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
      * dispatching / protocol parsing rather than authorization.
      */
     private final WsAuthorizationHelper authorizationHelper;
+    /**
+     * TASK-WS3.06: optional quota manager enforcing the per-connection
+     * control-message rate limit. {@code null} disables rate limiting —
+     * convenient for unit tests that focus on protocol dispatch.
+     */
+    private final WsQuotaManager quotaManager;
 
     public WsFrameHandler(WsConnectionContext connectionContext, WsConfigs wsConfigs) {
-        this(connectionContext, wsConfigs, null, null);
+        this(connectionContext, wsConfigs, null, null, null);
     }
 
     public WsFrameHandler(WsConnectionContext connectionContext, WsConfigs wsConfigs, WsMetrics metrics) {
-        this(connectionContext, wsConfigs, metrics, null);
+        this(connectionContext, wsConfigs, metrics, null, null);
     }
 
     public WsFrameHandler(WsConnectionContext connectionContext, WsConfigs wsConfigs, WsMetrics metrics,
                           WsAuthorizationHelper authorizationHelper) {
+        this(connectionContext, wsConfigs, metrics, authorizationHelper, null);
+    }
+
+    /**
+     * Full constructor (TASK-WS3.06). The {@code quotaManager} enforces
+     * per-connection control message rate limiting — pass {@code null} for
+     * tests that don't exercise quotas.
+     */
+    public WsFrameHandler(WsConnectionContext connectionContext, WsConfigs wsConfigs, WsMetrics metrics,
+                          WsAuthorizationHelper authorizationHelper, WsQuotaManager quotaManager) {
         this.connectionContext = Objects.requireNonNull(connectionContext, "connectionContext");
         this.wsConfigs = Objects.requireNonNull(wsConfigs, "wsConfigs");
         this.metrics = metrics;
         this.authorizationHelper = authorizationHelper;
+        this.quotaManager = quotaManager;
     }
 
     // ------------------------------------------------------------------
@@ -160,11 +180,47 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
             // ws.control.message.rate metric.
             metrics.controlMessageRate.mark();
         }
+        // TASK-WS3.06: enforce per-connection control message rate before any
+        // parsing work. Rejected frames still count as "seen" for metrics above
+        // (they are genuine inbound traffic the operator may want to track),
+        // but are NOT parsed, dispatched, or routed.
+        if (quotaManager != null
+                && !quotaManager.checkControlMessageRate(connectionContext.sessionId())) {
+            sendQuotaExceededFrame();
+            return;
+        }
         JsonNode msg = parseFrame(frame.text());
         if (msg == null) {
             return; // parseFrame already emitted the error frame
         }
         routeAndDispatch(msg);
+    }
+
+    /**
+     * TASK-WS3.06: emit a {@code QUOTA_EXCEEDED} error frame when the control
+     * message rate is exceeded. The frame carries a {@code retryAfterMs} hint
+     * equal to the remaining time in the current sliding-window second —
+     * rounded to an integer millisecond — so a well-behaved client can back
+     * off deterministically.
+     *
+     * <p>No correlation id is available: we reject before parsing JSON.
+     */
+    private void sendQuotaExceededFrame() {
+        ObjectNode err = MAPPER.createObjectNode();
+        err.put(FIELD_TYPE, FIELD_ERROR);
+        err.put("errorCode", ERR_QUOTA_EXCEEDED);
+        err.put("errorMessage", "Control message rate exceeded");
+        // Sliding window is 1s wide — the worst-case wait is 1000ms.
+        err.put("retryAfterMs", 1000L - (System.currentTimeMillis() % 1000L));
+        try {
+            connectionContext.sendFrame(MAPPER.writeValueAsString(err));
+        } catch (JsonProcessingException e) {
+            log.warn("Failed to serialise quota-exceeded frame for session {}",
+                connectionContext.sessionId(), e);
+        }
+        if (metrics != null) {
+            metrics.errorRate.mark();
+        }
     }
 
     /**
@@ -294,6 +350,11 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
         // the connection and we log the event for operator visibility.
         int active = connectionContext.subscriptions().size();
         connectionContext.subscriptions().clear();
+        // TASK-WS3.06: free the per-connection rate-limit window so the map
+        // cannot grow unboundedly with churn-heavy clients.
+        if (quotaManager != null) {
+            quotaManager.releaseConnection(connectionContext.sessionId());
+        }
         if (log.isInfoEnabled()) {
             log.info("WebSocket session closed: sessionId={} vhost={} activeSubscriptions={}",
                     connectionContext.sessionId(), connectionContext.vhost(), active);
@@ -545,5 +606,9 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
 
     WsConfigs wsConfigs() {
         return wsConfigs;
+    }
+
+    WsQuotaManager quotaManager() {
+        return quotaManager;
     }
 }
