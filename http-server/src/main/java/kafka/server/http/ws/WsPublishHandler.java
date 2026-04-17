@@ -18,6 +18,7 @@
 // Time: Update - TASK-WS3.01 - recordPending via WsPublisherConfirmTracker
 // Time: Update - TASK-WS3.02 - enhanced mandatory return semantics
 // Time: Update - TASK-WS3.08 - added metrics recording
+// Time: Update - TASK-WS4.05 - integrated dedup cache
 package kafka.server.http.ws;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -99,6 +100,8 @@ public final class WsPublishHandler {
     private static final String FIELD_MANDATORY = "mandatory";
     private static final String FIELD_PUBLISH_ID = "publishId";
     private static final String FIELD_HEADERS = "headers";
+    /** TASK-WS4.05: AMQP {@code messageId} property — used as the dedup key. */
+    private static final String FIELD_MESSAGE_ID = "messageId";
 
     // --- Error codes (string tokens mirrored elsewhere in the WS layer) ---
     private static final String ERR_INVALID = "INVALID_REQUEST";
@@ -116,6 +119,13 @@ public final class WsPublishHandler {
     private final Function<String, String> queueToTopicFn;
     private final ProduceRequestSink sink;
     private final WsMetrics metrics;
+    /**
+     * TASK-WS4.05: optional message-deduplication cache keyed by
+     * {@code (exchange, message.messageId)}. {@code null} when
+     * {@code ws.dedup.enabled=false}; the handler treats a null cache as a
+     * complete no-op on the dedup path.
+     */
+    private final WsDeduplicationCache dedupCache;
 
     /**
      * Convenience constructor for tests that do not care about metrics. Delegates
@@ -127,7 +137,20 @@ public final class WsPublishHandler {
                             WsMessageSerializer messageSerializer,
                             Function<String, String> queueToTopicFn,
                             ProduceRequestSink sink) {
-        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, null);
+        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, null, null);
+    }
+
+    /**
+     * Backwards-compatible 6-arg constructor (no dedup). Used by tests written
+     * before TASK-WS4.05.
+     */
+    public WsPublishHandler(ExchangeManager exchangeManager,
+                            RoutingEngine routingEngine,
+                            WsMessageSerializer messageSerializer,
+                            Function<String, String> queueToTopicFn,
+                            ProduceRequestSink sink,
+                            WsMetrics metrics) {
+        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, metrics, null);
     }
 
     /**
@@ -144,19 +167,29 @@ public final class WsPublishHandler {
      *                           {@code RequestChannel})
      * @param metrics            WS metrics sink (may be {@code null} — useful for
      *                           tests; production wiring injects a real instance)
+     * @param dedupCache         optional message-deduplication cache (TASK-WS4.05).
+     *                           {@code null} disables dedup entirely. When
+     *                           non-null, publishes carrying {@code message.messageId}
+     *                           are checked before routing; a hit silently
+     *                           suppresses the produce and (if confirms are
+     *                           enabled) emits a {@code published} confirm so
+     *                           the publisher sees the same outcome it would
+     *                           have for a successful first send.
      */
     public WsPublishHandler(ExchangeManager exchangeManager,
                             RoutingEngine routingEngine,
                             WsMessageSerializer messageSerializer,
                             Function<String, String> queueToTopicFn,
                             ProduceRequestSink sink,
-                            WsMetrics metrics) {
+                            WsMetrics metrics,
+                            WsDeduplicationCache dedupCache) {
         this.exchangeManager = Objects.requireNonNull(exchangeManager, "exchangeManager");
         this.routingEngine = Objects.requireNonNull(routingEngine, "routingEngine");
         this.messageSerializer = Objects.requireNonNull(messageSerializer, "messageSerializer");
         this.queueToTopicFn = Objects.requireNonNull(queueToTopicFn, "queueToTopicFn");
         this.sink = Objects.requireNonNull(sink, "sink");
         this.metrics = metrics; // nullable by design — see Javadoc
+        this.dedupCache = dedupCache; // nullable by design — see Javadoc
     }
 
     // ------------------------------------------------------------------
@@ -201,6 +234,21 @@ public final class WsPublishHandler {
         if (exchange.internal()) {
             emitError(ctx, publishId, ERR_ACCESS_REFUSED,
                 "Cannot publish to internal exchange '" + parsed.exchange + "'");
+            return;
+        }
+
+        // TASK-WS4.05: deduplication. Runs AFTER existence/internal checks (so
+        // duplicates against a non-existent or internal exchange follow the same
+        // error path the original publish would have taken) and BEFORE routing
+        // (so a duplicate consumes neither routing CPU nor a downstream produce
+        // slot). A hit is treated as "the broker already accepted this message"
+        // and therefore mirrors the success path: silently confirm if confirms
+        // are enabled, no error frame, no returned frame.
+        if (dedupCache != null && parsed.messageId != null
+                && dedupCache.isDuplicate(parsed.exchange, parsed.messageId)) {
+            log.debug("Dedup hit on exchange={} messageId={} publishId={}",
+                parsed.exchange, parsed.messageId, publishId);
+            emitPublishedIfConfirmsEnabled(ctx, publishId);
             return;
         }
 
@@ -264,9 +312,14 @@ public final class WsPublishHandler {
         tracker.confirmSuccess(publishId);
     }
 
-    /** Fully parsed + validated publish frame. */
+    /**
+     * Fully parsed + validated publish frame.
+     *
+     * @param messageId TASK-WS4.05 — extracted {@code message.messageId}
+     *                  (nullable). Used as the dedup key. Empty/missing → null.
+     */
     private record ParsedPublish(String exchange, String routingKey, JsonNode message,
-                                 boolean mandatory) { }
+                                 boolean mandatory, String messageId) { }
 
     /**
      * Extracts and validates the required fields from the raw frame. Emits an
@@ -290,7 +343,10 @@ public final class WsPublishHandler {
         }
         boolean mandatory = frame.hasNonNull(FIELD_MANDATORY)
             && frame.get(FIELD_MANDATORY).asBoolean(false);
-        return new ParsedPublish(exchange, routingKey, message, mandatory);
+        // TASK-WS4.05: lift message.messageId for the dedup path. Absent or
+        // empty values disable dedup for this publish (publisher opt-out).
+        String messageId = textOrNull(message, FIELD_MESSAGE_ID);
+        return new ParsedPublish(exchange, routingKey, message, mandatory, messageId);
     }
 
     /**

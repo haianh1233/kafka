@@ -16,6 +16,7 @@
  */
 // Time: Created - TASK-WS1.11
 // Time: Update - TASK-WS3.02 - enhanced mandatory return semantics
+// Time: Update - TASK-WS4.05 - integrated dedup cache
 package kafka.server.http.ws;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -45,6 +46,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atMostOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -531,6 +533,199 @@ class WsPublishHandlerTest {
     }
 
     // ------------------------------------------------------------------
+    //  Deduplication — TASK-WS4.05
+    // ------------------------------------------------------------------
+
+    @Test
+    void handlePublish_dedupHit_silentlyDropsAndConfirms() {
+        // Build a handler with dedup enabled.
+        WsDeduplicationCache dedup = new WsDeduplicationCache(100, 60_000);
+        WsPublishHandler dedupHandler = new WsPublishHandler(
+            exchangeManager, routingEngine, messageSerializer,
+            queue -> "ws." + queue, sink, null, dedup);
+
+        connCtx.enablePublishConfirms();
+        when(exchangeManager.getExchange("/", "events"))
+            .thenReturn(new ExchangeMetadata("events", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("events"), eq("k"), any()))
+            .thenReturn(Set.of("q"));
+
+        // First publish: routes + produces normally.
+        dedupHandler.handlePublish(buildPublishFrameWithMessageId(
+            "events", "k", "payload", 1L, false, "msg-A"), connCtx);
+        assertEquals(1, captured.size(), "first publish enqueued");
+        // First publish triggers a "published" confirm via the success path
+        // (recordPending in fanOut + confirmSuccess later — only recordPending
+        // fires synchronously, so no frame yet).
+        assertEquals(0, writtenFrames.size(), "no confirm frame until produce completes");
+
+        // Second publish — same (exchange, messageId) → duplicate hit.
+        dedupHandler.handlePublish(buildPublishFrameWithMessageId(
+            "events", "k", "payload", 2L, false, "msg-A"), connCtx);
+
+        assertEquals(1, captured.size(),
+            "duplicate must NOT enqueue another produce");
+        // Routing not re-invoked for the duplicate.
+        verify(routingEngine, atMostOnce()).route(eq("events"), eq("k"), any());
+        assertEquals(1, writtenFrames.size(),
+            "duplicate gets a synchronous published confirm");
+        String frame = writtenFrames.get(0);
+        assertTrue(frame.contains("\"type\":\"published\""), "frame=" + frame);
+        assertTrue(frame.contains("\"publishId\":2"), "duplicate's publishId echoed: " + frame);
+    }
+
+    @Test
+    void handlePublish_dedupMiss_admitsAndAddsToCache() {
+        WsDeduplicationCache dedup = new WsDeduplicationCache(100, 60_000);
+        WsPublishHandler dedupHandler = new WsPublishHandler(
+            exchangeManager, routingEngine, messageSerializer,
+            queue -> "ws." + queue, sink, null, dedup);
+
+        when(exchangeManager.getExchange("/", "events"))
+            .thenReturn(new ExchangeMetadata("events", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("events"), eq("k"), any()))
+            .thenReturn(Set.of("q"));
+
+        dedupHandler.handlePublish(buildPublishFrameWithMessageId(
+            "events", "k", "payload", 1L, false, "msg-fresh"), connCtx);
+
+        assertEquals(1, captured.size(), "miss admits the publish");
+        WsDeduplicationCache.CacheStats stats = dedup.stats();
+        assertEquals(0, stats.hits());
+        assertEquals(1, stats.misses());
+        assertEquals(1, stats.size(), "messageId recorded in cache");
+    }
+
+    @Test
+    void handlePublish_dedupDisabled_noCacheInteraction() {
+        // Default handler in setUp has dedupCache=null. Publishing the same
+        // messageId twice must enqueue twice (dedup is off).
+        when(exchangeManager.getExchange("/", "events"))
+            .thenReturn(new ExchangeMetadata("events", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("events"), eq("k"), any()))
+            .thenReturn(Set.of("q"));
+
+        handler.handlePublish(buildPublishFrameWithMessageId(
+            "events", "k", "p1", 1L, false, "same-id"), connCtx);
+        handler.handlePublish(buildPublishFrameWithMessageId(
+            "events", "k", "p2", 2L, false, "same-id"), connCtx);
+
+        assertEquals(2, captured.size(),
+            "dedup disabled → both publishes go through");
+    }
+
+    @Test
+    void handlePublish_dedup_perExchangeNamespace() {
+        // Same messageId on different exchanges = NOT a duplicate.
+        WsDeduplicationCache dedup = new WsDeduplicationCache(100, 60_000);
+        WsPublishHandler dedupHandler = new WsPublishHandler(
+            exchangeManager, routingEngine, messageSerializer,
+            queue -> "ws." + queue, sink, null, dedup);
+
+        when(exchangeManager.getExchange("/", "events"))
+            .thenReturn(new ExchangeMetadata("events", "/", "direct", true, false, false, java.util.Map.of()));
+        when(exchangeManager.getExchange("/", "orders"))
+            .thenReturn(new ExchangeMetadata("orders", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("events"), any(), any())).thenReturn(Set.of("q-events"));
+        when(routingEngine.route(eq("orders"), any(), any())).thenReturn(Set.of("q-orders"));
+
+        dedupHandler.handlePublish(buildPublishFrameWithMessageId(
+            "events", "k", "p1", 1L, false, "shared-id"), connCtx);
+        dedupHandler.handlePublish(buildPublishFrameWithMessageId(
+            "orders", "k", "p2", 2L, false, "shared-id"), connCtx);
+
+        assertEquals(2, captured.size(),
+            "same messageId on different exchanges should both enqueue");
+    }
+
+    @Test
+    void handlePublish_dedup_missingMessageId_skipsCache() {
+        // Frames without message.messageId bypass dedup entirely (publisher
+        // opt-out). Both publishes should go through.
+        WsDeduplicationCache dedup = new WsDeduplicationCache(100, 60_000);
+        WsPublishHandler dedupHandler = new WsPublishHandler(
+            exchangeManager, routingEngine, messageSerializer,
+            queue -> "ws." + queue, sink, null, dedup);
+
+        when(exchangeManager.getExchange("/", "events"))
+            .thenReturn(new ExchangeMetadata("events", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("events"), eq("k"), any()))
+            .thenReturn(Set.of("q"));
+
+        // Standard frame builder produces no messageId field.
+        handler.handlePublish(buildPublishFrame("events", "k", "p1", 1L, false), connCtx);
+        dedupHandler.handlePublish(buildPublishFrame("events", "k", "p1", 2L, false), connCtx);
+        dedupHandler.handlePublish(buildPublishFrame("events", "k", "p2", 3L, false), connCtx);
+
+        // captured: 1 from default handler + 2 from dedup handler (no dedup).
+        assertEquals(3, captured.size());
+        assertEquals(0, dedup.stats().size(),
+            "messageId-less publishes must not occupy cache slots");
+    }
+
+    @Test
+    void handlePublish_dedupHit_confirmsDisabled_noFrameEmitted() {
+        // When confirms are disabled, a duplicate hit drops silently with no
+        // frame emission.
+        WsDeduplicationCache dedup = new WsDeduplicationCache(100, 60_000);
+        WsPublishHandler dedupHandler = new WsPublishHandler(
+            exchangeManager, routingEngine, messageSerializer,
+            queue -> "ws." + queue, sink, null, dedup);
+
+        // confirms NOT enabled
+        when(exchangeManager.getExchange("/", "events"))
+            .thenReturn(new ExchangeMetadata("events", "/", "direct", true, false, false, java.util.Map.of()));
+        when(routingEngine.route(eq("events"), eq("k"), any()))
+            .thenReturn(Set.of("q"));
+
+        dedupHandler.handlePublish(buildPublishFrameWithMessageId(
+            "events", "k", "p", 1L, false, "id-1"), connCtx);
+        dedupHandler.handlePublish(buildPublishFrameWithMessageId(
+            "events", "k", "p", 2L, false, "id-1"), connCtx);
+
+        assertEquals(1, captured.size(), "duplicate suppressed");
+        assertTrue(writtenFrames.isEmpty(),
+            "confirms disabled → no frame on dedup hit; got: " + writtenFrames);
+    }
+
+    @Test
+    void handlePublish_dedup_doesNotRunOnUnknownExchange() {
+        // Unknown exchange → unrouted path runs; dedup must NOT be consulted
+        // (cache should remain empty so a future create-then-publish is admitted).
+        WsDeduplicationCache dedup = new WsDeduplicationCache(100, 60_000);
+        WsPublishHandler dedupHandler = new WsPublishHandler(
+            exchangeManager, routingEngine, messageSerializer,
+            queue -> "ws." + queue, sink, null, dedup);
+
+        when(exchangeManager.getExchange("/", "ghost")).thenReturn(null);
+
+        dedupHandler.handlePublish(buildPublishFrameWithMessageId(
+            "ghost", "k", "p", 1L, false, "id-A"), connCtx);
+
+        assertEquals(0, dedup.stats().size(),
+            "no exchange → no dedup record");
+        assertEquals(0, dedup.stats().misses());
+    }
+
+    @Test
+    void handlePublish_dedup_doesNotRunOnInternalExchange() {
+        // Internal exchange → ACCESS_REFUSED error before dedup runs.
+        WsDeduplicationCache dedup = new WsDeduplicationCache(100, 60_000);
+        WsPublishHandler dedupHandler = new WsPublishHandler(
+            exchangeManager, routingEngine, messageSerializer,
+            queue -> "ws." + queue, sink, null, dedup);
+
+        when(exchangeManager.getExchange("/", "amq.internal"))
+            .thenReturn(new ExchangeMetadata("amq.internal", "/", "direct", true, false, true, java.util.Map.of()));
+
+        dedupHandler.handlePublish(buildPublishFrameWithMessageId(
+            "amq.internal", "k", "p", 1L, false, "id-A"), connCtx);
+
+        assertEquals(0, dedup.stats().size(),
+            "internal exchange rejection must not pollute the dedup cache");
+    }
+
+    // ------------------------------------------------------------------
     //  Helpers
     // ------------------------------------------------------------------
 
@@ -544,6 +739,15 @@ class WsPublishHandlerTest {
         frame.put("publishId", publishId);
         ObjectNode message = frame.putObject("message");
         message.put("body", body);
+        return frame;
+    }
+
+    /** TASK-WS4.05 — variant carrying {@code message.messageId} for dedup tests. */
+    private ObjectNode buildPublishFrameWithMessageId(String exchange, String routingKey,
+                                                      String body, long publishId,
+                                                      boolean mandatory, String messageId) {
+        ObjectNode frame = buildPublishFrame(exchange, routingKey, body, publishId, mandatory);
+        ((ObjectNode) frame.get("message")).put("messageId", messageId);
         return frame;
     }
 
