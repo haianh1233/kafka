@@ -603,19 +603,72 @@ cd /home/anh/kafka && ./gradlew :http-server:test --tests 'kafka.server.http.rou
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Existing `RoutingEngine` uses functional-interface storage.** Rather than
+  owning `ConcurrentHashMap<String, ExchangeEntry>` like the task skeleton
+  proposes, the Phase-1 engine accepts `Function<String, ...>` lookups so that
+  storage stays in `ExchangeManager` / `BindingManager`. WS2.04 preserves that
+  design and simply adds a fourth functional parameter
+  (`Function<String, String> alternateExchangeFn`). This keeps the engine
+  stateless and avoids reintroducing duplicate routing state.
+- **Legacy 3-arg constructor is retained** and delegates to the 4-arg form
+  with `ex -> null`. All pre-existing WsPublishHandler mocks and
+  RoutingEngineTest call sites continue to compile unchanged.
+- **Alternate-exchange fallback fires after BOTH queue-binding matching AND
+  e2e recursion.** The guard is `matched.size() == matchedBefore`: it fires
+  only when *this exchange* contributed nothing (neither direct bindings nor
+  e2e bindings produced a queue). This matches ivy-ref semantics — e2e
+  recursion counts as "matching" so you don't get double-delivery via the
+  alternate chain when e2e already routed somewhere.
+- **Cycle guard covers BOTH e2e and alternate-exchange recursion** because
+  they share the same `visited` set passed through `routeRecursive`. A
+  mutual-alternate loop (A.alt=B, B.alt=A) terminates cleanly with an empty
+  result; a mutual-e2e loop terminates with the union of both exchanges'
+  bindings.
+- **Matcher wiring scope:** the task explicitly wires Topic/Fanout/Headers
+  matchers into `matchQueueBindings` in the Skeleton Code section, so the
+  three `UnsupportedOperationException` Phase-1 stubs are now replaced with
+  real matching. The previous tests that asserted
+  `UnsupportedOperationException` were replaced with positive matcher-wiring
+  tests (`route_topicExchange_wildcardMatch`, `route_fanoutExchange_allBoundQueues`,
+  `route_headersExchange_allMode`, `route_headersExchange_anyMode`).
+- **E2E on a fanout source must always match** per ivy-ref — the fanout case
+  in `e2eMatches` returns `true` unconditionally. Same applies to fanout
+  queue-binding matching, which ignores the message routing key entirely.
+- **E2E on a headers source uses `HeadersMatcher.matches(binding.arguments(),
+  headers)`**, so an `E2EBinding` can carry the same `x-match`/header
+  arguments a normal headers binding would.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- The alternate-exchange lookup is a `Function<String, String>`; callers
+  building on top of `ExchangeManager` / `ExchangeMetadata` will need to
+  project `arguments().get("alternate-exchange")` into that function. This
+  task does not add an `alternateExchange` field to `ExchangeMetadata`
+  (tracked implicitly via the `arguments` map, per AMQP 0-9-1 convention).
+- The engine itself is stateless; per-call allocation of `HashSet<String>`
+  for `matched` and `visited` is unchanged from Phase 1. A future perf task
+  (§8.5 in the design doc) may pool these sets.
+- No integration with WS2.05+ (REST endpoints for declaring alternate
+  exchange). Integration comes later when the publish handler starts passing
+  an `alternateExchangeFn` derived from `ExchangeManager`.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Mockito-based `WsPublishHandlerTest` continued to pass with no changes: it
+  mocks `RoutingEngine` by class, so the new constructor arg is invisible
+  to the mock.
+- The skeleton in the spec uses a monolithic engine with internal storage,
+  but reconciling that with the existing `BindingManager`-driven storage in
+  the codebase would have forced a duplicate source of truth. The functional-
+  interface approach was kept and the skeleton treated as algorithmic guidance.
+- Empty-string alternate exchange is treated identically to `null` (explicitly
+  tested via `route_alternateExchange_emptyStringTreatedAsNone`). This is a
+  defensive guard in case the metadata serializer round-trips a missing
+  argument as `""`.
 
 ---
 
