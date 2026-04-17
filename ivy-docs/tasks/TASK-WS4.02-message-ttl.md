@@ -142,31 +142,109 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsMessageT
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Serializer/deserializer already understood `_ws_expiration`** — WS1.09/WS1.10 mapped the
+  AMQP `expiration` message property to the `_ws_expiration` Kafka header round-trip without
+  touching the publish/deliver pipeline, so WS4.02 only needed the *check* at delivery time.
+  Concretely this means no serializer changes were required: the header is written on publish,
+  read on fetch, and WS4.02 simply adds a predicate that `WsConsumerFetchLoop` consults before
+  emitting a deliver frame.
+- **Fail-open TTL parsing** — A dropped message is a worse outcome than a slightly stale one:
+  unknown-format expiration headers, negative TTLs, and clock-skewed records all return
+  `isExpired == false`. This is a conservative design choice, and it is documented explicitly
+  in both `WsMessageTtl` Javadoc and the corresponding tests so future changes do not silently
+  flip it.
+- **Offset watermark advances even for expired records** — If we did not advance, the next
+  fetch would return the same expired record forever, poisoning the subscription. The skip
+  path in `maybeDeliverRecord` intentionally updates `currentOffsets` before returning
+  `false`; tests `perMessageTtl_expired_offsetAdvanced` and
+  `multipleRecords_mixedExpiration_offsetsAdvanceForAll` pin this invariant.
+- **Per-queue TTL is declarative** — `x-message-ttl` → `retention.ms` is a one-shot mapping at
+  topic-creation time (there is no per-fetch check). `WsMessageTtl.retentionMsFromQueueArgs`
+  returns `-1L` as the sentinel for "use broker default", which matches Kafka's convention
+  of treating negative retention values as "ignored" and keeps the helper trivial to adopt
+  when `QueueManager` is eventually wired (the WS1.06 `QueueManager` did not exist at the
+  time of this task, so the helper is currently unused in production but fully tested).
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **DLX integration deferred to WS4.04.** Expired messages with a configured DLX should be
+  dead-lettered with `reason: "expired"` per §12.4. WS4.01 (the dead-letter handler) has not
+  landed yet, so `maybeDeliverRecord` currently drops expired records silently and advances
+  the offset. The drop path includes a hook comment (and a debug log) noting that WS4.01 will
+  replace the drop with a dead-letter call; existing tests will still pass because they
+  verify the drop+offset-advance contract, which DLX must preserve.
+- **`QueueManager` does not exist yet.** The design doc lists
+  `http-server/src/main/java/kafka/server/http/routing/QueueManager.java` as a modification
+  target but the file is absent. `REST` handlers work against a `QueueStore` façade (WS2.06).
+  The helper `WsMessageTtl.retentionMsFromQueueArgs` is ready to be called from whatever
+  topic-creation path is eventually added to queue declare, but wiring it is out of scope.
+- **Wall-clock dependency.** The TTL check uses `System.currentTimeMillis()` in the
+  production overload of `maybeDeliverRecord`. If upstream Kafka record timestamps are
+  broker-produced and clients publish against a different clock, clock drift could flip the
+  expiration decision. The `isExpired(... , long nowMs)` overload accepts an explicit clock
+  so the fetch loop can eventually inject a `Clock` / a broker-synced time source if drift
+  becomes a real problem.
+- **No metric for dropped-due-to-TTL.** `WsMetrics` does not currently have a
+  `TtlExpiredRate` meter. Once WS4.01/WS4.04 wire the DLX path the metric will most naturally
+  live with the DLX counters, so we deliberately did not add one here to avoid a throwaway
+  meter.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- **TDD loop.** Tests written first against `loop.maybeDeliverRecord(...)` and a
+  `WsMessageTtl.isExpired(...)` helper that did not exist — gradle reported 22 "cannot find
+  symbol" errors (RED). Added `WsMessageTtl.java` + two `maybeDeliverRecord` overloads on the
+  fetch loop (GREEN in a single pass). Checkstyle caught an unused `ArrayList` import on the
+  first run; removed. Second run: all 19 new tests pass, all 13 existing
+  `WsConsumerFetchLoopTest` cases still pass.
+- **Design considered.** Initially considered baking the TTL check directly inside
+  `deliverRecord`, but that would have forced every existing call site to supply headers and
+  a timestamp, churning the `deliverRecord` signature and WS1.15 tests. A new wrapper method
+  `maybeDeliverRecord` keeps the existing API untouched and gives TASK-WS1.16 (fetch
+  integration) a clean extension point for the "post-fetch, pre-delivery" pipeline stage.
+- **No DLX scaffold yet.** The task description mentions WS4.01/WS4.04 integration as
+  follow-ups; no DLX-specific code was added. The drop path is structured so the eventual
+  integration is a minimal diff: replace the debug log with `deadLetterHandler.deadLetter(
+  ..., "expired").thenRun(() -> currentOffsets.put(tp, offset + 1))`.
+- **Per-queue TTL helper is "ready but unconsumed".** Spotlessly documented and tested, no
+  production call site yet — covered by three dedicated tests to prove absence-of-arg,
+  presence, and malformed-value handling.
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] `timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsMessageTtlTest' -x spotlessCheck` exits 0
-- [ ] `grep -r "_ws_expiration" http-server/src/main/java/` returns at least 2 hits
-- [ ] Expired messages advance consumer offset
-- [ ] Learning section filled with at least one entry
+- [x] `timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsMessageTtlTest' -x spotlessCheck` exits 0 (19/19 pass)
+- [x] `grep -r "_ws_expiration" http-server/src/main/java/` returns at least 2 hits (returns 5)
+- [x] Expired messages advance consumer offset (`perMessageTtl_expired_offsetAdvanced`, `multipleRecords_mixedExpiration_offsetsAdvanceForAll`)
+- [x] Learning section filled with at least one entry
 
 ---
 
 ## File Manifest
 
-_To be filled by the executing agent._
+**Added**
+- `http-server/src/main/java/kafka/server/http/ws/WsMessageTtl.java` — pure TTL helpers:
+  `isExpired(headers, recordTs, now)` + `retentionMsFromQueueArgs(args)` + constants.
+- `http-server/src/test/java/kafka/server/http/ws/WsMessageTtlTest.java` — 19 tests covering
+  header predicate semantics, serializer/deserializer round-trip of `_ws_expiration`,
+  `maybeDeliverRecord` deliver-vs-skip behaviour, offset watermark advance on expiry, and
+  per-queue TTL mapping.
+
+**Modified**
+- `http-server/src/main/java/kafka/server/http/ws/WsConsumerFetchLoop.java` — added WS4.02
+  update header, imports for `Header`/`Collections`, and two `maybeDeliverRecord` overloads
+  (explicit-clock + production-clock) that consult `WsMessageTtl.isExpired` before delegating
+  to the existing `deliverRecord`. Expired records advance the offset watermark without
+  writing a frame / consuming a credit / assigning a delivery tag.
+
+**Not modified (per plan)**
+- `WsMessageSerializer.java` and `WsMessageDeserializer.java` — already encoded/decoded the
+  `_ws_expiration` header since WS1.09/WS1.10; no change required for WS4.02.
+- `QueueManager.java` / queue declare path — `QueueManager` does not exist yet in this
+  branch; `WsMessageTtl.retentionMsFromQueueArgs` is provided for future integration and is
+  fully tested.
