@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Time: Update - TASK-WS1.12 - added WS response routing via wsConnections map
 package kafka.server.http;
 
 import io.netty.buffer.Unpooled;
@@ -27,8 +28,11 @@ import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpVersion;
 import kafka.network.RequestChannel;
 import kafka.network.ResponseProcessor;
+import kafka.server.http.ws.WsConnectionContext;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.requests.AbstractResponse;
+import org.apache.kafka.common.requests.FetchResponse;
+import org.apache.kafka.common.requests.ProduceResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -83,6 +87,10 @@ public class HttpProcessor implements ResponseProcessor {
 
     // --- Active Netty channels: connectionId -> ChannelHandlerContext ---
     private final ConcurrentHashMap<String, ChannelHandlerContext> channels =
+        new ConcurrentHashMap<>();
+
+    // --- WebSocket connection contexts: connectionId -> WsConnectionContext (TASK-WS1.12) ---
+    private final ConcurrentHashMap<String, WsConnectionContext> wsConnections =
         new ConcurrentHashMap<>();
 
     // --- Drainer thread state ---
@@ -161,6 +169,48 @@ public class HttpProcessor implements ResponseProcessor {
         channels.remove(connectionId);
     }
 
+    // --- WebSocket connection lifecycle (TASK-WS1.12) ---
+
+    /**
+     * Registers a WebSocket connection context. Called during WS upgrade. After
+     * registration, responses routed through {@link #processResponses()} for the
+     * same {@code connectionId} are dispatched via
+     * {@link WsConnectionContext#sendFrame(String)} instead of the HTTP response
+     * path.
+     *
+     * @param connectionId the connection ID (same identifier as used for HTTP channels)
+     * @param wsCtx        WebSocket connection context, must not be null
+     */
+    public void registerWsConnection(String connectionId, WsConnectionContext wsCtx) {
+        Objects.requireNonNull(connectionId, "connectionId");
+        Objects.requireNonNull(wsCtx, "wsCtx");
+        wsConnections.put(connectionId, wsCtx);
+    }
+
+    /**
+     * Unregisters a WebSocket connection. Called on WS close.
+     *
+     * @param connectionId the connection ID
+     */
+    public void unregisterWsConnection(String connectionId) {
+        wsConnections.remove(connectionId);
+    }
+
+    /**
+     * Returns {@code true} if the given connection is registered as a WebSocket
+     * connection.
+     */
+    public boolean isWsConnection(String connectionId) {
+        return wsConnections.containsKey(connectionId);
+    }
+
+    /**
+     * Returns the number of registered WebSocket connections.
+     */
+    public int wsConnectionCount() {
+        return wsConnections.size();
+    }
+
     /**
      * Enqueues a response for delivery to the Netty channel.
      * Non-blocking — called from KafkaRequestHandler threads via RequestChannel.sendResponse().
@@ -187,6 +237,14 @@ public class HttpProcessor implements ResponseProcessor {
         for (RequestChannel.Response response : batch) {
             String connectionId = response.request().context().connectionId();
             try {
+                // TASK-WS1.12: route WebSocket responses via a separate path.
+                // Using get() (not containsKey + get) to avoid a TOCTOU race with unregister.
+                WsConnectionContext wsCtx = wsConnections.get(connectionId);
+                if (wsCtx != null) {
+                    handleWsResponse(wsCtx, response, connectionId);
+                    continue;
+                }
+
                 if (response instanceof RequestChannel.SendResponse) {
                     handleSendResponse((RequestChannel.SendResponse) response, connectionId);
                 } else if (response instanceof RequestChannel.NoOpResponse) {
@@ -275,6 +333,185 @@ public class HttpProcessor implements ResponseProcessor {
         httpResponse.headers().set(HttpHeaderNames.CONTENT_TYPE, HttpHeaderValues.APPLICATION_JSON);
         httpResponse.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length);
         return httpResponse;
+    }
+
+    /**
+     * Handles a response for a WebSocket connection (TASK-WS1.12).
+     *
+     * <p>WebSocket connections do not share the HTTP response path: instead of
+     * building a {@link FullHttpResponse}, the processor writes compact JSON
+     * frames via {@link WsConnectionContext#sendFrame(String)}.</p>
+     *
+     * <p>Routing rules (mirrors design §12.4):</p>
+     * <ul>
+     *   <li>{@code SendResponse} wrapping a {@link ProduceResponse}: write a
+     *       publisher-confirm frame when confirms are enabled, otherwise drop.</li>
+     *   <li>{@code SendResponse} wrapping a {@link FetchResponse}: no-op
+     *       ({@code WsConsumerFetchLoop} streams fetch data directly).</li>
+     *   <li>{@code SendResponse} with any other payload: no-op (nothing to send
+     *       over the WebSocket for this response type).</li>
+     *   <li>{@code NoOpResponse}: no-op (acks=0 produce on WS is fire-and-forget).</li>
+     *   <li>{@code CloseConnectionResponse}: close the WS channel, remove from
+     *       both the WS map and the HTTP channel map.</li>
+     *   <li>{@code StartThrottlingResponse}: write a throttle error frame.</li>
+     *   <li>{@code EndThrottlingResponse}: no-op (no mute/unmute on WS).</li>
+     * </ul>
+     *
+     * <p>Every branch decrements {@code inFlightCount} exactly once, matching
+     * the HTTP path's accounting.</p>
+     */
+    private void handleWsResponse(WsConnectionContext wsCtx,
+                                   RequestChannel.Response response,
+                                   String connectionId) {
+        try {
+            if (response instanceof RequestChannel.SendResponse) {
+                RequestChannel.SendResponse sendResp = (RequestChannel.SendResponse) response;
+                AbstractResponse kafkaResp = extractAbstractResponse(sendResp);
+                if (kafkaResp instanceof ProduceResponse) {
+                    if (wsCtx.isPublishConfirmsEnabled()) {
+                        long publishId = extractPublishId(sendResp);
+                        wsCtx.sendFrame(buildPublishConfirmFrame((ProduceResponse) kafkaResp, publishId));
+                    }
+                    // else: confirms disabled -> silent ack (fire-and-forget)
+                } else if (kafkaResp instanceof FetchResponse) {
+                    // No-op: FetchResponse flows via WsConsumerFetchLoop, not through the processor.
+                }
+                // else: no-op for other response payloads (or null fallback)
+                safeUpdateMetrics(response);
+            } else if (response instanceof RequestChannel.NoOpResponse) {
+                // No-op for WS — acks=0 produce is fire-and-forget on WebSockets.
+                safeUpdateMetrics(response);
+            } else if (response instanceof RequestChannel.CloseConnectionResponse) {
+                if (wsCtx.isActive()) {
+                    wsCtx.close(1000, "server closed");
+                }
+                wsConnections.remove(connectionId);
+                channels.remove(connectionId);
+            } else if (response instanceof RequestChannel.StartThrottlingResponse) {
+                long throttleTimeMs = response.request().apiThrottleTimeMs();
+                wsCtx.sendFrame(buildThrottleFrame(throttleTimeMs));
+            } else if (response instanceof RequestChannel.EndThrottlingResponse) {
+                // No-op for WS — no mute/unmute mechanism.
+            }
+        } finally {
+            inFlightCount.decrementAndGet();
+        }
+    }
+
+    /**
+     * Extracts the {@link AbstractResponse} stored in
+     * {@link RequestChannel.Request#requestLocalProperties()} under the
+     * {@code httpAbstractResponse} key, or {@code null} if not present.
+     */
+    private AbstractResponse extractAbstractResponse(RequestChannel.SendResponse sendResp) {
+        java.util.concurrent.ConcurrentHashMap<String, Object> props =
+            sendResp.request().requestLocalProperties();
+        if (props == null) {
+            return null;
+        }
+        Object stored = props.get("httpAbstractResponse");
+        return (stored instanceof AbstractResponse) ? (AbstractResponse) stored : null;
+    }
+
+    /**
+     * Extracts the publish sequence ID (set by {@code WsPublishHandler}) from the
+     * request-local properties under the {@code wsPublishId} key. Defaults to
+     * {@code 0} if absent.
+     */
+    private long extractPublishId(RequestChannel.SendResponse sendResp) {
+        java.util.concurrent.ConcurrentHashMap<String, Object> props =
+            sendResp.request().requestLocalProperties();
+        if (props == null) {
+            return 0L;
+        }
+        Object stored = props.get("wsPublishId");
+        if (stored instanceof Long) {
+            return (Long) stored;
+        }
+        if (stored instanceof Number) {
+            return ((Number) stored).longValue();
+        }
+        return 0L;
+    }
+
+    /**
+     * Builds a publisher-confirm JSON frame. Successful responses produce
+     * {@code {"type":"published","publishId":N}}; failures produce
+     * {@code {"type":"publish-failed","publishId":N,"errorCode":E,"errorMessage":"..."}}.
+     */
+    private String buildPublishConfirmFrame(ProduceResponse response, long publishId) {
+        // Aggregate status across partitions: first non-NONE error wins.
+        org.apache.kafka.common.protocol.Errors firstError = null;
+        String firstErrorMessage = null;
+        if (response.data() != null && response.data().responses() != null) {
+            outer:
+            for (org.apache.kafka.common.message.ProduceResponseData.TopicProduceResponse topic
+                    : response.data().responses()) {
+                if (topic.partitionResponses() == null) {
+                    continue;
+                }
+                for (org.apache.kafka.common.message.ProduceResponseData.PartitionProduceResponse part
+                        : topic.partitionResponses()) {
+                    org.apache.kafka.common.protocol.Errors err =
+                        org.apache.kafka.common.protocol.Errors.forCode(part.errorCode());
+                    if (err != org.apache.kafka.common.protocol.Errors.NONE) {
+                        firstError = err;
+                        firstErrorMessage = part.errorMessage();
+                        break outer;
+                    }
+                }
+            }
+        }
+        if (firstError == null) {
+            return String.format("{\"type\":\"published\",\"publishId\":%d}", publishId);
+        }
+        String msg = firstErrorMessage != null ? firstErrorMessage : firstError.name();
+        return String.format(
+            "{\"type\":\"publish-failed\",\"publishId\":%d,\"errorCode\":%d,\"errorMessage\":\"%s\"}",
+            publishId, firstError.code(), escapeJson(msg));
+    }
+
+    /**
+     * Builds a throttle-error JSON frame for WebSocket clients.
+     */
+    private String buildThrottleFrame(long throttleTimeMs) {
+        return String.format(
+            "{\"type\":\"throttled\",\"errorCode\":%d,\"errorMessage\":\"%s\",\"throttleTimeMs\":%d}",
+            THROTTLE_ERROR_CODE, THROTTLE_ERROR_MESSAGE, throttleTimeMs);
+    }
+
+    /**
+     * Minimal JSON string escaping for error messages in WS frames.
+     */
+    private static String escapeJson(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"':
+                    sb.append("\\\"");
+                    break;
+                case '\\':
+                    sb.append("\\\\");
+                    break;
+                case '\n':
+                    sb.append("\\n");
+                    break;
+                case '\r':
+                    sb.append("\\r");
+                    break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        return sb.toString();
     }
 
     /**
@@ -415,6 +652,7 @@ public class HttpProcessor implements ResponseProcessor {
             drainerThread = null;
         }
         channels.clear();
+        wsConnections.clear();
         responseQueue.clear();
     }
 

@@ -424,19 +424,29 @@ public void processResponses() {
 
 ## Learning
 
-_To be filled by the executing agent._
+- **`wsConnections.get()` vs `containsKey() + get()`**. Using a single `get()` (non-null check) is atomically race-free against concurrent `unregister` AND one map lookup cheaper per response. Design doc pseudo-code used `containsKey`; implementation uses `get` per the CRITICAL note at line 154.
+- **WsConnectionContext (WS1.02 stub) only exposes `sendFrame(String)`** — not the `writePublishConfirm(ProduceResponse, long)` helper the task spec draft described. The processor therefore owns JSON frame construction (`buildPublishConfirmFrame`, `buildThrottleFrame`). Moving that formatting into `WsConnectionContext` later is an easy refactor once `WsFrameSerializer` (WS1.09) lands.
+- **`ProduceResponseData` aggregation**. `ProduceResponse` carries an arbitrary number of topic/partition tuples; a single WS publish lifts this to one `publishId`. The processor picks the first non-NONE partition error as the response verdict, matching RabbitMQ's publisher-confirm semantics (any nack on any shard fails the publish).
+- **`requestLocalProperties` marker keys**. The HTTP path stores the `AbstractResponse` under `httpAbstractResponse`. The WS publish-confirm path reuses this key *and* adds `wsPublishId` (to be set by `WsPublishHandler`, TASK-WS1.11) for the confirm frame's correlation ID. If `wsPublishId` is absent the processor defaults to 0 so tests that don't wire through WS1.11 still pass.
+- **`inFlightCount` accounting parity**. Every WS branch in `handleWsResponse` decrements the shared counter in a `finally` block. Missing this was explicitly called out in the task as a failure mode (counter leak -> connection rejection). The `finally` placement guarantees the decrement even if a Netty write throws.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- Publisher confirms are written synchronously on the response-drainer thread via `ctx.writeAndFlush`. Netty serialises onto its event loop, so correctness is fine, but the drainer blocks on queueing. If WS produce throughput becomes a hot path, consider batching multiple confirm frames before flushing.
+- `buildPublishConfirmFrame` reports only the *first* partition error. A batched produce across multiple partitions that partially succeeds is reported as a full failure. This matches RabbitMQ's "any nack -> publish-failed" model and is the behaviour WS1.11 expects, but is lossy compared to the full Kafka `ProduceResponse`.
+- `StartThrottlingResponse` is expressed as a WS JSON frame rather than transport-level throttling. HTTP clients get a proper HTTP 429 with `Retry-After`; WS clients get a data frame they must interpret. Consistent with plain-WebSocket protocol (no transport backpressure beyond TCP) but clients must parse `"type":"throttled"` frames specifically.
+- The in-house `escapeJson` helper is minimal — sufficient for server-generated error messages, but downstream tasks that embed arbitrary user-supplied strings in WS frames should switch to Jackson for correctness under all Unicode edge cases.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Checkstyle flagged switch-case single-line statements (`case X: sb.append(...); break;`) under the `OneStatementPerLine` rule. Multi-line case blocks are required in this repo.
+- `org.apache.kafka.common.message.ProduceResponseData.TopicProduceResponseCollection` is constructed from an `Iterator<TopicProduceResponse>` — not a `List`. Subtle gotcha when building test fixtures.
+- Mockito's default behaviour for `when(ctx.writeAndFlush(any())).thenReturn(writeFuture)` does not auto-stub `writeFuture.addListener(...)`; tests that chain listeners would NPE without an explicit `when(writeFuture.addListener(any())).thenReturn(writeFuture)`. Replicated the pattern from `HttpProcessorTest`'s `mockActiveCtx` helper.
+- Worktree snapshot base was stale (`f95a1f995d`, main's trunk HEAD). First action was `git fetch && git reset --hard origin/feature/http-protocol` to align with the actual `feature/http-protocol` HEAD (`f89cbe575b`).
 
 ---
 
