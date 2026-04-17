@@ -470,9 +470,11 @@ public void processResponses() {
 
 > Filled by the executing agent after each commit.
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-17 — HttpProcessor WebSocket extension (commit dc2458c138)
+
 Created:
-  - path/to/NewFile.java — <what it does>
+  - `http-server/src/test/java/kafka/server/http/HttpProcessorWsTest.java` — 18 tests covering the WS extension: registration API, ProduceResponse confirm success/failure, confirms-disabled silence, HTTP fall-through regression, CloseConnectionResponse routing, StartThrottlingResponse frame, NoOpResponse silence, mixed HTTP+WS routing, concurrent register/unregister safety.
+
 Modified:
-  - path/to/Existing.java — <what changed>
--->
+  - `http-server/src/main/java/kafka/server/http/HttpProcessor.java` — added `wsConnections` `ConcurrentHashMap<String, WsConnectionContext>` field; added `registerWsConnection`, `unregisterWsConnection`, `isWsConnection`, `wsConnectionCount`; extended `processResponses()` to route WS connections first via a single `get()`; added `handleWsResponse`, `extractAbstractResponse`, `extractPublishId`, `buildPublishConfirmFrame`, `buildThrottleFrame`, `escapeJson` helpers; `close()` now clears `wsConnections`.
+  - `ivy-docs/tasks/TASK-WS1.12-http-processor-ws-extension.md` — Learning, Limitations, Field Notes, File Manifest sections filled.
