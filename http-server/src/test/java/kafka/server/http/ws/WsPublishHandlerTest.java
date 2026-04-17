@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 // Time: Created - TASK-WS1.11
+// Time: Update - TASK-WS3.02 - enhanced mandatory return semantics
 package kafka.server.http.ws;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -273,22 +274,38 @@ class WsPublishHandlerTest {
     }
 
     // ------------------------------------------------------------------
-    //  Unknown exchange
+    //  Unknown exchange — TASK-WS3.02 changed these semantics:
+    //  non-existent exchange is treated as unroutable (not an error).
     // ------------------------------------------------------------------
 
     @Test
-    void handlePublish_unknownExchange_emitsErrorFrame() {
+    void handlePublish_unknownExchange_nonMandatory_silentDrop() {
+        // Design doc §5.7 / TASK-WS3.02: missing exchange + mandatory=false =>
+        // silent drop, no error frame, no returned frame. Routing is NOT invoked.
         when(exchangeManager.getExchange("/", "ghost")).thenReturn(null);
 
         handler.handlePublish(buildPublishFrame("ghost", "k", "x", 3L, false), connCtx);
 
         assertTrue(captured.isEmpty());
-        assertEquals(1, writtenFrames.size(), "one error frame expected");
+        assertTrue(writtenFrames.isEmpty(),
+            "non-existent exchange + mandatory=false must be silent; got: " + writtenFrames);
+        verify(routingEngine, never()).route(any(), any(), any());
+    }
+
+    @Test
+    void handlePublish_unknownExchange_mandatory_emitsReturnedFrame() {
+        // Design doc §5.7 / TASK-WS3.02: missing exchange + mandatory=true =>
+        // returned frame (replyCode 312 / NO_ROUTE).
+        when(exchangeManager.getExchange("/", "ghost")).thenReturn(null);
+
+        handler.handlePublish(buildPublishFrame("ghost", "k", "x", 3L, true), connCtx);
+
+        assertTrue(captured.isEmpty());
+        assertEquals(1, writtenFrames.size(), "one returned frame expected");
         String frame = writtenFrames.get(0);
-        assertTrue(frame.contains("\"type\":\"error\""), "frame=" + frame);
-        assertTrue(frame.contains("NOT_FOUND"), "frame=" + frame);
+        assertTrue(frame.contains("\"type\":\"returned\""), "frame=" + frame);
+        assertTrue(frame.contains("\"replyCode\":312"), "frame=" + frame);
         assertTrue(frame.contains("\"publishId\":3"), "publishId echoed: frame=" + frame);
-        // And routing engine must not be called.
         verify(routingEngine, never()).route(any(), any(), any());
     }
 
