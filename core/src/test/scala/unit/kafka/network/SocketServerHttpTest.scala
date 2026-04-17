@@ -296,4 +296,252 @@ class SocketServerHttpTest {
     assertNotNull(httpEntry.getValue,
       "HTTP acceptor should not be null")
   }
+
+  // ===================================================================
+  // Test 8: Port conflict — HTTP port == PLAINTEXT port → rejected
+  // ===================================================================
+  @Test
+  def testPortConflictHttpAndPlaintext(): Unit = {
+    val props = new Properties()
+    props.put("process.roles", "broker")
+    props.put("node.id", "0")
+    props.put("quorum.bootstrap.servers", "localhost:9095")
+    props.put("controller.listener.names", "CONTROLLER")
+    props.put(SocketServerConfigs.LISTENERS_CONFIG,
+      "PLAINTEXT://localhost:9092,HTTP://localhost:9092")
+    props.put(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG,
+      "PLAINTEXT:PLAINTEXT,HTTP:HTTP,CONTROLLER:PLAINTEXT")
+    props.put(ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG, "PLAINTEXT")
+
+    val exception = assertThrows(classOf[IllegalArgumentException], () => {
+      KafkaConfig.fromProps(props)
+    })
+    assertTrue(exception.getMessage.contains("different port"),
+      s"Should reject duplicate ports, got: ${exception.getMessage}")
+  }
+
+  // ===================================================================
+  // Test 9: HTTP port = 0 (random assignment) works
+  // ===================================================================
+  @Test
+  def testHttpPortZeroRandomAssignment(): Unit = {
+    val props = createProps()
+    // Port 0 is already used in createProps — verify it works
+    val ss = createSocketServer(props)
+    ss.enableRequestProcessing(Map.empty).get(1, TimeUnit.MINUTES)
+
+    // HTTP acceptor should exist
+    assertEquals(1, ss.httpAcceptors.size())
+    // The mock returns boundPort=0, but the key point is no exception was thrown
+  }
+
+  // ===================================================================
+  // Test 10: HTTP + HTTPS on same broker
+  // ===================================================================
+  @Test
+  def testHttpAndHttpsCoexist(): Unit = {
+    val props = TestUtils.createBrokerConfig(0, port = 0)
+    props.put(SocketServerConfigs.LISTENERS_CONFIG,
+      "PLAINTEXT://localhost:0,HTTP://localhost:0,HTTPS://localhost:0")
+    props.put(SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG,
+      "PLAINTEXT://localhost:0,HTTP://localhost:0,HTTPS://localhost:0")
+    props.put(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG,
+      "PLAINTEXT:PLAINTEXT,HTTP:HTTP,HTTPS:HTTPS,CONTROLLER:PLAINTEXT")
+    props.put(ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG, "PLAINTEXT")
+    // HTTPS requires SSL config
+    props.put("ssl.keystore.location", "/tmp/test-keystore.jks")
+    props.put("ssl.keystore.password", "testpass")
+    props.put("ssl.key.password", "testpass")
+
+    val config = KafkaConfig.fromProps(props)
+    val factory: (Endpoint, Time) => HttpAcceptorLike = (ep, t) => new HttpAcceptorLike {
+      private val _startedFuture = new java.util.concurrent.CompletableFuture[Void]()
+      override def endpoint: Endpoint = ep
+      override def startedFuture: java.util.concurrent.CompletableFuture[Void] = _startedFuture
+      override def startup(): Unit = _startedFuture.complete(null)
+      override def beginDrain(): Unit = ()
+      override def awaitDrain(timeoutMs: Long): Unit = ()
+      override def boundPort: Int = 0
+      override def close(): Unit = ()
+      override def isDraining: Boolean = false
+      override def pendingRequestCount: Int = 0
+    }
+    server = new SocketServer(config, metrics, Time.SYSTEM, credentialProvider, apiVersionManager,
+      httpAcceptorFactory = factory)
+    server.enableRequestProcessing(Map.empty).get(1, TimeUnit.MINUTES)
+
+    // Should have 2 HTTP acceptors (HTTP + HTTPS)
+    assertEquals(2, server.httpAcceptors.size(),
+      "Should have HTTP and HTTPS acceptors")
+    val protocols = server.httpAcceptors.keySet().asScala.map(_.securityProtocol()).toSet
+    assertTrue(protocols.contains(SecurityProtocol.HTTP), "Should contain HTTP")
+    assertTrue(protocols.contains(SecurityProtocol.HTTPS), "Should contain HTTPS")
+    // Binary acceptor should only have PLAINTEXT
+    assertEquals(1, server.dataPlaneAcceptors.size(),
+      "Should have exactly one binary acceptor")
+  }
+
+  // ===================================================================
+  // Test 11: advertised.listeners with HTTP
+  // ===================================================================
+  @Test
+  def testAdvertisedListenersWithHttp(): Unit = {
+    val props = TestUtils.createBrokerConfig(0, port = 0)
+    props.put(SocketServerConfigs.LISTENERS_CONFIG,
+      "PLAINTEXT://localhost:0,HTTP://localhost:0")
+    props.put(SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG,
+      "PLAINTEXT://broker1.example.com:9092,HTTP://broker1.example.com:9094")
+    props.put(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG,
+      "PLAINTEXT:PLAINTEXT,HTTP:HTTP,CONTROLLER:PLAINTEXT")
+    props.put(ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG, "PLAINTEXT")
+
+    // Should parse without error
+    val config = KafkaConfig.fromProps(props)
+    val advertisedListeners = config.effectiveAdvertisedBrokerListeners
+    val httpAdvertised = advertisedListeners.find(_.securityProtocol() == SecurityProtocol.HTTP)
+    assertTrue(httpAdvertised.isDefined, "HTTP should be in advertised listeners")
+    assertEquals("broker1.example.com", httpAdvertised.get.host(),
+      "HTTP advertised host should match")
+    assertEquals(9094, httpAdvertised.get.port(),
+      "HTTP advertised port should match")
+  }
+
+  // ===================================================================
+  // Test 12: HTTP without httpAcceptorFactory (null factory) → error
+  // ===================================================================
+  @Test
+  def testHttpWithoutFactoryThrows(): Unit = {
+    val props = createProps()
+    val config = KafkaConfig.fromProps(props)
+
+    // Create SocketServer WITHOUT httpAcceptorFactory (null)
+    val exception = assertThrows(classOf[IllegalStateException], () => {
+      server = new SocketServer(config, metrics, Time.SYSTEM, credentialProvider, apiVersionManager)
+      server.enableRequestProcessing(Map.empty).get(1, TimeUnit.MINUTES)
+    })
+    assertTrue(exception.getMessage.toLowerCase.contains("http"),
+      s"Should mention HTTP in error, got: ${exception.getMessage}")
+  }
+
+  // ===================================================================
+  // Test 13: inter.broker.listener = HTTPS also rejected
+  // ===================================================================
+  @Test
+  def testInterBrokerListenerCannotBeHttps(): Unit = {
+    val props = TestUtils.createBrokerConfig(0, port = 0)
+    props.put(SocketServerConfigs.LISTENERS_CONFIG,
+      "HTTPS://localhost:0")
+    props.put(SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG,
+      "HTTPS://localhost:0")
+    props.put(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG,
+      "HTTPS:HTTPS,CONTROLLER:PLAINTEXT")
+    props.put(ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG, "HTTPS")
+    props.put("ssl.keystore.location", "/tmp/test-keystore.jks")
+    props.put("ssl.keystore.password", "testpass")
+
+    val config = KafkaConfig.fromProps(props)
+    val factory: (Endpoint, Time) => HttpAcceptorLike = (ep, t) => new HttpAcceptorLike {
+      private val _startedFuture = new java.util.concurrent.CompletableFuture[Void]()
+      override def endpoint: Endpoint = ep
+      override def startedFuture: java.util.concurrent.CompletableFuture[Void] = _startedFuture
+      override def startup(): Unit = _startedFuture.complete(null)
+      override def beginDrain(): Unit = ()
+      override def awaitDrain(timeoutMs: Long): Unit = ()
+      override def boundPort: Int = 0
+      override def close(): Unit = ()
+      override def isDraining: Boolean = false
+      override def pendingRequestCount: Int = 0
+    }
+
+    val exception = assertThrows(classOf[IllegalArgumentException], () => {
+      server = new SocketServer(config, metrics, Time.SYSTEM, credentialProvider, apiVersionManager,
+        httpAcceptorFactory = factory)
+    })
+    assertTrue(exception.getMessage.toLowerCase.contains("inter.broker") ||
+      exception.getMessage.toLowerCase.contains("binary protocol"),
+      s"Should reject HTTPS as inter-broker, got: ${exception.getMessage}")
+  }
+
+  // ===================================================================
+  // Test 14: Custom listener name mapped to HTTP protocol
+  // ===================================================================
+  @Test
+  def testCustomListenerNameMappedToHttp(): Unit = {
+    val props = TestUtils.createBrokerConfig(0, port = 0)
+    props.put(SocketServerConfigs.LISTENERS_CONFIG,
+      "PLAINTEXT://localhost:0,MY_REST_API://localhost:0")
+    props.put(SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG,
+      "PLAINTEXT://localhost:0,MY_REST_API://localhost:0")
+    props.put(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG,
+      "PLAINTEXT:PLAINTEXT,MY_REST_API:HTTP,CONTROLLER:PLAINTEXT")
+    props.put(ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG, "PLAINTEXT")
+
+    val config = KafkaConfig.fromProps(props)
+    val factory: (Endpoint, Time) => HttpAcceptorLike = (ep, t) => new HttpAcceptorLike {
+      private val _startedFuture = new java.util.concurrent.CompletableFuture[Void]()
+      override def endpoint: Endpoint = ep
+      override def startedFuture: java.util.concurrent.CompletableFuture[Void] = _startedFuture
+      override def startup(): Unit = _startedFuture.complete(null)
+      override def beginDrain(): Unit = ()
+      override def awaitDrain(timeoutMs: Long): Unit = ()
+      override def boundPort: Int = 0
+      override def close(): Unit = ()
+      override def isDraining: Boolean = false
+      override def pendingRequestCount: Int = 0
+    }
+    server = new SocketServer(config, metrics, Time.SYSTEM, credentialProvider, apiVersionManager,
+      httpAcceptorFactory = factory)
+    server.enableRequestProcessing(Map.empty).get(1, TimeUnit.MINUTES)
+
+    // Custom name should route to httpAcceptors
+    assertEquals(1, server.httpAcceptors.size(),
+      "Custom HTTP listener should be in httpAcceptors")
+    val ep = server.httpAcceptors.keySet().asScala.head
+    assertEquals(SecurityProtocol.HTTP, ep.securityProtocol(),
+      "Custom listener should map to HTTP protocol")
+    assertEquals("MY_REST_API", ep.listener(),
+      "Custom listener name should be preserved")
+  }
+
+  // ===================================================================
+  // Test 15: HTTPS with valid SSL config succeeds
+  // ===================================================================
+  @Test
+  def testHttpsWithValidSslConfigSucceeds(): Unit = {
+    val props = TestUtils.createBrokerConfig(0, port = 0)
+    props.put(SocketServerConfigs.LISTENERS_CONFIG,
+      "PLAINTEXT://localhost:0,HTTPS://localhost:0")
+    props.put(SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG,
+      "PLAINTEXT://localhost:0,HTTPS://localhost:0")
+    props.put(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG,
+      "PLAINTEXT:PLAINTEXT,HTTPS:HTTPS,CONTROLLER:PLAINTEXT")
+    props.put(ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG, "PLAINTEXT")
+    props.put("ssl.keystore.location", "/tmp/test-keystore.jks")
+    props.put("ssl.keystore.password", "testpass")
+    props.put("ssl.key.password", "testpass")
+
+    val config = KafkaConfig.fromProps(props)
+    val factory: (Endpoint, Time) => HttpAcceptorLike = (ep, t) => new HttpAcceptorLike {
+      private val _startedFuture = new java.util.concurrent.CompletableFuture[Void]()
+      override def endpoint: Endpoint = ep
+      override def startedFuture: java.util.concurrent.CompletableFuture[Void] = _startedFuture
+      override def startup(): Unit = _startedFuture.complete(null)
+      override def beginDrain(): Unit = ()
+      override def awaitDrain(timeoutMs: Long): Unit = ()
+      override def boundPort: Int = 0
+      override def close(): Unit = ()
+      override def isDraining: Boolean = false
+      override def pendingRequestCount: Int = 0
+    }
+
+    // Should NOT throw — SSL config is present
+    server = new SocketServer(config, metrics, Time.SYSTEM, credentialProvider, apiVersionManager,
+      httpAcceptorFactory = factory)
+    server.enableRequestProcessing(Map.empty).get(1, TimeUnit.MINUTES)
+
+    assertEquals(1, server.httpAcceptors.size(),
+      "HTTPS acceptor should be created with valid SSL config")
+    val ep = server.httpAcceptors.keySet().asScala.head
+    assertEquals(SecurityProtocol.HTTPS, ep.securityProtocol())
+  }
 }
