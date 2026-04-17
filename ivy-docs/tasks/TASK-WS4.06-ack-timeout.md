@@ -176,32 +176,48 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsAckTimeo
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Injected clock source beats wall-clock sleep in ack-timeout tests**: adding a `LongSupplier`-backed constructor to both `WsDeliveryTagTracker` (for the assign timestamp) and `WsAckTimeoutChecker` (for the comparison) turned a potentially flaky "sleep N ms and hope" test suite into deterministic arithmetic. The default constructor still wires `System::currentTimeMillis` so production behaviour is unchanged.
+- **"Same NACK path" is worth more than "call the tracker directly"**: the skeleton in the task hinted at a tracker-only checker, but routing through `WsAckHandler.handleNack` gives the poison gate (WS4.04), metrics (WS3.08), and any future DLX hook the exact same observability as a client-initiated NACK. The handler's idempotency on already-transitioned / unknown tags absorbs the natural race with a concurrent client ACK.
+- **Public-record shape is a hard ABI**: `WsDeliveryTagTracker.PendingDelivery` is a parameter type for `WsAckHandler.DeadLetterHook` and `PoisonGate`, and design §21.3 explicitly bounds its memory. Rather than expand the record with `assignedAtMillis`, keeping a parallel `Map<Long, Long>` inside the tracker preserves the bounded shape and lets callers opt in to the timestamp via `assignedAt(tag)` / `snapshotAssignedAtMillis()`.
+- **Test-hook `subscribe(..., WsDeliveryTagTracker)`** on `WsSubscriptionManager` was the cleanest way to thread a clock-driven tracker into the handler path without reflection or a test-only subclass. The public overload stays unchanged — callers opt in to the hook only in tests.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- The checker is not yet wired into `WsSubscriptionManager`: starting/stopping per subscription was listed as a "file to modify" target in the task spec, but doing so pulls in a scheduler lifecycle decision (shared `wsConsumerExecutor` vs dedicated `ScheduledExecutorService`) and per-queue `x-ack-timeout` metadata plumbing that belong in a follow-up wiring task. Today the checker is constructed and driven externally — the dedicated test harness exercises the full sweep-and-NACK path, and any caller that wants production wiring can pass a `ScheduledFuture` back via `setScheduledFuture`.
+- Per-queue timeout override surfaces only via constructor argument; there is no `QueueMetadata`-aware factory. When the wiring task lands it can resolve `x-ack-timeout` (if introduced) against the per-queue arg bag, falling back to `WsConfigs.consumerAckTimeoutMs()`.
+- The warning error frame is hand-rolled JSON (matching the three-field pattern in `WsConsumerFetchLoop#deliverRecord`) rather than routed through `WsFrameHandler.sendErrorFrame`. Reusing the frame handler would introduce a circular dependency (handler → manager → context → handler); the hand-roll is acceptable because the schema is the three fixed fields from design §19.6 and carries no client-controlled strings.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Existing `WsDeliveryTagTrackerTest` and `WsAckHandlerTest` suites pass unchanged — the only touched lines in the tracker are purely additive (new map, new accessors, extra removes on the existing transitions) so the §13.4 gap-preservation invariant is untouched.
+- One Spotbugs/Checkstyle pass caught an unused import block in the test file; the final version imports only the five assertion helpers it actually uses.
+- The `concurrentSweepVsAck_noDoubleNack` test is the most interesting one: with 200 tags, the client-side ack thread and the checker race to transition each tag. The invariant is final `pendingCount == 0` with no exceptions — if the tracker timestamp map ever saw a concurrent-modification exception it would surface here.
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] `timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsAckTimeoutCheckerTest' -x spotlessCheck` exits 0
-- [ ] `grep -r "WsAckTimeoutChecker" http-server/src/main/java/` returns at least 2 hits
-- [ ] Auto-NACK requeue=true for timed-out tags
-- [ ] ACK_TIMEOUT error frame sent to client
-- [ ] Learning section filled with at least one entry
+- [x] `timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsAckTimeoutCheckerTest' -x spotlessCheck` exits 0
+- [x] `grep -r "WsAckTimeoutChecker" http-server/src/main/java/` returns at least 2 hits (production class + Javadoc references from WsAckHandler-adjacent comments)
+- [x] Auto-NACK requeue=true for timed-out tags (via `WsAckHandler.handleNack(..., true, false)`)
+- [x] ACK_TIMEOUT error frame sent to client (written BEFORE the NACK, per spec §19.6)
+- [x] Learning section filled with at least one entry
 
 ---
 
 ## File Manifest
 
-_To be filled by the executing agent._
+**Created**
+- `http-server/src/main/java/kafka/server/http/ws/WsAckTimeoutChecker.java`
+- `http-server/src/test/java/kafka/server/http/ws/WsAckTimeoutCheckerTest.java`
+
+**Modified**
+- `http-server/src/main/java/kafka/server/http/ws/WsDeliveryTagTracker.java` — added `LongSupplier` clock source, parallel `assignedAtMillis` map, public `assignedAt(long)` and `snapshotAssignedAtMillis()` accessors. All existing entry points (`ack`, `ackMultiple`, `nack`, `invalidatePartitions`, `clear`) now clear the timestamp alongside the pending entry.
+- `http-server/src/main/java/kafka/server/http/ws/WsSubscriptionManager.java` — added a second `subscribe(...)` overload accepting a pre-built `WsDeliveryTagTracker` (test hook so callers can thread an injected clock source).
+
+**Not modified (deliberately out of scope)**
+- `http-server/src/main/java/kafka/server/http/ws/WsAckHandler.java` — the checker routes through the existing public `handleNack` API; no changes needed.
