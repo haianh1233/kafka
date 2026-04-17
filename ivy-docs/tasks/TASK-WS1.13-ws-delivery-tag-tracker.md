@@ -652,19 +652,29 @@ cd /home/anh/kafka && ./gradlew :http-server:test --tests 'kafka.server.http.ws.
 
 ## Learning
 
-_To be filled by the executing agent._
+- The §13.4 "gap-fill" invariant has a subtle redelivery wrinkle: after a `NACK(requeue=true)` marks an offset as `NACKED_REQUEUE`, the caller will eventually redeliver that same offset under a new tag. The ack bitmap must promote the existing `NACKED_REQUEUE` entry back to `PENDING` at assign time, or else the later `ack()` finds a non-PENDING state and refuses to transition it to `ACKED`, leaving the gap forever. Resolved via a `Map.merge` on `assign`: only `NACKED_REQUEUE → PENDING` transitions are allowed; terminal states (`ACKED`, `NACKED_DISCARD`) are preserved to catch double-delivery by the caller.
+- `TreeMap.headMap(k).clear()` is exclusive of `k` — convenient for pruning "committed" entries because the Kafka commit offset `k = lastOffset + 1` is *itself* not yet observed, so pruning everything strictly below `k` is correct and keeps the watermark computation O(pending) rather than O(all-time).
+- Idempotence semantics in the spec: `ack(tag)` returns `false` on the *second* call because the tag is no longer in `pendingDeliveries`. The "idempotent" guarantee is state-level (no corruption, no exception), not return-level. This matches `Map.remove` semantics and mirrors `Amqp091AckHandler.unackedDeliveries.remove`.
+- A single `synchronized (lock)` block keeps `pendingDeliveries`, `partitionAckMaps`, and `lastCommittedOffsets` in a consistent view during `ackMultiple` and `getCommittableOffsets`. The spec explicitly rules out `ConcurrentHashMap` for `pendingDeliveries` because atomic range iteration is required. The `cleared` flag is volatile purely as a fast-path signal; the lock still serialises all mutations.
+- The concurrency smoke tests exercise the realistic threading model (one assigner, many ack-ers) and verified the final watermark equals `lastOffset+1` after 500 parallel acks across 8 threads.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- Only the `NACKED_REQUEUE → PENDING` transition is allowed on re-assign. A caller that erroneously re-delivers an already-`ACKED` offset will silently leave the `ACKED` state unchanged and the new pending delivery will never clear the pending map (because `ack` for the new tag will find the offset already `ACKED`). This is defensive (we refuse to un-ack) but is not surfaced via an exception — the caller is expected to coordinate via the consumer fetch loop contract.
+- Memory pruning happens inside `getCommittableOffsets`. If a caller never invokes that method, the ack bitmap grows unbounded. Design doc §21.3 bounds pending deliveries via credit flow-control, but the ack bitmap entries for `ACKED`/`NACKED_DISCARD` offsets linger until the next `getCommittableOffsets` call. Callers should poll at least once per ack batch.
+- `assign` still increments the tag counter even after `clear()` — the tag returned is "detached" and will never match any later ack. This matches the spec ("After clear, ack/nack calls are ignored") and avoids a race between a concurrent assign and clear leaving the counter in an inconsistent state.
+- No per-connection / per-subscription memory cap enforced here; that is the responsibility of the credit manager (TASK-WS1.14). This tracker assumes credits bound the live set.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- The `feature/http-protocol` branch HEAD has a pre-existing scala compile break in `http-server/src/main/scala/kafka/network/HttpRequestHandler.scala` (references `HttpRouter.validateClientId`, `HttpRouter.HandlerType`, `HttpRequestTranslator.translateCommitOffsets`, `HttpResponseSerializer.serialize`, etc., which do not exist on the branch). This blocked `./gradlew :http-server:test` until I skipped scala explicitly: `-x compileScala -x compileTestScala`. Verified by checking out a fresh clone of `feature/http-protocol` into `/tmp` — the break is not mine. Flagging for a follow-up task or a sibling agent's fix.
+- With `-x compileScala -x compileTestScala`, all 20 tests pass in ~0.05s wall (including two concurrency smoke tests with 8-thread executors and 500/200 tags respectively).
+- Checkstyle passes on both main and test sources.
+- The worktree started from an older upstream commit `f95a1f995d` (no `http-server` module). Reset to `feature/http-protocol` HEAD (`ee602708bd`) before writing code, as instructed by CLAUDE.md workflow.
 
 ---
 
