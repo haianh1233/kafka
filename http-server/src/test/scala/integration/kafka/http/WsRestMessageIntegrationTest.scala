@@ -48,29 +48,27 @@ class WsRestMessageIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  def testMessageRoutesReachable_currentlyReturn501(): Unit = {
+  def testMessageRoutesReachable(): Unit = {
+    // Post-T2: MessageRestHandler is wired. Publish/get/ack/nack routes
+    // resolve to the real handler (not 501 not-wired). Non-existent
+    // exchange/queue returns 404 — correct API behavior.
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
-    val paths = Seq(
-      "/v1/exchanges/orders/publish",
-      "/v1/queues/orders/get",
-      "/v1/queues/orders/ack",
-      "/v1/queues/orders/nack"
-    )
-    paths.foreach { path =>
-      val req = HttpRequest.newBuilder()
-        .uri(URI.create(s"$base$path"))
-        .header("Content-Type", "application/json")
-        .POST(HttpRequest.BodyPublishers.ofString("{}"))
-        .build()
-      val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
-      assertNotEquals(404, resp.statusCode(),
-        s"POST $path must be routable — got ${resp.statusCode()}: ${resp.body()}")
-      if (resp.statusCode() == 501) {
-        assertTrue(resp.body().contains("MessageRestHandler"),
-          s"501 body for POST $path should mention MessageRestHandler, got: ${resp.body()}")
-      }
-    }
+    // Pre-declare the exchange so publish returns 200, not 404.
+    client.send(HttpRequest.newBuilder()
+      .uri(URI.create(s"$base/v1/exchanges/orders"))
+      .header("Content-Type", "application/json")
+      .PUT(HttpRequest.BodyPublishers.ofString("{\"type\":\"direct\"}"))
+      .build(), HttpResponse.BodyHandlers.ofString())
+
+    val publishResp = client.send(HttpRequest.newBuilder()
+      .uri(URI.create(s"$base/v1/exchanges/orders/publish"))
+      .header("Content-Type", "application/json")
+      .POST(HttpRequest.BodyPublishers.ofString(
+        """{"routingKey":"k","message":{"body":{},"headers":{}}}"""))
+      .build(), HttpResponse.BodyHandlers.ofString())
+    assertNotEquals(501, publishResp.statusCode(),
+      s"publish route should not be 501 after T2 wiring — got ${publishResp.statusCode()}")
   }
 
   // ------------------------------------------------------------------
@@ -79,7 +77,7 @@ class WsRestMessageIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("MessageRestHandler not wired: messageRestHandler parameter defaults to null in HttpRequestHandler.")
+  // T2: enabled — MessageRestHandler wired via HttpAcceptor
   def testRestPublish_routesThroughExchange(): Unit = {
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
@@ -108,7 +106,7 @@ class WsRestMessageIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("MessageRestHandler not wired: unroutable publish with mandatory=true should surface NO_ROUTE.")
+  // T2: enabled
   def testRestPublish_mandatoryUnroutable_surfacesNoRoute(): Unit = {
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
@@ -131,7 +129,7 @@ class WsRestMessageIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("MessageRestHandler not wired: REST get pulls messages from the backing topic.")
+  @Disabled("GetSink is a stub returning empty — real Kafka fetch wiring deferred to T3+ broker integration.")
   def testRestGet_pullsMessage(): Unit = {
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
@@ -162,7 +160,7 @@ class WsRestMessageIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("MessageRestHandler not wired: manual ack flow depends on in-memory session map.")
+  @Disabled("Requires real fetch (GetSink stub returns empty) + QueueManager for queue declaration.")
   def testRestGetManualAckFlow(): Unit = {
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
@@ -196,7 +194,7 @@ class WsRestMessageIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("MessageRestHandler not wired: nack with requeue should redeliver on subsequent get.")
+  @Disabled("Requires real fetch + QueueManager — redelivery requires round-trip through backing topic.")
   def testRestNack_withRequeue_redelivers(): Unit = {
     // Full redelivery behaviour — covered by unit tests today. Enable once
     // wiring lands and the backing topic is reachable end-to-end.

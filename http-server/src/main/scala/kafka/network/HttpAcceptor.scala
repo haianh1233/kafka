@@ -27,9 +27,9 @@ import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.nio.NioServerSocketChannel
 import io.netty.handler.ssl.SslContext
 import kafka.server.http.HttpProcessor
-import kafka.server.http.rest.{BindingRestHandler, ConnectionRestHandler, ConsumerRestHandler, ExchangeRestHandler, QueueRestHandler, VhostRestHandler}
-import kafka.server.http.routing.{BindingManager, ExchangeManager, VhostManager}
-import kafka.server.http.ws.{WsConfigs, WsConnectionRegistry, WsRoutingMetadataManager}
+import kafka.server.http.rest.{BindingRestHandler, ConnectionRestHandler, ConsumerRestHandler, ExchangeRestHandler, MessageRestHandler, QueueRestHandler, VhostRestHandler}
+import kafka.server.http.routing.{BindingManager, ExchangeManager, RoutingEngine, VhostManager}
+import kafka.server.http.ws.{WsConfigs, WsConnectionRegistry, WsMessageSerializer, WsRoutingMetadataManager}
 import kafka.utils.Logging
 import org.apache.kafka.common.Endpoint
 import org.apache.kafka.common.utils.Time
@@ -122,6 +122,7 @@ class HttpAcceptor(
   @volatile private var _connectionRestHandler: ConnectionRestHandler = _
   @volatile private var _consumerRestHandler: ConsumerRestHandler = _
   @volatile private var _vhostRestHandler: VhostRestHandler = _
+  @volatile private var _messageRestHandler: MessageRestHandler = _
   @volatile private var _wsConnectionRegistry: WsConnectionRegistry = _
 
   private def buildRestHandlerStack(): Unit = {
@@ -172,6 +173,35 @@ class HttpAcceptor(
     _connectionRestHandler = new ConnectionRestHandler(_wsConnectionRegistry, brokerId)
     _consumerRestHandler = new ConsumerRestHandler(_wsConnectionRegistry, (_: String) => null)
     _vhostRestHandler = new VhostRestHandler(vhostManager)
+
+    // TASK-T2: MessageRestHandler with stub sinks. Real produce/fetch/commit
+    // to Kafka requires RequestChannel integration, deferred.
+    //
+    // Per-vhost RoutingEngine on VhostManager reads bindings from the metadata
+    // topic — which is write-path only in this no-op stub wiring, so tests
+    // that bind via REST wouldn't see the bindings. We build a direct-view
+    // RoutingEngine that reads from BindingManager instead, ensuring REST
+    // bind + REST publish observe the same state within a single broker.
+    val routingEngine = new RoutingEngine(
+      (exchangeName: String) => {
+        val ex = exchangeManager.getExchange("/", exchangeName)
+        if (ex == null) null else ex.`type`()
+      },
+      (exchangeName: String) => bindingManager.listByExchange(exchangeName),
+      (_: String) => java.util.Collections.emptyList()
+    )
+    val stubPublishSink: MessageRestHandler.PublishSink = (queue, topic, _) =>
+      new MessageRestHandler.QueueOffset(queue, 0, 0L)
+    val stubGetSink: MessageRestHandler.GetSink = (_, _, _) => java.util.Collections.emptyList()
+    val stubAckSink: MessageRestHandler.AckSink = (_, _, _, _) => ()
+    _messageRestHandler = new MessageRestHandler(
+      routingEngine,
+      new WsMessageSerializer(),
+      (q: String) => "ws." + q,
+      stubPublishSink,
+      stubGetSink,
+      stubAckSink
+    )
   }
 
   override def setRequestChannel(requestChannel: RequestChannel): Unit = {
@@ -234,7 +264,8 @@ class HttpAcceptor(
         bindingRestHandler = _bindingRestHandler,
         connectionRestHandler = _connectionRestHandler,
         consumerRestHandler = _consumerRestHandler,
-        vhostRestHandler = _vhostRestHandler))
+        vhostRestHandler = _vhostRestHandler,
+        messageRestHandler = _messageRestHandler))
 
     val host = if (endpoint.host() == null || endpoint.host().isEmpty) "0.0.0.0" else endpoint.host()
     try {
