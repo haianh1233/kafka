@@ -465,3 +465,9 @@ Created:
 Modified:
   - path/to/Existing.java — <what changed>
 -->
+
+### 2026-04-17 — WS1.14 WsCreditManager (commit 364438b49c)
+
+Created:
+  - http-server/src/main/java/kafka/server/http/ws/WsCreditManager.java — per-subscription credit counter with `grant`/`consume`/`awaitCredits`/`available`/`reset`; lock-free via `AtomicInteger`, blocking via `LockSupport.parkNanos` (10ms polling); additionally gates on Netty `Channel.isWritable()`
+  - http-server/src/test/java/kafka/server/http/ws/WsCreditManagerTest.java — 22 unit tests covering basic state, consume floor-at-zero, grant validation, awaitCredits (immediate/zero-timeout/timeout/writability gate/cross-thread unblock-on-grant/cross-thread unblock-on-writable), reset, constructor validation, 8-thread concurrent grant/consume invariant
