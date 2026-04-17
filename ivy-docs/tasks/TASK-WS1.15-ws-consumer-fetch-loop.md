@@ -647,9 +647,14 @@ cd /home/anh/kafka && ./gradlew :http-server:test --tests 'kafka.server.http.ws.
 > Filled by the executing agent after each commit.
 > Run: `git diff --name-status HEAD~1 HEAD -- '*.java' '*.xml' '*.json' '*.yaml' '*.yml'`
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-17 — WsConsumerFetchLoop + WsSubscriptionManager (commit ee1266cad1)
+
 Created:
-  - path/to/NewFile.java — <what it does>
+  - http-server/src/main/java/kafka/server/http/ws/SubscriptionContext.java — per-subscription state container bundling id, queue/topic names, WsDeliveryTagTracker, WsCreditManager, WsConsumerFetchLoop.
+  - http-server/src/main/java/kafka/server/http/ws/WsConsumerFetchLoop.java — Runnable fetch loop; credit-gated, cancellation-aware, noAck-aware; writes deliver frames to the channel and advances offsets; protected `doFetchIteration` hook for TASK-WS1.16 Kafka wiring.
+  - http-server/src/main/java/kafka/server/http/ws/WsSubscriptionManager.java — per-connection subscription registry with subscribe/unsubscribe/grantCredits/cancelAll/activeCount/getSubscription; rolls back on `RejectedExecutionException`; `cancelAll` returns merged committable offsets.
+  - http-server/src/test/java/kafka/server/http/ws/WsConsumerFetchLoopTest.java — 13 tests covering construction, lifecycle (stop/isActive), deliverRecord happy path, noAck mode, monotonic tags, redelivered flag, prompt stop, channel-close exit, no busy-spin, immutable offset snapshot.
+  - http-server/src/test/java/kafka/server/http/ws/WsSubscriptionManagerTest.java — 17 tests covering construction, subscribe, duplicate rejection, executor dispatch observation, unsubscribe/offsets, grantCredits forwarding, cancelAll with merged offsets, 8-thread × 20-cycle concurrent subscribe/unsubscribe consistency.
+
 Modified:
-  - path/to/Existing.java — <what changed>
--->
+  - ivy-docs/tasks/TASK-WS1.15-ws-consumer-fetch-loop.md — Learning / Limitations / Field Notes / File Manifest.
