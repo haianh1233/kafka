@@ -599,7 +599,7 @@ Modified:
   - path/to/Existing.scala — <what changed>
 -->
 
-### 2026-04-17 — WS Phase 1 integration test harness + 6 disabled scenarios + 1 pre-wiring baseline (commit <fill-in-after-commit>)
+### 2026-04-17 — WS Phase 1 integration test harness + 6 disabled scenarios + 1 pre-wiring baseline (commit 6d84c3f5ad)
 Created:
   - http-server/src/test/scala/integration/kafka/http/WsTestClient.scala — Thin WebSocket test client built on `java.net.http.WebSocket`; matches the spec surface with `connect/send/waitForType/declareExchange/declareQueue/bind/subscribe/publish/waitForDeliver/ack/nack/enableConfirms/grantCredits/unsubscribe/close`.
   - http-server/src/test/scala/integration/kafka/http/WsBasicIntegrationTest.scala — Extends `HttpIntegrationTestHarness`; 6 `@Disabled` round-trip scenarios per spec plus 1 enabled baseline test (`testWsEndpointNotYetWired`) that pins pre-wiring behaviour.
