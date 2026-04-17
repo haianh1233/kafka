@@ -489,19 +489,83 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.rest.*RestHan
 
 ## Learning
 
-_To be filled by the executing agent._
+- HttpRouter dispatch was kept as regex matchers; adding a separate
+  `matchRoutingRoutes` method modeled on the existing `matchTopicRoutes`
+  keeps the router flat and testable. Checkstyle caps cyclomatic complexity
+  at 16, so the three route families (exchange / queue / binding) had to be
+  split into their own methods plus small method-to-HandlerType helpers.
+- The existing `RouteResult` only carried `topicName`, `consumerGroup`, and
+  `groupId`. Extending it with a generic `resourceName` field (and a new
+  constructor overload that defaults the others to null) was the minimum-
+  disruption change that avoided touching every call site.
+- `HttpRequestTranslator` uses a Java 21 exhaustive switch over `HandlerType`.
+  Every new enum value MUST be accompanied by a matching branch or the whole
+  module fails to compile. The WS2.06 routes all throw from the translator
+  because they are dispatched synchronously by the Netty handler, never via
+  `RequestChannel`.
+- REST handlers produce `FullHttpResponse` synchronously, so they don't need
+  the full `RequestChannel` + `HttpProcessor` pipeline. This is ideal for the
+  routing CRUD endpoints, which are metadata-only and return in microseconds.
+- `ExchangeManager.deleteExchange` already handles the `EXCHANGE_PROTECTED` /
+  `EXCHANGE_IN_USE` / `EXCHANGE_TYPE_MISMATCH` cases. The REST handler's job
+  is exclusively the HTTP surface: status code mapping and JSON framing.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **No `QueueManager` yet.** `QueueRestHandler` defines a local
+  `QueueStore` SAM plus a `QueueConflict` exception as a façade over whatever
+  queue lifecycle implementation WS1.06 eventually ships. Once the real
+  `QueueManager` lands, only a small adapter shim needs to be written.
+- **`PATCH /v1/queues/{name}` and `DELETE /v1/queues/{name}/messages`
+  (purge)** are routed through to the dispatch layer but respond with 501
+  Not Implemented. They need `QueueManager` + Kafka admin client integration
+  (AlterConfigs / topic purge via offset advancement) which are out of scope
+  for WS2.06.
+- **Queue details `consumers` array is always empty.** The spec requires it
+  to include per-subscriber `{ subscriptionId, connectionId, credits,
+  unacked, prefetch }` entries sourced from `WsSubscriptionManager`. The
+  handler includes the field (so the shape matches), but population is
+  deferred until the WS subscription manager is wired into the broker.
+- **`ExchangeRestHandler.getExchange.bindingCount`** reports the count from
+  the in-memory `BindingManager`, not from the `WsRoutingMetadataManager`.
+  If bindings exist only in the persisted metadata but not in the local
+  manager (e.g. right after restart before replay completes), the count
+  will read zero. Once `WsRoutingMetadataManager` is the single source of
+  truth, the handler should delegate to it.
+- **REST bindings are queue-to-exchange only.** Exchange-to-exchange
+  bindings still require the WebSocket control frame per task scope.
+- **`DELETE /v1/bindings`** takes a JSON body (for symmetry with
+  `POST /v1/bindings`); the task file also mentioned path-parametric form
+  `DELETE /v1/bindings/{exchange}/{queue}/{routingKey}`. Body form is more
+  flexible (supports arguments) and cleanly matches the AMQP delete
+  semantics. A future task can add the path-parametric alias if clients
+  need it.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Existing HTTP handlers (produce/fetch/metadata) serialize responses via
+  `HttpResponseSerializer` driven by `AbstractResponse` payloads from the
+  RequestChannel. The routing REST handlers, by contrast, return a
+  `FullHttpResponse` directly — there is no Kafka API response to wrap. I
+  therefore dispatched them in `HttpRequestHandler.scala` before any
+  `HttpRequestTranslator` / `RequestChannel` work.
+- Optional constructor parameters on the Scala `HttpRequestHandler` (with
+  default nulls) keep all existing instantiation sites working without
+  changes. Production wiring can pass live handlers later; tests see 501
+  Not Implemented which is still a defined status code.
+- `bindingManager` in `ExchangeRestHandler` is optional. Many early unit
+  tests don't have a real binding manager to hand, so the constructor
+  accepts null and the `bindingCount` field simply reports zero. Production
+  wiring passes the real manager.
+- Kept Jackson usage consistent with the existing HTTP handlers —
+  `ObjectMapper` at class scope, `ObjectNode` for building responses,
+  `JsonNode.fieldNames()` instead of the deprecated `fields()`.
+
+---
 
 ---
 
@@ -520,4 +584,27 @@ _To be filled by the executing agent._
 
 ## File Manifest
 
-_To be filled by the executing agent._
+**Files created:**
+- `http-server/src/main/java/kafka/server/http/rest/ExchangeRestHandler.java`
+- `http-server/src/main/java/kafka/server/http/rest/QueueRestHandler.java`
+- `http-server/src/main/java/kafka/server/http/rest/BindingRestHandler.java`
+- `http-server/src/test/java/kafka/server/http/HttpRouterRoutingTest.java`
+- `http-server/src/test/java/kafka/server/http/rest/ExchangeRestHandlerTest.java`
+- `http-server/src/test/java/kafka/server/http/rest/QueueRestHandlerTest.java`
+- `http-server/src/test/java/kafka/server/http/rest/BindingRestHandlerTest.java`
+- `http-server/src/test/java/kafka/server/http/rest/RoutingRestHandlerTest.java`
+
+**Files modified:**
+- `http-server/src/main/java/kafka/server/http/HttpRouter.java` — added
+  13 new `HandlerType` values, 6 URL patterns, 4 new matcher methods, and
+  `validateResourceName()` helper. Added `resourceName` field on `RouteResult`.
+- `http-server/src/main/java/kafka/server/http/HttpRequestTranslator.java` —
+  added a catch-all branch in the exhaustive `HandlerType` switch to keep the
+  module compiling with the new enum values.
+- `http-server/src/main/scala/kafka/network/HttpRequestHandler.scala` —
+  added 3 optional constructor parameters (`exchangeRestHandler`,
+  `queueRestHandler`, `bindingRestHandler`), a `isRestRoutingHandler`
+  dispatch predicate, a `handleRestRoutingRequest` method, and a
+  `notWired(...)` fallback that returns 501 when a handler isn't injected.
+
+**Test counts:** 57 new tests across 5 test classes — all pass.
