@@ -16,6 +16,7 @@
  */
 // Time: Created - TASK-WS1.11
 // Time: Update - TASK-WS3.01 - recordPending via WsPublisherConfirmTracker
+// Time: Update - TASK-WS3.08 - added metrics recording
 package kafka.server.http.ws;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -104,6 +105,20 @@ public final class WsPublishHandler {
     private final WsMessageSerializer messageSerializer;
     private final Function<String, String> queueToTopicFn;
     private final ProduceRequestSink sink;
+    private final WsMetrics metrics;
+
+    /**
+     * Convenience constructor for tests that do not care about metrics. Delegates
+     * to the main constructor with {@code metrics = null} — the handler treats a
+     * null metrics instance as a silent no-op on every record call.
+     */
+    public WsPublishHandler(ExchangeManager exchangeManager,
+                            RoutingEngine routingEngine,
+                            WsMessageSerializer messageSerializer,
+                            Function<String, String> queueToTopicFn,
+                            ProduceRequestSink sink) {
+        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, null);
+    }
 
     /**
      * @param exchangeManager    used to verify the target exchange exists in the
@@ -117,17 +132,21 @@ public final class WsPublishHandler {
      * @param sink               hand-off for per-queue produce hand-off (injected
      *                           to keep the handler testable without a running
      *                           {@code RequestChannel})
+     * @param metrics            WS metrics sink (may be {@code null} — useful for
+     *                           tests; production wiring injects a real instance)
      */
     public WsPublishHandler(ExchangeManager exchangeManager,
                             RoutingEngine routingEngine,
                             WsMessageSerializer messageSerializer,
                             Function<String, String> queueToTopicFn,
-                            ProduceRequestSink sink) {
+                            ProduceRequestSink sink,
+                            WsMetrics metrics) {
         this.exchangeManager = Objects.requireNonNull(exchangeManager, "exchangeManager");
         this.routingEngine = Objects.requireNonNull(routingEngine, "routingEngine");
         this.messageSerializer = Objects.requireNonNull(messageSerializer, "messageSerializer");
         this.queueToTopicFn = Objects.requireNonNull(queueToTopicFn, "queueToTopicFn");
         this.sink = Objects.requireNonNull(sink, "sink");
+        this.metrics = metrics; // nullable by design — see Javadoc
     }
 
     // ------------------------------------------------------------------
@@ -165,6 +184,9 @@ public final class WsPublishHandler {
         if (matchedQueues.isEmpty()) {
             if (parsed.mandatory) {
                 emitReturned(ctx, publishId, parsed.exchange, parsed.routingKey, parsed.message);
+                if (metrics != null) {
+                    metrics.mandatoryReturnRate.mark();
+                }
             }
             // Non-mandatory drop is silent — no confirms to emit either since
             // no produce was issued.
@@ -262,6 +284,9 @@ public final class WsPublishHandler {
             }
             try {
                 sink.enqueue(topic, serialized, publishId, confirmsEnabled, ctx);
+                if (metrics != null) {
+                    metrics.publishRate.mark();
+                }
             } catch (RuntimeException e) {
                 log.warn("Produce sink rejected publish for queue={} topic={}: {}",
                     queue, topic, e.toString());
@@ -325,8 +350,8 @@ public final class WsPublishHandler {
     //  Frame emitters
     // ------------------------------------------------------------------
 
-    private static void emitError(WsConnectionContext ctx, Long publishId,
-                                  String errorCode, String errorMessage) {
+    private void emitError(WsConnectionContext ctx, Long publishId,
+                           String errorCode, String errorMessage) {
         ObjectNode frame = MAPPER.createObjectNode();
         frame.put("type", "error");
         frame.put("errorCode", errorCode);
@@ -335,6 +360,9 @@ public final class WsPublishHandler {
             frame.put("publishId", publishId.longValue());
         }
         sendFrame(ctx, frame);
+        if (metrics != null) {
+            metrics.errorRate.mark();
+        }
     }
 
     private static void emitReturned(WsConnectionContext ctx, Long publishId,

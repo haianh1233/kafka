@@ -16,6 +16,7 @@
  */
 
 // Time: Created - TASK-WS1.16
+// Time: Update - TASK-WS3.08 - added metrics recording
 
 package kafka.server.http.ws;
 
@@ -96,26 +97,39 @@ public final class WsAckHandler {
     private final WsSubscriptionManager subscriptionManager;
     private final long commitIntervalMs;
     private final OffsetCommitSink sink;
+    private final WsMetrics metrics;
     private final ScheduledExecutorService scheduler;
     private final AtomicBoolean started = new AtomicBoolean(false);
     private final AtomicBoolean stopped = new AtomicBoolean(false);
     private volatile ScheduledFuture<?> commitTask;
 
     /**
-     * @param subscriptionManager  subscription registry; used to look up tag trackers
-     * @param commitIntervalMs     batch flush interval; {@code 0} means flush-on-each-ack
-     * @param sink                 offset commit sink (placeholder for {@code RequestChannel}
-     *                             wiring)
+     * Convenience constructor with no metrics.
      */
     public WsAckHandler(WsSubscriptionManager subscriptionManager,
                         long commitIntervalMs,
                         OffsetCommitSink sink) {
+        this(subscriptionManager, commitIntervalMs, sink, null);
+    }
+
+    /**
+     * @param subscriptionManager  subscription registry; used to look up tag trackers
+     * @param commitIntervalMs     batch flush interval; {@code 0} means flush-on-each-ack
+     * @param sink                 offset commit sink (placeholder for {@code RequestChannel}
+     *                             wiring)
+     * @param metrics              WS metrics sink (may be {@code null} — useful for tests)
+     */
+    public WsAckHandler(WsSubscriptionManager subscriptionManager,
+                        long commitIntervalMs,
+                        OffsetCommitSink sink,
+                        WsMetrics metrics) {
         this.subscriptionManager = Objects.requireNonNull(subscriptionManager, "subscriptionManager");
         this.sink = Objects.requireNonNull(sink, "sink");
         if (commitIntervalMs < 0) {
             throw new IllegalArgumentException("commitIntervalMs must be >= 0, got " + commitIntervalMs);
         }
         this.commitIntervalMs = commitIntervalMs;
+        this.metrics = metrics;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "ws-ack-commit-timer");
             t.setDaemon(true);
@@ -160,6 +174,9 @@ public final class WsAckHandler {
             return null;
         }
 
+        if (metrics != null) {
+            metrics.ackRate.mark();
+        }
         if (commitIntervalMs == 0L) {
             flushSubscription(subscriptionId, ctx);
         }
@@ -195,6 +212,12 @@ public final class WsAckHandler {
             for (long tag = 1L; tag <= deliveryTag; tag++) {
                 WsDeliveryTagTracker.PendingDelivery pd = tracker.nack(tag, requeue);
                 if (pd != null) {
+                    if (metrics != null) {
+                        metrics.nackRate.mark();
+                        if (!requeue) {
+                            metrics.dlxRate.mark();
+                        }
+                    }
                     if (!requeue) {
                         handleDlxOrDiscard(ctx, pd);
                     } else {
@@ -211,6 +234,12 @@ public final class WsAckHandler {
                 }
                 // Known but already acked/nacked → idempotent success.
                 return null;
+            }
+            if (metrics != null) {
+                metrics.nackRate.mark();
+                if (!requeue) {
+                    metrics.dlxRate.mark();
+                }
             }
             if (!requeue) {
                 handleDlxOrDiscard(ctx, pd);
