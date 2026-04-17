@@ -598,9 +598,11 @@ class WsMessageDeserializerTest {
 
 > Filled by the executing agent after each commit.
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-17 — WsMessageDeserializer initial implementation (commit eeee29346a)
+
 Created:
-  - path/to/NewFile.java — <what it does>
+  - `http-server/src/main/java/kafka/server/http/ws/WsMessageDeserializer.java` — Kafka record → deliver-frame components. Exposes the `DeliverFrame` record (exchange, routingKey, message JsonNode, partition, offset, kafkaTimestamp) and a single `deserialize(key, value, headers, partition, offset, timestamp)` entry point. Reconstructs routing metadata + all 13 AMQP properties from `_ws_*` headers, with cross-protocol synthesis when headers are absent. Body deserialization handles JSON / base64 / string / null; never throws on malformed input.
+  - `http-server/src/test/java/kafka/server/http/ws/WsMessageDeserializerTest.java` — 21 JUnit 5 tests covering routing reconstruction, body encodings, all AMQP properties, missing / null / invalid headers, non-ws header filtering, Kafka metadata passthrough, and three round-trip tests against `WsMessageSerializer` (JSON / string / binary).
+
 Modified:
-  - path/to/Existing.java — <what changed>
--->
+  - `ivy-docs/tasks/TASK-WS1.10-ws-message-deserializer.md` — filled Learning / Limitations / Field Notes / File Manifest sections.
