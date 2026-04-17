@@ -18,6 +18,7 @@
 // Time: Created - TASK-WS1.15
 // Time: Update - TASK-WS3.08 - added metrics recording
 // Time: Update - TASK-WS4.02 - added per-message TTL check at delivery
+// Time: Update - TASK-WS4.03 - added priority-ordered delivery
 
 package kafka.server.http.ws;
 
@@ -31,10 +32,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 
 /**
  * Per-subscription WebSocket push-delivery fetch loop.
@@ -87,6 +90,11 @@ public final class WsConsumerFetchLoop implements Runnable {
     private final Channel channel;
     private final boolean noAck;
     private final WsMetrics metrics;
+    /**
+     * Queue's {@code x-max-priority} value ({@code 0} == non-priority queue, no sorting).
+     * Set at construction time from {@link WsPriority#maxPriorityFromQueueArgs}.
+     */
+    private final int queueMaxPriority;
     private final AtomicBoolean active = new AtomicBoolean(true);
 
     /**
@@ -112,6 +120,28 @@ public final class WsConsumerFetchLoop implements Runnable {
                                Channel channel,
                                boolean noAck,
                                WsMetrics metrics) {
+        this(subscriptionId, topic, startOffsets, creditManager, tagTracker,
+            channel, noAck, metrics, /*queueMaxPriority*/ 0);
+    }
+
+    /**
+     * Full constructor including priority configuration. Prefer
+     * {@link #withMaxPriority} for call sites that already have a max-priority
+     * value handy — it keeps the existing (shorter) constructors unchanged.
+     *
+     * @param queueMaxPriority queue's {@code x-max-priority} (0 == non-priority);
+     *                         values are clamped to {@code [0, 255]} and
+     *                         negatives are treated as 0
+     */
+    public WsConsumerFetchLoop(String subscriptionId,
+                               String topic,
+                               Map<TopicPartition, Long> startOffsets,
+                               WsCreditManager creditManager,
+                               WsDeliveryTagTracker tagTracker,
+                               Channel channel,
+                               boolean noAck,
+                               WsMetrics metrics,
+                               int queueMaxPriority) {
         this.subscriptionId = Objects.requireNonNull(subscriptionId, "subscriptionId");
         this.topic = Objects.requireNonNull(topic, "topic");
         Objects.requireNonNull(startOffsets, "startOffsets");
@@ -121,6 +151,32 @@ public final class WsConsumerFetchLoop implements Runnable {
         this.channel = Objects.requireNonNull(channel, "channel");
         this.noAck = noAck;
         this.metrics = metrics; // nullable; null means no-op metric recording
+        // Clamp to [0, 255] per AMQP octet range; negatives collapse to 0 so
+        // the loop treats the queue as non-priority and never calls into sort.
+        int clamped = Math.max(0, Math.min(queueMaxPriority, WsPriority.MAX_PRIORITY_CAP));
+        this.queueMaxPriority = clamped;
+    }
+
+    /**
+     * Convenience factory for priority-aware queues. Equivalent to the full
+     * constructor with a {@code null} metrics and the supplied
+     * {@code queueMaxPriority}.
+     *
+     * @param queueMaxPriority queue's {@code x-max-priority} (clamped to
+     *                         {@code [0, 255]}; 0 disables sorting)
+     */
+    public static WsConsumerFetchLoop withMaxPriority(
+            String subscriptionId,
+            String topic,
+            Map<TopicPartition, Long> startOffsets,
+            WsCreditManager creditManager,
+            WsDeliveryTagTracker tagTracker,
+            Channel channel,
+            boolean noAck,
+            int queueMaxPriority) {
+        return new WsConsumerFetchLoop(subscriptionId, topic, startOffsets,
+            creditManager, tagTracker, channel, noAck, /*metrics*/ null,
+            queueMaxPriority);
     }
 
     @Override
@@ -333,5 +389,44 @@ public final class WsConsumerFetchLoop implements Runnable {
     /** Kafka topic being fetched — used by subclasses/tests. */
     public String topic() {
         return topic;
+    }
+
+    /**
+     * @return the queue's {@code x-max-priority} value (0 when the queue is
+     *         non-priority; values in {@code [1, 255]} when priority-sorted
+     *         delivery is enabled). Exposed so the fetch integration and
+     *         tests can confirm how records will be ordered before dispatch.
+     */
+    public int queueMaxPriority() {
+        return queueMaxPriority;
+    }
+
+    /**
+     * Sorts a fetch batch by per-message priority (descending, stable) when
+     * the queue is priority-enabled; otherwise returns the input unchanged
+     * (design doc §12.5 / §18.7).
+     *
+     * <p>For a non-priority queue ({@link #queueMaxPriority()} {@code <= 0})
+     * the same {@link List} instance is returned — no allocation, offset order
+     * preserved. For priority queues the sort is in-place and the same
+     * reference is returned.
+     *
+     * <p>Within each priority tier, records keep their input order (stable
+     * sort), so callers that feed records in offset order will see records of
+     * equal priority delivered in offset order.
+     *
+     * <p>Priority ordering is <b>batch-local</b> — a low-priority record
+     * already in the current batch will be delivered before a high-priority
+     * record that arrives in a later fetch.
+     *
+     * @param batch           mutable list of records (tests pass plain POJOs;
+     *                        the fetch integration passes {@code ConsumerRecord})
+     * @param headerExtractor maps a record to its Kafka headers
+     * @param <T>             record type
+     * @return {@code batch} (same reference) — sorted if applicable
+     */
+    public <T> List<T> maybeSortByPriority(List<T> batch,
+                                           Function<T, Iterable<Header>> headerExtractor) {
+        return WsPriority.sortByPriority(batch, headerExtractor, queueMaxPriority);
     }
 }
