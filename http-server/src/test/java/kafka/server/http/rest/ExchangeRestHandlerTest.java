@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 // Time: Created - TASK-WS2.06
+// Time: Update - TASK-WS2.09 - added vhost scoping test
 package kafka.server.http.rest;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -160,6 +161,25 @@ class ExchangeRestHandlerTest {
         exchangeManager.initializeDefaults(VHOST);
         FullHttpResponse resp = handler.handleDelete("amq.direct", VHOST, false);
         assertEquals(HttpResponseStatus.FORBIDDEN, resp.status());
+    }
+
+    // ------------------------------------------------------------------
+    // WS2.09 — vhost scoping
+    // ------------------------------------------------------------------
+
+    @Test
+    void declareExchange_inProdVhost_notVisibleInStageVhost() throws Exception {
+        // Vhosts need not be pre-registered with the ExchangeManager — declare
+        // will create the exchange record scoped by the vhost it is given.
+        handler.handleDeclare("orders", "/prod", requestBody("{\"type\":\"direct\"}"));
+
+        // Visible in /prod...
+        FullHttpResponse inProd = handler.handleGet("orders", "/prod");
+        assertEquals(HttpResponseStatus.OK, inProd.status());
+
+        // ...but NOT in /stage.
+        FullHttpResponse inStage = handler.handleGet("orders", "/stage");
+        assertEquals(HttpResponseStatus.NOT_FOUND, inStage.status());
     }
 
     // ------------------------------------------------------------------

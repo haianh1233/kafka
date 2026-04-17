@@ -17,6 +17,7 @@
 // Time: Created - TASK-WS1.03
 // Time: Update - TASK-WS3.06 - added connection limit enforcement (WsResourceLimitManager)
 // Time: Update - TASK-WS3.07 - added drain support
+// Time: Update - TASK-WS2.09 - added vhost scoping (verified ?vhost= query-param extraction)
 package kafka.server.http.ws;
 
 import io.netty.buffer.Unpooled;

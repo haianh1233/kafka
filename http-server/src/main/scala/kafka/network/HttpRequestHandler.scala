@@ -20,6 +20,7 @@
 // Time: Modified - TASK-WS2.06 (REST exchange/queue/binding CRUD dispatch)
 // Time: Modified - TASK-WS2.07 (REST connection/consumer management dispatch)
 // Time: Modified - TASK-WS2.08 (REST message operations dispatch)
+// Time: Update - TASK-WS2.09 - added vhost scoping (vhost REST dispatch)
 package kafka.network
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
@@ -28,7 +29,7 @@ import io.netty.channel.{ChannelFutureListener, ChannelHandlerContext, SimpleCha
 import io.netty.handler.codec.http.{DefaultFullHttpResponse, FullHttpRequest, HttpHeaderNames, HttpResponseStatus, HttpVersion}
 import io.netty.handler.ssl.SslHandler
 import kafka.server.http.{HttpProcessor, HttpRequestTranslator, HttpRouter, HttpServerConfigs}
-import kafka.server.http.rest.{BindingRestHandler, ConnectionRestHandler, ConsumerRestHandler, ExchangeRestHandler, MessageRestHandler, QueueRestHandler}
+import kafka.server.http.rest.{BindingRestHandler, ConnectionRestHandler, ConsumerRestHandler, ExchangeRestHandler, MessageRestHandler, QueueRestHandler, VhostRestHandler}
 import org.apache.kafka.common.memory.MemoryPool
 import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.ApiKeys
@@ -82,7 +83,9 @@ class HttpRequestHandler(
   bindingRestHandler: BindingRestHandler = null,
   connectionRestHandler: ConnectionRestHandler = null,
   consumerRestHandler: ConsumerRestHandler = null,
-  messageRestHandler: MessageRestHandler = null
+  messageRestHandler: MessageRestHandler = null,
+  // WS2.09: vhost admin REST handler
+  vhostRestHandler: VhostRestHandler = null
 ) extends SimpleChannelInboundHandler[FullHttpRequest] {
 
   /** Convenience constructor for backward compatibility (no drain support). */
@@ -1142,7 +1145,11 @@ class HttpRequestHandler(
          HttpRouter.HandlerType.PUBLISH_VIA_EXCHANGE |
          HttpRouter.HandlerType.QUEUE_GET |
          HttpRouter.HandlerType.QUEUE_ACK |
-         HttpRouter.HandlerType.QUEUE_NACK => true
+         HttpRouter.HandlerType.QUEUE_NACK |
+         // WS2.09 vhost admin
+         HttpRouter.HandlerType.LIST_VHOSTS |
+         HttpRouter.HandlerType.CREATE_VHOST |
+         HttpRouter.HandlerType.DELETE_VHOST => true
     case _ => false
   }
 
@@ -1250,6 +1257,20 @@ class HttpRequestHandler(
       case HttpRouter.HandlerType.QUEUE_NACK =>
         if (messageRestHandler == null) notWired("MessageRestHandler")
         else messageRestHandler.handleNack(routeResult.resourceName(), vhost, req)
+
+      // WS2.09: vhost admin — vhost is identified by the path segment, not the
+      // X-Vhost header (which scopes all other REST requests).
+      case HttpRouter.HandlerType.LIST_VHOSTS =>
+        if (vhostRestHandler == null) notWired("VhostRestHandler")
+        else vhostRestHandler.handleList()
+
+      case HttpRouter.HandlerType.CREATE_VHOST =>
+        if (vhostRestHandler == null) notWired("VhostRestHandler")
+        else vhostRestHandler.handleCreate(routeResult.resourceName())
+
+      case HttpRouter.HandlerType.DELETE_VHOST =>
+        if (vhostRestHandler == null) notWired("VhostRestHandler")
+        else vhostRestHandler.handleDelete(routeResult.resourceName())
 
       case _ =>
         notWired("Unknown REST routing handler")
