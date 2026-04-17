@@ -274,4 +274,60 @@ class HttpRouterRoutingTest {
         assertThrows(InvalidRequestException.class,
             () -> router.route(HttpMethod.GET, "/v1/consumers/conn-1/sub-42"));
     }
+
+    // --- WS2.08: Message operations ---
+
+    @Test
+    void route_publishViaExchange_post() {
+        var r = router.route(HttpMethod.POST, "/v1/exchanges/orders/publish");
+        assertEquals(HttpRouter.HandlerType.PUBLISH_VIA_EXCHANGE, r.handlerType());
+        assertEquals("orders", r.resourceName());
+    }
+
+    @Test
+    void route_publishViaExchange_wrongMethod_throws() {
+        assertThrows(InvalidRequestException.class,
+            () -> router.route(HttpMethod.GET, "/v1/exchanges/orders/publish"));
+    }
+
+    @Test
+    void route_publishPath_precedesExchangeBarePath() {
+        // /v1/exchanges/{name}/publish must not be interpreted as exchange named "{name}/publish".
+        var r = router.route(HttpMethod.POST, "/v1/exchanges/ex1/publish");
+        assertEquals(HttpRouter.HandlerType.PUBLISH_VIA_EXCHANGE, r.handlerType());
+    }
+
+    @Test
+    void route_queueGet_post() {
+        var r = router.route(HttpMethod.POST, "/v1/queues/orders/get");
+        assertEquals(HttpRouter.HandlerType.QUEUE_GET, r.handlerType());
+        assertEquals("orders", r.resourceName());
+    }
+
+    @Test
+    void route_queueAck_post() {
+        var r = router.route(HttpMethod.POST, "/v1/queues/orders/ack");
+        assertEquals(HttpRouter.HandlerType.QUEUE_ACK, r.handlerType());
+        assertEquals("orders", r.resourceName());
+    }
+
+    @Test
+    void route_queueNack_post() {
+        var r = router.route(HttpMethod.POST, "/v1/queues/orders/nack");
+        assertEquals(HttpRouter.HandlerType.QUEUE_NACK, r.handlerType());
+        assertEquals("orders", r.resourceName());
+    }
+
+    @Test
+    void route_queueGet_wrongMethod_throws() {
+        assertThrows(InvalidRequestException.class,
+            () -> router.route(HttpMethod.GET, "/v1/queues/orders/get"));
+    }
+
+    @Test
+    void route_queueGetPath_precedesQueueBarePath() {
+        // /v1/queues/{name}/get must not be interpreted as queue named "{name}/get".
+        var r = router.route(HttpMethod.POST, "/v1/queues/myq/get");
+        assertEquals(HttpRouter.HandlerType.QUEUE_GET, r.handlerType());
+    }
 }

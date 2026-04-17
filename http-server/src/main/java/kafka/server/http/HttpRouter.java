@@ -17,6 +17,7 @@
 // Time: Created - TASK-B.01
 // Time: Update - TASK-WS2.06 - added exchange/queue/binding REST routes
 // Time: Update - TASK-WS2.07 - added connection/consumer REST routes
+// Time: Update - TASK-WS2.08 - added message-ops REST routes
 package kafka.server.http;
 
 import io.netty.handler.codec.http.HttpMethod;
@@ -84,7 +85,12 @@ public final class HttpRouter {
         GET_CONNECTION,
         FORCE_CLOSE_CONNECTION,
         LIST_CONSUMERS,
-        FORCE_CANCEL_CONSUMER
+        FORCE_CANCEL_CONSUMER,
+        // --- WS2.08: REST message operations ---
+        PUBLISH_VIA_EXCHANGE,
+        QUEUE_GET,
+        QUEUE_ACK,
+        QUEUE_NACK
     }
 
     // --- Route result ---
@@ -214,6 +220,24 @@ public final class HttpRouter {
         Pattern.compile("^/v1/openapi\\.yaml$");
 
     // --- WS2.06 routing CRUD patterns ---
+
+    // --- WS2.08 message operations (must precede the bare {name} patterns) ---
+
+    // Matches: /v1/exchanges/{name}/publish — must precede EXCHANGE_PATTERN
+    private static final Pattern EXCHANGE_PUBLISH_PATTERN =
+        Pattern.compile("^/v1/exchanges/([^/?]+)/publish$");
+
+    // Matches: /v1/queues/{name}/get — must precede QUEUE_PATTERN
+    private static final Pattern QUEUE_GET_PATTERN =
+        Pattern.compile("^/v1/queues/([^/?]+)/get$");
+
+    // Matches: /v1/queues/{name}/ack — must precede QUEUE_PATTERN
+    private static final Pattern QUEUE_ACK_PATTERN =
+        Pattern.compile("^/v1/queues/([^/?]+)/ack$");
+
+    // Matches: /v1/queues/{name}/nack — must precede QUEUE_PATTERN
+    private static final Pattern QUEUE_NACK_PATTERN =
+        Pattern.compile("^/v1/queues/([^/?]+)/nack$");
 
     // Matches: /v1/exchanges/{name}
     private static final Pattern EXCHANGE_PATTERN =
@@ -425,9 +449,17 @@ public final class HttpRouter {
         return matchBindingRoutes(method, path, queryParams);
     }
 
-    /** /v1/exchanges and /v1/exchanges/{name}. */
+    /** /v1/exchanges, /v1/exchanges/{name}, and /v1/exchanges/{name}/publish. */
     private RouteResult matchExchangeRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
-        Matcher matcher = EXCHANGE_PATTERN.matcher(path);
+        // WS2.08: /v1/exchanges/{name}/publish must precede the bare {name} pattern.
+        Matcher matcher = EXCHANGE_PUBLISH_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.POST, path);
+            String name = validateResourceName(matcher.group(1), "exchange");
+            return new RouteResult(HandlerType.PUBLISH_VIA_EXCHANGE,
+                null, null, null, null, name, queryParams);
+        }
+        matcher = EXCHANGE_PATTERN.matcher(path);
         if (matcher.matches()) {
             String name = validateResourceName(matcher.group(1), "exchange");
             HandlerType ht = exchangeMethodToHandler(method, path);
@@ -441,14 +473,35 @@ public final class HttpRouter {
         return null;
     }
 
-    /** /v1/queues, /v1/queues/{name}, and /v1/queues/{name}/messages. */
+    /** /v1/queues, /v1/queues/{name}, /v1/queues/{name}/messages, plus WS2.08 get/ack/nack. */
     private RouteResult matchQueueRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
-        // More specific path (/messages) must come first.
+        // More specific paths (/messages, /get, /ack, /nack) must come first.
         Matcher matcher = QUEUE_MESSAGES_PATTERN.matcher(path);
         if (matcher.matches()) {
             requireMethod(method, HttpMethod.DELETE, path);
             String name = validateResourceName(matcher.group(1), "queue");
             return new RouteResult(HandlerType.PURGE_QUEUE, null, null, null, null, name, queryParams);
+        }
+        // WS2.08: /v1/queues/{name}/get
+        matcher = QUEUE_GET_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.POST, path);
+            String name = validateResourceName(matcher.group(1), "queue");
+            return new RouteResult(HandlerType.QUEUE_GET, null, null, null, null, name, queryParams);
+        }
+        // WS2.08: /v1/queues/{name}/ack
+        matcher = QUEUE_ACK_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.POST, path);
+            String name = validateResourceName(matcher.group(1), "queue");
+            return new RouteResult(HandlerType.QUEUE_ACK, null, null, null, null, name, queryParams);
+        }
+        // WS2.08: /v1/queues/{name}/nack
+        matcher = QUEUE_NACK_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.POST, path);
+            String name = validateResourceName(matcher.group(1), "queue");
+            return new RouteResult(HandlerType.QUEUE_NACK, null, null, null, null, name, queryParams);
         }
         matcher = QUEUE_PATTERN.matcher(path);
         if (matcher.matches()) {

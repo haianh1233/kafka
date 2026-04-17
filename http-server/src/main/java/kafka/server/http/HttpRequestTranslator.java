@@ -187,6 +187,10 @@ public final class HttpRequestTranslator {
                  LIST_CONSUMERS, FORCE_CANCEL_CONSUMER ->
                 throw new InvalidRequestException(
                     "Connection/consumer management requests are handled directly, not translated");
+            // WS2.08 message operations — dispatched directly too.
+            case PUBLISH_VIA_EXCHANGE, QUEUE_GET, QUEUE_ACK, QUEUE_NACK ->
+                throw new InvalidRequestException(
+                    "Message operation requests are handled directly, not translated");
         };
     }
 
