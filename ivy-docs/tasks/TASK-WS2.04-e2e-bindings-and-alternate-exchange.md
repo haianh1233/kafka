@@ -695,3 +695,20 @@ Created:
 Modified:
   - path/to/Existing.java — <what changed>
 -->
+
+### 2026-04-17 — WS2.04 RoutingEngine e2e + alternate exchange (commit 4503e3ae3f)
+
+Modified:
+  - http-server/src/main/java/kafka/server/http/routing/RoutingEngine.java —
+    added 4-arg constructor with `alternateExchangeFn`; kept legacy 3-arg
+    constructor as a thin delegate; added alternate-exchange fallback after
+    queue + e2e matching; extended `e2eMatches` to fanout/topic/headers
+    source types; replaced `UnsupportedOperationException` stubs with real
+    `TopicMatcher` / `FanoutMatcher` / `HeadersMatcher` wiring.
+  - http-server/src/test/java/kafka/server/http/routing/RoutingEngineTest.java —
+    29 tests total: kept the original direct / e2e / null-guard tests,
+    dropped the three Phase-1 `UnsupportedOperationException` stub tests,
+    and added 17 new tests covering matcher wiring, e2e source-type
+    coverage, chain-of-three, alternate exchange used / not-used / chained
+    / cycle-guarded / missing / empty-string, and legacy 3-arg constructor
+    sanity.
