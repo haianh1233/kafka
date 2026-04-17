@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 // Time: Created - TASK-WS1.02
+// Time: Update - TASK-WS3.04 - added exclusive consumer semantics
 package kafka.server.http.ws;
 
 import io.netty.channel.Channel;
@@ -29,6 +30,7 @@ import org.mockito.ArgumentCaptor;
 
 import java.net.InetSocketAddress;
 import java.time.Instant;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -39,6 +41,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -265,5 +268,56 @@ class WsConnectionContextTest {
 
         when(mockNettyChannel.isActive()).thenReturn(false);
         assertFalse(ctx.isActive());
+    }
+
+    // --- TASK-WS3.04: exclusive consumer wiring ---
+
+    @Test
+    void exclusiveConsumerManager_unsetByDefault() {
+        assertNull(ctx.exclusiveConsumerManager());
+    }
+
+    @Test
+    void onClose_withoutExclusiveManager_returnsEmptyList() {
+        List<String> released = ctx.onClose();
+        assertNotNull(released);
+        assertTrue(released.isEmpty());
+    }
+
+    @Test
+    void onClose_releasesConnectionLocks_viaExclusiveManager() {
+        ExclusiveConsumerManager excl = new ExclusiveConsumerManager();
+        WsConnectionContext c = new WsConnectionContext(
+            "ws-3-close", principal, "/", mockChannel, remoteAddress, excl);
+
+        assertTrue(excl.tryAcquireExclusive("q1", "ws-3-close"));
+        assertTrue(excl.tryAcquireExclusive("q2", "ws-3-close"));
+        // Different connection's lock must not be affected.
+        assertTrue(excl.tryAcquireExclusive("q-other", "other-conn"));
+
+        List<String> released = c.onClose();
+        assertEquals(2, released.size());
+        assertTrue(released.contains("q1"));
+        assertTrue(released.contains("q2"));
+        assertFalse(excl.isExclusivelyLocked("q1"));
+        assertFalse(excl.isExclusivelyLocked("q2"));
+        assertTrue(excl.isLockedBy("q-other", "other-conn"));
+    }
+
+    @Test
+    void onClose_noLocks_returnsEmptyList() {
+        ExclusiveConsumerManager excl = new ExclusiveConsumerManager();
+        WsConnectionContext c = new WsConnectionContext(
+            "ws-3-empty", principal, "/", mockChannel, remoteAddress, excl);
+        List<String> released = c.onClose();
+        assertTrue(released.isEmpty());
+    }
+
+    @Test
+    void sixArgConstructor_storesExclusiveManager() {
+        ExclusiveConsumerManager excl = new ExclusiveConsumerManager();
+        WsConnectionContext c = new WsConnectionContext(
+            "ws-3-ctor", principal, "/", mockChannel, remoteAddress, excl);
+        assertSame(excl, c.exclusiveConsumerManager());
     }
 }

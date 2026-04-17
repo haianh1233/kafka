@@ -17,6 +17,7 @@
 
 // Time: Created - TASK-WS1.15
 // Time: Update - TASK-WS3.03 - added competing consumer / group integration
+// Time: Update - TASK-WS3.04 - added exclusive consumer semantics
 
 package kafka.server.http.ws;
 
@@ -61,6 +62,7 @@ public final class WsSubscriptionManager {
     private final ConcurrentHashMap<String, SubscriptionContext> subscriptions = new ConcurrentHashMap<>();
     private final Executor wsConsumerExecutor;
     private final WsConsumerGroupCoordinator groupCoordinator;
+    private final ExclusiveConsumerManager exclusiveManager;
 
     /**
      * @param wsConsumerExecutor shared executor on which fetch loops are scheduled.
@@ -68,7 +70,7 @@ public final class WsSubscriptionManager {
      *                           with {@code num.ws.consumer.threads} threads.
      */
     public WsSubscriptionManager(Executor wsConsumerExecutor) {
-        this(wsConsumerExecutor, null);
+        this(wsConsumerExecutor, null, null);
     }
 
     /**
@@ -79,13 +81,33 @@ public final class WsSubscriptionManager {
      *                           are wired.
      */
     public WsSubscriptionManager(Executor wsConsumerExecutor, WsConsumerGroupCoordinator groupCoordinator) {
+        this(wsConsumerExecutor, groupCoordinator, null);
+    }
+
+    /**
+     * @param wsConsumerExecutor shared executor on which fetch loops are scheduled.
+     * @param groupCoordinator   optional consumer-group coordinator (TASK-WS3.03).
+     * @param exclusiveManager   optional exclusive-consumer lock registry (TASK-WS3.04).
+     *                           When {@code null}, the exclusive-subscription overload
+     *                           {@link #subscribeExclusive} is unsupported and the plain
+     *                           {@link #subscribe} path performs no exclusivity check.
+     */
+    public WsSubscriptionManager(Executor wsConsumerExecutor,
+                                 WsConsumerGroupCoordinator groupCoordinator,
+                                 ExclusiveConsumerManager exclusiveManager) {
         this.wsConsumerExecutor = Objects.requireNonNull(wsConsumerExecutor, "wsConsumerExecutor");
         this.groupCoordinator = groupCoordinator;
+        this.exclusiveManager = exclusiveManager;
     }
 
     /** Returns the (optional) consumer-group coordinator configured on this manager. */
     public WsConsumerGroupCoordinator groupCoordinator() {
         return groupCoordinator;
+    }
+
+    /** Returns the (optional) exclusive-consumer manager configured on this manager. */
+    public ExclusiveConsumerManager exclusiveManager() {
+        return exclusiveManager;
     }
 
     /**
@@ -146,6 +168,73 @@ public final class WsSubscriptionManager {
     }
 
     /**
+     * Subscribes with exclusive consumer semantics (TASK-WS3.04, design §11.3).
+     *
+     * <p>The queue is locked to {@code connectionId} — a second subscriber (from any
+     * connection, exclusive or not) will be rejected by the frame handler with
+     * {@code EXCLUSIVE_CONSUMER} by observing the result of
+     * {@link ExclusiveConsumerManager#tryAcquireExclusive(String, String)}.
+     *
+     * <p>The lock is released when the subscription is cancelled (via {@link #unsubscribe}
+     * or {@link #cancelAll}) or when the owning connection closes.
+     *
+     * @param connectionId owning connection id; must be the same value later passed to
+     *                     {@link ExclusiveConsumerManager#onConnectionClose(String)} at
+     *                     channel-close time
+     * @throws ExclusiveLockDeniedException if another connection holds the exclusive lock
+     * @throws IllegalStateException        if no {@link ExclusiveConsumerManager} was
+     *                                      configured on this subscription manager
+     */
+    public void subscribeExclusive(String connectionId,
+                                   String subscriptionId,
+                                   String queueName,
+                                   String topic,
+                                   Set<TopicPartition> partitions,
+                                   Map<TopicPartition, Long> startOffsets,
+                                   int initialCredits,
+                                   boolean noAck,
+                                   Channel channel) {
+        Objects.requireNonNull(connectionId, "connectionId");
+        Objects.requireNonNull(queueName, "queueName");
+        if (exclusiveManager == null) {
+            throw new IllegalStateException(
+                "subscribeExclusive requires an ExclusiveConsumerManager — none configured");
+        }
+
+        if (!exclusiveManager.tryAcquireExclusive(queueName, connectionId)) {
+            throw new ExclusiveLockDeniedException(queueName);
+        }
+
+        try {
+            subscribe(subscriptionId, queueName, topic, partitions, startOffsets,
+                initialCredits, noAck, channel);
+        } catch (RuntimeException e) {
+            // Subscription bookkeeping failed — release the lock we just acquired so the
+            // queue doesn't stay locked to a connection that has no live subscription.
+            exclusiveManager.releaseExclusive(queueName, connectionId);
+            throw e;
+        }
+    }
+
+    /**
+     * Thrown by {@link #subscribeExclusive} when the queue is already held by another
+     * connection. Frame handlers map this to the {@code EXCLUSIVE_CONSUMER} error code.
+     */
+    public static final class ExclusiveLockDeniedException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+        private final String queueName;
+
+        public ExclusiveLockDeniedException(String queueName) {
+            super("EXCLUSIVE_CONSUMER: queue '" + queueName + "' is already held by another connection");
+            this.queueName = queueName;
+        }
+
+        public String queueName() {
+            return queueName;
+        }
+    }
+
+    /**
      * Cancels the subscription with the given id and stops its fetch loop.
      *
      * <p>Returns the committable offsets computed by
@@ -168,6 +257,27 @@ public final class WsSubscriptionManager {
 
         if (log.isDebugEnabled()) {
             log.debug("Subscription stopped: id={} finalOffsets={}", subscriptionId, offsets);
+        }
+        return offsets;
+    }
+
+    /**
+     * Cancels a subscription AND releases any exclusive-consumer lock it holds on its
+     * queue for {@code connectionId} (TASK-WS3.04). If no
+     * {@link ExclusiveConsumerManager} is wired, this is equivalent to
+     * {@link #unsubscribe(String)}.
+     *
+     * @return committable offsets (see {@link #unsubscribe(String)})
+     */
+    public Map<TopicPartition, Long> unsubscribeExclusive(String connectionId, String subscriptionId) {
+        Objects.requireNonNull(connectionId, "connectionId");
+        SubscriptionContext ctx = subscriptions.get(subscriptionId);
+        String queueName = ctx != null ? ctx.queueName() : null;
+
+        Map<TopicPartition, Long> offsets = unsubscribe(subscriptionId);
+
+        if (queueName != null && exclusiveManager != null) {
+            exclusiveManager.releaseExclusive(queueName, connectionId);
         }
         return offsets;
     }
