@@ -128,6 +128,18 @@ class HttpAcceptor(
   @volatile private var _messageRestHandler: MessageRestHandler = _
   @volatile private var _wsConnectionRegistry: WsConnectionRegistry = _
   @volatile private var _wsUpgradeHandlerFactory: () => WsUpgradeOrHttpHandler = _
+  @volatile private var _bootstrapServersSupplier: java.util.function.Supplier[String] = _
+  @volatile private var _wsKafkaProducer: org.apache.kafka.clients.producer.KafkaProducer[Array[Byte], Array[Byte]] = _
+  @volatile private var _wsAdminClient: org.apache.kafka.clients.admin.AdminClient = _
+  private val _createdTopics = java.util.concurrent.ConcurrentHashMap.newKeySet[String]()
+
+  override def setBootstrapServersSupplier(supplier: java.util.function.Supplier[String]): Unit = {
+    _bootstrapServersSupplier = supplier
+  }
+
+  private def bootstrapServers(): String = {
+    if (_bootstrapServersSupplier != null) _bootstrapServersSupplier.get() else null
+  }
 
   private def buildRestHandlerStack(): Unit = {
     if (_exchangeRestHandler != null) return // already built
@@ -194,10 +206,38 @@ class HttpAcceptor(
       (exchangeName: String) => bindingManager.listByExchange(exchangeName),
       (_: String) => java.util.Collections.emptyList()
     )
-    val stubPublishSink: MessageRestHandler.PublishSink = (queue, topic, _) =>
-      new MessageRestHandler.QueueOffset(queue, 0, 0L)
-    val stubGetSink: MessageRestHandler.GetSink = (_, _, _) => java.util.Collections.emptyList()
-    val stubAckSink: MessageRestHandler.AckSink = (_, _, _, _) => ()
+    // T8: dynamic sinks — evaluate bootstrap supplier at each call (by then
+    // binary listeners are bound).
+    val kafkaPublishSink: MessageRestHandler.PublishSink = (queue: String, topic: String, serialized) => {
+      val bs = bootstrapServers()
+      if (bs == null || bs.isEmpty) {
+        new MessageRestHandler.QueueOffset(queue, 0, 0L)
+      } else {
+        ensureTopicExists(topic, bs)
+        val producer = getOrCreateKafkaProducer(bs)
+        val headers = new org.apache.kafka.common.header.internals.RecordHeaders()
+        serialized.headers().forEach(h => headers.add(h))
+        val record = new org.apache.kafka.clients.producer.ProducerRecord[Array[Byte], Array[Byte]](
+          topic, null, null, serialized.key(), serialized.value(), headers)
+        try {
+          val md = producer.send(record).get(10, java.util.concurrent.TimeUnit.SECONDS)
+          new MessageRestHandler.QueueOffset(queue, md.partition(), md.offset())
+        } catch {
+          case e: Exception =>
+            warn(s"WS produce failed for topic=$topic: ${e.getClass.getSimpleName}: ${e.getMessage}")
+            null
+        }
+      }
+    }
+    val kafkaGetSink: MessageRestHandler.GetSink = (_: String, topic: String, count: Int) => {
+      val bs = bootstrapServers()
+      if (bs == null || bs.isEmpty) java.util.Collections.emptyList()
+      else fetchFromTopic(topic, count, bs)
+    }
+    val kafkaAckSink: MessageRestHandler.AckSink = (_: String, _: String, _: Int, _: Long) => ()
+    val stubPublishSink = kafkaPublishSink
+    val stubGetSink = kafkaGetSink
+    val stubAckSink = kafkaAckSink
     _messageRestHandler = new MessageRestHandler(
       routingEngine,
       new WsMessageSerializer(),
@@ -225,6 +265,75 @@ class HttpAcceptor(
 
   /** T3: exposed for HttpChannelInitializer — builds a fresh upgrade handler per pipeline. */
   def wsUpgradeHandlerFactory: () => WsUpgradeOrHttpHandler = _wsUpgradeHandlerFactory
+
+  // ------------------------------------------------------------------
+  //  T8: in-process Kafka producer + per-ack consumer wiring for WS data plane.
+  // ------------------------------------------------------------------
+
+  private def getOrCreateKafkaProducer(bs: String): org.apache.kafka.clients.producer.KafkaProducer[Array[Byte], Array[Byte]] = synchronized {
+    if (_wsKafkaProducer == null) {
+      val props = new java.util.Properties()
+      props.put("bootstrap.servers", bs)
+      props.put("key.serializer", classOf[org.apache.kafka.common.serialization.ByteArraySerializer].getName)
+      props.put("value.serializer", classOf[org.apache.kafka.common.serialization.ByteArraySerializer].getName)
+      props.put("acks", "1")
+      props.put("client.id", s"ws-publisher-$brokerId")
+      props.put("max.block.ms", "10000")
+      _wsKafkaProducer = new org.apache.kafka.clients.producer.KafkaProducer[Array[Byte], Array[Byte]](props)
+    }
+    _wsKafkaProducer
+  }
+
+  private def ensureTopicExists(topic: String, bs: String): Unit = {
+    if (_createdTopics.contains(topic)) return
+    synchronized {
+      if (_wsAdminClient == null) {
+        val props = new java.util.Properties()
+        props.put("bootstrap.servers", bs)
+        props.put("client.id", s"ws-admin-$brokerId")
+        _wsAdminClient = org.apache.kafka.clients.admin.AdminClient.create(props)
+      }
+    }
+    val newTopic = new org.apache.kafka.clients.admin.NewTopic(topic, 1, 1.toShort)
+    try {
+      _wsAdminClient.createTopics(java.util.Collections.singletonList(newTopic)).all().get(10, java.util.concurrent.TimeUnit.SECONDS)
+      _createdTopics.add(topic)
+    } catch {
+      case e: java.util.concurrent.ExecutionException if e.getCause.isInstanceOf[org.apache.kafka.common.errors.TopicExistsException] =>
+        _createdTopics.add(topic)
+      case e: Exception =>
+        warn(s"Failed to create topic $topic: ${e.getClass.getSimpleName}: ${e.getMessage}")
+    }
+  }
+
+  private def fetchFromTopic(topic: String, count: Int, bs: String): java.util.List[MessageRestHandler.FetchedMessage] = {
+    val props = new java.util.Properties()
+    props.put("bootstrap.servers", bs)
+    props.put("group.id", s"ws-get-${java.util.UUID.randomUUID()}")
+    props.put("key.deserializer", classOf[org.apache.kafka.common.serialization.ByteArrayDeserializer].getName)
+    props.put("value.deserializer", classOf[org.apache.kafka.common.serialization.ByteArrayDeserializer].getName)
+    props.put("auto.offset.reset", "earliest")
+    props.put("enable.auto.commit", "false")
+    val consumer = new org.apache.kafka.clients.consumer.KafkaConsumer[Array[Byte], Array[Byte]](props)
+    try {
+      consumer.subscribe(java.util.Collections.singletonList(topic))
+      val records = consumer.poll(java.time.Duration.ofSeconds(2))
+      val out = new java.util.ArrayList[MessageRestHandler.FetchedMessage]()
+      val it = records.records(topic).iterator()
+      var n = 0
+      while (it.hasNext && n < count) {
+        val r = it.next()
+        val hdrMap = new java.util.HashMap[String, String]()
+        r.headers().forEach(h => hdrMap.put(h.key(), if (h.value() == null) "" else new String(h.value(), java.nio.charset.StandardCharsets.UTF_8)))
+        out.add(new MessageRestHandler.FetchedMessage(r.partition(), r.offset(), r.key(), r.value(), hdrMap))
+        n += 1
+      }
+      out
+    } finally {
+      consumer.close(java.time.Duration.ofMillis(100))
+    }
+  }
+
 
   override def setRequestChannel(requestChannel: RequestChannel): Unit = {
     _requestChannel = requestChannel
@@ -359,6 +468,14 @@ class HttpAcceptor(
    */
   override def close(): Unit = {
     if (closed.compareAndSet(false, true)) {
+      // T8: close the WS data-plane producer/admin before other resources.
+      try {
+        if (_wsKafkaProducer != null) _wsKafkaProducer.close(java.time.Duration.ofSeconds(2))
+      } catch { case e: Exception => warn(s"Error closing WS producer: ${e.getMessage}") }
+      try {
+        if (_wsAdminClient != null) _wsAdminClient.close(java.time.Duration.ofSeconds(2))
+      } catch { case e: Exception => warn(s"Error closing WS admin: ${e.getMessage}") }
+
       try {
         // 0. Shut down HttpProcessor drainer thread
         if (_httpProcessor != null) {

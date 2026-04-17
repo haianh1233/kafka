@@ -129,7 +129,7 @@ class WsRestMessageIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("GetSink is a stub returning empty — real Kafka fetch wiring deferred to T3+ broker integration.")
+  // T8: enabled — KafkaConsumer-backed GetSink.
   def testRestGet_pullsMessage(): Unit = {
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
@@ -160,7 +160,7 @@ class WsRestMessageIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("Requires real fetch (GetSink stub returns empty) + QueueManager for queue declaration.")
+  @Disabled("Requires QueueManager for queue declaration — T8 wired fetch, but declareQueue is still a stub.")
   def testRestGetManualAckFlow(): Unit = {
     val client = HttpClient.newHttpClient()
     val base = httpBaseUrl
@@ -194,7 +194,7 @@ class WsRestMessageIntegrationTest extends HttpIntegrationTestHarness {
 
   @Test
   @Timeout(30)
-  @Disabled("Requires real fetch + QueueManager — redelivery requires round-trip through backing topic.")
+  @Disabled("Requires QueueManager + redelivery round-trip through backing topic.")
   def testRestNack_withRequeue_redelivers(): Unit = {
     // Full redelivery behaviour — covered by unit tests today. Enable once
     // wiring lands and the backing topic is reachable end-to-end.

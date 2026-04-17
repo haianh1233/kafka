@@ -293,6 +293,20 @@ class SocketServer(
         val httpAcceptor = httpAcceptorFactory(endpoint, time)
         // Inject the shared RequestChannel so HTTP requests flow through KafkaApis
         httpAcceptor.setRequestChannel(dataPlaneRequestChannel)
+        // T8: lazily compute the bootstrap string from actually-bound binary listener
+        // ports. Called at first WS publish/fetch — by then ports are bound.
+        httpAcceptor.setBootstrapServersSupplier(new java.util.function.Supplier[String] {
+          override def get(): String = {
+            config.listeners
+              .filterNot(_.securityProtocol().isHttp)
+              .flatMap { l =>
+                val host = if (l.host == null || l.host.isEmpty) "localhost" else l.host
+                val port = boundPort(ListenerName.normalised(l.listener))
+                if (port > 0) Some(s"$host:$port") else None
+              }
+              .mkString(",")
+          }
+        })
         // Bind immediately so boundPort() is available (unlike binary acceptors
         // which bind in the constructor, Netty binds in startup())
         httpAcceptor.startup()

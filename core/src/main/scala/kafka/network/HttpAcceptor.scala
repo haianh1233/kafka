@@ -92,4 +92,11 @@ trait HttpAcceptorLike {
    * Default implementation is a no-op for backward compatibility.
    */
   def setTopicIdSupplier(supplier: java.util.function.Function[String, org.apache.kafka.common.Uuid]): Unit = {}
+
+  /**
+   * T8: inject a Kafka bootstrap servers supplier. Called lazily at first use
+   * (after binary listeners have bound so ports are known). Null supplier or
+   * empty result disables the WS data plane.
+   */
+  def setBootstrapServersSupplier(supplier: java.util.function.Supplier[String]): Unit = {}
 }
