@@ -324,19 +324,72 @@ cd /home/anh/kafka && ./gradlew :http-server:test --tests 'kafka.server.http.rou
 
 ## Learning
 
-_To be filled by the executing agent._
+- The task skeleton's API (`routingEngine.declareExchange`, `.bind`, `.unbind`,
+  `.exchangeExists`, 2-arg `.route`) predates the WS1.06–1.08 architecture split.
+  In the actual codebase, **state lives in `ExchangeManager` + `BindingManager`**
+  and `RoutingEngine` is a stateless function that composes lookup predicates.
+  `DefaultExchangeManager` adapts to reality: it's a thin facade that delegates
+  `initialize` to `ExchangeManager.initializeDefaults(vhost)` (which already
+  registers `""` as direct per WS1.06) and `onQueueDeclared / onQueueDeleted`
+  to `BindingManager.bind / unbind` with `routingKey = queueName`.
+- `ExchangeManager.initializeDefaults` is idempotent — it checks
+  `metadataManager.getExchange(vhost, name) != null` before synthesizing, so
+  `DefaultExchangeManager.initialize` can be called many times safely.
+- `BindingManager.bind` deduplicates on the full tuple
+  `(exchange, queue, routingKey, arguments)` — so re-declaring a queue that
+  already has an implicit binding is a silent no-op with no duplicate list
+  entry. The idempotency test asserts `bindingCount("") == 1` after a double
+  declare.
+- The default exchange is already protected from deletion: it's in
+  `ExchangeManager.DEFAULT_EXCHANGE_NAMES`, which `deleteExchange` rejects
+  with `EXCHANGE_PROTECTED`. A test asserts this explicitly so the guarantee
+  doesn't silently regress.
+- Tests wire up the real `ExchangeManager` + `BindingManager` +
+  `RoutingEngine` stack (not mocks) so they exercise the same code path a
+  publish will take in production: implicit binding → direct matcher → queue
+  name. `onQueueDeleted_onlyRemovesImplicitBinding` additionally proves the
+  hook is surgical — it doesn't touch bindings on `amq.direct` or other
+  exchanges.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- No `QueueManager` yet (per task preamble), so `DefaultExchangeManager` can't
+  be driven automatically on queue lifecycle events. Whichever component ends
+  up owning queue lifecycle must call `onQueueDeclared` / `onQueueDeleted` at
+  the right moments. The hooks are stateless static methods so wiring is
+  trivial when that arrives.
+- `DefaultExchangeManager.onQueueDeleted` only removes the implicit binding on
+  `""`; it does NOT cascade across all exchanges. For a full queue delete the
+  caller should also invoke `BindingManager.removeAllForQueue(queueName)` to
+  drop any explicit bindings the queue had elsewhere. Documented in the class
+  Javadoc.
+- `BindingManager` is not vhost-aware (exchanges are keyed by name only in the
+  in-memory bucket map). A multi-vhost deployment will need either per-vhost
+  `BindingManager` instances or a vhost-prefixed key scheme. Out of scope for
+  this task.
+- Spec says "Add `getExchangeType()` method to `RoutingEngine` if not present."
+  Not added — `RoutingEngine` is stateless and type lookup is already the
+  caller's `exchangeTypeFn`. Tests read the type directly from
+  `ExchangeManager.getExchange(vhost, name).type()`, which is the canonical
+  source.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Pre-flight reset was required: worktree was at an older commit
+  (`f95a1f995d`), reset to `origin/feature/http-protocol` at `7180b94b24`.
+- Time from design to green: ~15 minutes. Code footprint is small (one static
+  utility class, ~50 LOC of logic, plus 20 tests).
+- Only one file created in `main/` (new `DefaultExchangeManager.java`); no
+  existing source file was modified. `RoutingEngine` untouched.
+- Target test command `./gradlew :http-server:test --tests
+  'kafka.server.http.routing.DefaultExchangeManagerTest' --tests
+  'kafka.server.http.routing.RoutingEngineTest'` completes in ~1m 35s. Both
+  suites green; 20 new `DefaultExchangeManagerTest` cases, all existing
+  `RoutingEngineTest` cases still pass (no regression).
 
 ---
 
