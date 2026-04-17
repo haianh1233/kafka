@@ -17,6 +17,7 @@
 // Time: Created - TASK-F.05
 // Time: Modified - TASK-F.06 (drain check + in-flight tracking)
 // Time: Modified - TASK-B.06 (request pipeline wiring)
+// Time: Modified - TASK-WS2.06 (REST exchange/queue/binding CRUD dispatch)
 package kafka.network
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
@@ -25,6 +26,7 @@ import io.netty.channel.{ChannelFutureListener, ChannelHandlerContext, SimpleCha
 import io.netty.handler.codec.http.{DefaultFullHttpResponse, FullHttpRequest, HttpHeaderNames, HttpResponseStatus, HttpVersion}
 import io.netty.handler.ssl.SslHandler
 import kafka.server.http.{HttpProcessor, HttpRequestTranslator, HttpRouter, HttpServerConfigs}
+import kafka.server.http.rest.{BindingRestHandler, ExchangeRestHandler, QueueRestHandler}
 import org.apache.kafka.common.memory.MemoryPool
 import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.ApiKeys
@@ -72,7 +74,10 @@ class HttpRequestHandler(
   httpProcessor: HttpProcessor = null,
   metadataSupplier: java.util.function.Function[String, Integer] = null,
   topicIdSupplier: java.util.function.Function[String, org.apache.kafka.common.Uuid] = null,
-  httpServerConfigs: HttpServerConfigs = HttpServerConfigs.withDefaults()
+  httpServerConfigs: HttpServerConfigs = HttpServerConfigs.withDefaults(),
+  exchangeRestHandler: ExchangeRestHandler = null,
+  queueRestHandler: QueueRestHandler = null,
+  bindingRestHandler: BindingRestHandler = null
 ) extends SimpleChannelInboundHandler[FullHttpRequest] {
 
   /** Convenience constructor for backward compatibility (no drain support). */
@@ -216,6 +221,14 @@ class HttpRequestHandler(
       if (routeResult.handlerType() == HttpRouter.HandlerType.CONSUMER_LAG) {
         sendErrorResponse(ctx, HttpResponseStatus.NOT_FOUND,
           """{"errorCode":3,"errorMessage":"UNKNOWN_TOPIC_OR_PARTITION","detail":"Consumer group lag endpoint not yet implemented"}""")
+        return
+      }
+
+      // --- WS2.06: REST exchange/queue/binding CRUD dispatch ---
+      // Handlers produce a fully-formed FullHttpResponse synchronously; no
+      // RequestChannel / HttpProcessor involvement is required.
+      if (isRestRoutingHandler(routeResult.handlerType())) {
+        handleRestRoutingRequest(ctx, req, routeResult)
         return
       }
 
@@ -1096,6 +1109,109 @@ class HttpRequestHandler(
     }
 
     flatRoot
+  }
+
+  /**
+   * WS2.06 — True for any HandlerType managed by the REST routing handlers
+   * (exchange/queue/binding CRUD).
+   */
+  private def isRestRoutingHandler(t: HttpRouter.HandlerType): Boolean = t match {
+    case HttpRouter.HandlerType.DECLARE_EXCHANGE |
+         HttpRouter.HandlerType.GET_EXCHANGE |
+         HttpRouter.HandlerType.LIST_EXCHANGES |
+         HttpRouter.HandlerType.DELETE_EXCHANGE |
+         HttpRouter.HandlerType.DECLARE_QUEUE |
+         HttpRouter.HandlerType.GET_QUEUE |
+         HttpRouter.HandlerType.LIST_QUEUES |
+         HttpRouter.HandlerType.PATCH_QUEUE |
+         HttpRouter.HandlerType.DELETE_QUEUE |
+         HttpRouter.HandlerType.PURGE_QUEUE |
+         HttpRouter.HandlerType.CREATE_BINDING |
+         HttpRouter.HandlerType.LIST_BINDINGS |
+         HttpRouter.HandlerType.DELETE_BINDING => true
+    case _ => false
+  }
+
+  /**
+   * WS2.06 — Dispatches an already-routed REST routing request to the
+   * appropriate handler instance. If the handler is not wired (typical during
+   * early phases), responds with 501 Not Implemented.
+   */
+  private def handleRestRoutingRequest(
+    ctx: ChannelHandlerContext,
+    req: FullHttpRequest,
+    routeResult: HttpRouter.RouteResult
+  ): Unit = {
+    val vhostHeader = req.headers().get("X-Vhost")
+    val vhost = if (vhostHeader == null || vhostHeader.isEmpty) "/" else vhostHeader
+    val qp = routeResult.queryParams()
+    val ifUnused = java.lang.Boolean.parseBoolean(qp.getOrDefault("ifUnused", "false"))
+    val ifEmpty = java.lang.Boolean.parseBoolean(qp.getOrDefault("ifEmpty", "false"))
+
+    val response: io.netty.handler.codec.http.FullHttpResponse = routeResult.handlerType() match {
+      case HttpRouter.HandlerType.DECLARE_EXCHANGE =>
+        if (exchangeRestHandler == null) notWired("ExchangeRestHandler")
+        else exchangeRestHandler.handleDeclare(routeResult.resourceName(), vhost, req)
+
+      case HttpRouter.HandlerType.GET_EXCHANGE =>
+        if (exchangeRestHandler == null) notWired("ExchangeRestHandler")
+        else exchangeRestHandler.handleGet(routeResult.resourceName(), vhost)
+
+      case HttpRouter.HandlerType.LIST_EXCHANGES =>
+        if (exchangeRestHandler == null) notWired("ExchangeRestHandler")
+        else exchangeRestHandler.handleList(vhost)
+
+      case HttpRouter.HandlerType.DELETE_EXCHANGE =>
+        if (exchangeRestHandler == null) notWired("ExchangeRestHandler")
+        else exchangeRestHandler.handleDelete(routeResult.resourceName(), vhost, ifUnused)
+
+      case HttpRouter.HandlerType.DECLARE_QUEUE =>
+        if (queueRestHandler == null) notWired("QueueRestHandler")
+        else queueRestHandler.handleDeclare(routeResult.resourceName(), vhost, req)
+
+      case HttpRouter.HandlerType.GET_QUEUE =>
+        if (queueRestHandler == null) notWired("QueueRestHandler")
+        else queueRestHandler.handleGet(routeResult.resourceName(), vhost)
+
+      case HttpRouter.HandlerType.LIST_QUEUES =>
+        if (queueRestHandler == null) notWired("QueueRestHandler")
+        else queueRestHandler.handleList(vhost)
+
+      case HttpRouter.HandlerType.DELETE_QUEUE =>
+        if (queueRestHandler == null) notWired("QueueRestHandler")
+        else queueRestHandler.handleDelete(routeResult.resourceName(), vhost, ifUnused, ifEmpty)
+
+      case HttpRouter.HandlerType.CREATE_BINDING =>
+        if (bindingRestHandler == null) notWired("BindingRestHandler")
+        else bindingRestHandler.handleCreate(vhost, req)
+
+      case HttpRouter.HandlerType.LIST_BINDINGS =>
+        if (bindingRestHandler == null) notWired("BindingRestHandler")
+        else bindingRestHandler.handleList(vhost, qp.get("exchange"), qp.get("queue"))
+
+      case HttpRouter.HandlerType.DELETE_BINDING =>
+        if (bindingRestHandler == null) notWired("BindingRestHandler")
+        else bindingRestHandler.handleDelete(vhost, req)
+
+      case HttpRouter.HandlerType.PATCH_QUEUE | HttpRouter.HandlerType.PURGE_QUEUE =>
+        notWired("QueueRestHandler (patch/purge not implemented in WS2.06)")
+
+      case _ =>
+        notWired("Unknown REST routing handler")
+    }
+
+    ctx.writeAndFlush(response)
+  }
+
+  private def notWired(which: String): io.netty.handler.codec.http.FullHttpResponse = {
+    val body = s"""{"errorCode":-1,"errorMessage":"$which not wired in this broker"}"""
+      .getBytes(StandardCharsets.UTF_8)
+    val response = new DefaultFullHttpResponse(
+      HttpVersion.HTTP_1_1, HttpResponseStatus.NOT_IMPLEMENTED,
+      Unpooled.wrappedBuffer(body))
+    response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json")
+    response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, body.length)
+    response
   }
 
   /**

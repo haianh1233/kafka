@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 // Time: Created - TASK-B.01
+// Time: Update - TASK-WS2.06 - added exchange/queue/binding REST routes
 package kafka.server.http;
 
 import io.netty.handler.codec.http.HttpMethod;
@@ -62,7 +63,21 @@ public final class HttpRouter {
         SHARE_POLL,
         SHARE_ACKNOWLEDGE,
         HEALTH,
-        OPENAPI_SPEC
+        OPENAPI_SPEC,
+        // --- WS2.06: REST routing CRUD ---
+        DECLARE_EXCHANGE,
+        GET_EXCHANGE,
+        LIST_EXCHANGES,
+        DELETE_EXCHANGE,
+        DECLARE_QUEUE,
+        GET_QUEUE,
+        LIST_QUEUES,
+        PATCH_QUEUE,
+        DELETE_QUEUE,
+        PURGE_QUEUE,
+        CREATE_BINDING,
+        LIST_BINDINGS,
+        DELETE_BINDING
     }
 
     // --- Route result ---
@@ -72,6 +87,7 @@ public final class HttpRouter {
         private final Integer partition;
         private final String consumerGroup;
         private final String groupId;
+        private final String resourceName; // WS2.06: exchange/queue name for REST routes
         private final Map<String, String> queryParams;
 
         public RouteResult(
@@ -81,7 +97,7 @@ public final class HttpRouter {
             String consumerGroup,
             Map<String, String> queryParams
         ) {
-            this(handlerType, topicName, partition, consumerGroup, null, queryParams);
+            this(handlerType, topicName, partition, consumerGroup, null, null, queryParams);
         }
 
         public RouteResult(
@@ -92,11 +108,24 @@ public final class HttpRouter {
             String groupId,
             Map<String, String> queryParams
         ) {
+            this(handlerType, topicName, partition, consumerGroup, groupId, null, queryParams);
+        }
+
+        public RouteResult(
+            HandlerType handlerType,
+            String topicName,
+            Integer partition,
+            String consumerGroup,
+            String groupId,
+            String resourceName,
+            Map<String, String> queryParams
+        ) {
             this.handlerType = handlerType;
             this.topicName = topicName;
             this.partition = partition;
             this.consumerGroup = consumerGroup;
             this.groupId = groupId;
+            this.resourceName = resourceName;
             this.queryParams = queryParams;
         }
 
@@ -118,6 +147,11 @@ public final class HttpRouter {
 
         public String groupId() {
             return groupId;
+        }
+
+        /** WS2.06: exchange or queue name extracted from /v1/exchanges/{name} or /v1/queues/{name}. */
+        public String resourceName() {
+            return resourceName;
         }
 
         public Map<String, String> queryParams() {
@@ -172,6 +206,32 @@ public final class HttpRouter {
     private static final Pattern OPENAPI_SPEC_PATTERN =
         Pattern.compile("^/v1/openapi\\.yaml$");
 
+    // --- WS2.06 routing CRUD patterns ---
+
+    // Matches: /v1/exchanges/{name}
+    private static final Pattern EXCHANGE_PATTERN =
+        Pattern.compile("^/v1/exchanges/([^/?]+)$");
+
+    // Matches: /v1/exchanges
+    private static final Pattern EXCHANGES_LIST_PATTERN =
+        Pattern.compile("^/v1/exchanges$");
+
+    // Matches: /v1/queues/{name}/messages — must precede QUEUE_PATTERN
+    private static final Pattern QUEUE_MESSAGES_PATTERN =
+        Pattern.compile("^/v1/queues/([^/?]+)/messages$");
+
+    // Matches: /v1/queues/{name}
+    private static final Pattern QUEUE_PATTERN =
+        Pattern.compile("^/v1/queues/([^/?]+)$");
+
+    // Matches: /v1/queues
+    private static final Pattern QUEUES_LIST_PATTERN =
+        Pattern.compile("^/v1/queues$");
+
+    // Matches: /v1/bindings
+    private static final Pattern BINDINGS_PATTERN =
+        Pattern.compile("^/v1/bindings$");
+
     // --- Client ID validation ---
     private static final Pattern CLIENT_ID_PATTERN =
         Pattern.compile("^[a-zA-Z0-9._-]{1,128}$");
@@ -213,6 +273,9 @@ public final class HttpRouter {
         if (result != null) return result;
 
         result = matchConsumerGroupRoutes(method, path, queryParams);
+        if (result != null) return result;
+
+        result = matchRoutingRoutes(method, path, queryParams);
         if (result != null) return result;
 
         result = matchUtilityRoutes(method, path, queryParams);
@@ -319,6 +382,96 @@ public final class HttpRouter {
     }
 
     /**
+     * WS2.06 — Matches REST routing CRUD routes for exchanges, queues, and bindings.
+     *
+     * Order matters: the more specific {@code /v1/queues/{name}/messages} must come
+     * before the general {@code /v1/queues/{name}} to avoid being swallowed.
+     */
+    private RouteResult matchRoutingRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
+        RouteResult result = matchExchangeRoutes(method, path, queryParams);
+        if (result != null) return result;
+
+        result = matchQueueRoutes(method, path, queryParams);
+        if (result != null) return result;
+
+        return matchBindingRoutes(method, path, queryParams);
+    }
+
+    /** /v1/exchanges and /v1/exchanges/{name}. */
+    private RouteResult matchExchangeRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
+        Matcher matcher = EXCHANGE_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            String name = validateResourceName(matcher.group(1), "exchange");
+            HandlerType ht = exchangeMethodToHandler(method, path);
+            return new RouteResult(ht, null, null, null, null, name, queryParams);
+        }
+        matcher = EXCHANGES_LIST_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.GET, path);
+            return new RouteResult(HandlerType.LIST_EXCHANGES, null, null, null, null, null, queryParams);
+        }
+        return null;
+    }
+
+    /** /v1/queues, /v1/queues/{name}, and /v1/queues/{name}/messages. */
+    private RouteResult matchQueueRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
+        // More specific path (/messages) must come first.
+        Matcher matcher = QUEUE_MESSAGES_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.DELETE, path);
+            String name = validateResourceName(matcher.group(1), "queue");
+            return new RouteResult(HandlerType.PURGE_QUEUE, null, null, null, null, name, queryParams);
+        }
+        matcher = QUEUE_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            String name = validateResourceName(matcher.group(1), "queue");
+            HandlerType ht = queueMethodToHandler(method, path);
+            return new RouteResult(ht, null, null, null, null, name, queryParams);
+        }
+        matcher = QUEUES_LIST_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.GET, path);
+            return new RouteResult(HandlerType.LIST_QUEUES, null, null, null, null, null, queryParams);
+        }
+        return null;
+    }
+
+    /** /v1/bindings. */
+    private RouteResult matchBindingRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
+        Matcher matcher = BINDINGS_PATTERN.matcher(path);
+        if (!matcher.matches()) return null;
+        HandlerType ht;
+        if (method.equals(HttpMethod.POST)) {
+            ht = HandlerType.CREATE_BINDING;
+        } else if (method.equals(HttpMethod.GET)) {
+            ht = HandlerType.LIST_BINDINGS;
+        } else if (method.equals(HttpMethod.DELETE)) {
+            ht = HandlerType.DELETE_BINDING;
+        } else {
+            throw new InvalidRequestException(
+                "Method " + method + " not allowed for " + path + "; expected POST, GET or DELETE");
+        }
+        return new RouteResult(ht, null, null, null, null, null, queryParams);
+    }
+
+    private static HandlerType exchangeMethodToHandler(HttpMethod method, String path) {
+        if (method.equals(HttpMethod.PUT)) return HandlerType.DECLARE_EXCHANGE;
+        if (method.equals(HttpMethod.GET)) return HandlerType.GET_EXCHANGE;
+        if (method.equals(HttpMethod.DELETE)) return HandlerType.DELETE_EXCHANGE;
+        throw new InvalidRequestException(
+            "Method " + method + " not allowed for " + path + "; expected PUT, GET or DELETE");
+    }
+
+    private static HandlerType queueMethodToHandler(HttpMethod method, String path) {
+        if (method.equals(HttpMethod.PUT)) return HandlerType.DECLARE_QUEUE;
+        if (method.equals(HttpMethod.GET)) return HandlerType.GET_QUEUE;
+        if (method.equals(HttpMethod.PATCH)) return HandlerType.PATCH_QUEUE;
+        if (method.equals(HttpMethod.DELETE)) return HandlerType.DELETE_QUEUE;
+        throw new InvalidRequestException(
+            "Method " + method + " not allowed for " + path + "; expected PUT, GET, PATCH or DELETE");
+    }
+
+    /**
      * Matches utility routes: HEALTH, OPENAPI_SPEC.
      */
     private RouteResult matchUtilityRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
@@ -391,6 +544,43 @@ public final class HttpRouter {
         if (decoded.length() > 255) {
             throw new InvalidRequestException(
                 "Consumer group ID must not exceed 255 characters, got " + decoded.length());
+        }
+        return decoded;
+    }
+
+    /**
+     * URL-decodes and validates an exchange or queue name from the URI path.
+     * Rejects path-traversal characters (null byte, '/', '\'). Allows all other
+     * printable characters so AMQP names like {@code amq.direct} and empty-string
+     * default exchange survive (callers use an empty path segment for the latter,
+     * which the regex rejects — use a non-empty placeholder and translate at the
+     * handler layer).
+     *
+     * // Time: Created - TASK-WS2.06
+     *
+     * @param rawSegment URL-encoded resource name from the URI path
+     * @param kind       "exchange" or "queue" — used in the error message only
+     * @return validated, decoded resource name
+     * @throws InvalidRequestException if the name is empty, too long, or contains
+     *                                 illegal characters
+     */
+    static String validateResourceName(String rawSegment, String kind) {
+        String decoded = URLDecoder.decode(rawSegment, StandardCharsets.UTF_8);
+        if (decoded.isEmpty()) {
+            throw new InvalidRequestException(kind + " name must not be empty");
+        }
+        if (decoded.length() > 255) {
+            throw new InvalidRequestException(
+                kind + " name must not exceed 255 characters, got " + decoded.length());
+        }
+        if (decoded.indexOf('\0') >= 0) {
+            throw new InvalidRequestException(kind + " name contains illegal null byte character");
+        }
+        if (decoded.indexOf('/') >= 0) {
+            throw new InvalidRequestException(kind + " name contains illegal '/' character");
+        }
+        if (decoded.indexOf('\\') >= 0) {
+            throw new InvalidRequestException(kind + " name contains illegal '\\' character");
         }
         return decoded;
     }

@@ -175,6 +175,13 @@ public final class HttpRequestTranslator {
                 "HEALTH requests should be handled directly, not translated");
             case OPENAPI_SPEC -> throw new InvalidRequestException(
                 "OPENAPI_SPEC requests should be handled directly, not translated");
+            // WS2.06 REST routing handlers — dispatched by HttpRequestHandler
+            // directly; never reach the generic translator.
+            case DECLARE_EXCHANGE, GET_EXCHANGE, LIST_EXCHANGES, DELETE_EXCHANGE,
+                 DECLARE_QUEUE, GET_QUEUE, LIST_QUEUES, PATCH_QUEUE, DELETE_QUEUE,
+                 PURGE_QUEUE, CREATE_BINDING, LIST_BINDINGS, DELETE_BINDING ->
+                throw new InvalidRequestException(
+                    "REST routing requests are handled directly, not translated");
         };
     }
 
