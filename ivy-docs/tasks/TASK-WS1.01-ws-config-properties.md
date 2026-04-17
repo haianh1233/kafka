@@ -966,9 +966,15 @@ timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.ws.WsConfigsT
 > Filled by the executing agent after each commit.
 > Run: `git diff --name-status HEAD~1 HEAD -- '*.java' '*.xml' '*.json' '*.yaml' '*.yml'`
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-17 — WS1.01 config properties (commit fa97449cb6)
+
 Created:
-  - path/to/NewFile.java — <what it does>
+  - `server/src/main/java/org/apache/kafka/network/WsServerConfigs.java` — 28 public constants (key + default + doc) and `CONFIG_DEF` that registers all properties with types, validators, importance levels, and docs.
+  - `http-server/src/main/java/kafka/server/http/ws/WsConfigs.java` — runtime holder with 28-arg constructor, `withDefaults()` factory, and 28 typed accessors. Defaults come from `WsServerConfigs` constants.
+  - `server/src/test/java/org/apache/kafka/network/WsServerConfigsTest.java` — 25 tests covering CONFIG_DEF presence, total count = 28, all key registration, default values per spec, custom-value parsing, and all validator edge cases (`atLeast(1)` rejects 0, `atLeast(0)` accepts 0, `ValidString.in(earliest, latest)` enforcement, empty-doc guard).
+  - `http-server/src/test/java/kafka/server/http/ws/WsConfigsTest.java` — 6 tests covering `withDefaults()`, full-constructor round-trip, three NPE tests for null string fields, and a CONFIG_DEF → constructor integration test.
+
 Modified:
-  - path/to/Existing.java — <what changed>
--->
+  - `server/src/main/java/org/apache/kafka/server/config/AbstractKafkaConfig.java` — added import for `WsServerConfigs` and `WsServerConfigs.CONFIG_DEF` entry in the `Utils.mergeConfigs(List.of(...))` builder so all 28 WS keys are recognized by `KafkaConfig`.
+  - `checkstyle/suppressions.xml` — appended `WsConfigs` to the existing `ParameterNumber` suppression filename regex (28-arg constructor exceeds the 13-arg Kafka limit).
+  - `ivy-docs/tasks/TASK-WS1.01-ws-config-properties.md` — filled Learning, Limitations, Field Notes, and File Manifest sections.
