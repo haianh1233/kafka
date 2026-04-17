@@ -632,9 +632,12 @@ static {
 
 > Filled by the executing agent after each commit.
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-17 — WsMessageSerializer initial implementation (commit f6e5479c12)
+
 Created:
-  - path/to/NewFile.java — <what it does>
+  - `http-server/src/main/java/kafka/server/http/ws/WsMessageSerializer.java` — publish-frame → Kafka record components (key, value, headers) with all 13 AMQP property mappings, JSON/string/base64 body encoding, and immutable `SerializedMessage` record
+  - `http-server/src/test/java/kafka/server/http/ws/WsMessageSerializerTest.java` — 25 JUnit 5 tests covering routing key, body encodings, header mapping, null-handling, UTF-8 fidelity
+
 Modified:
-  - path/to/Existing.java — <what changed>
--->
+  - `http-server/src/main/java/kafka/server/http/HttpRequestTranslator.java` — widened `MAPPER` from package-private to `public static final` so the `kafka.server.http.ws` sub-package can reuse the shared ObjectMapper instead of creating a new one
+  - `ivy-docs/tasks/TASK-WS1.09-ws-message-serializer.md` — Learning / Limitations / Field Notes / File Manifest sections filled
