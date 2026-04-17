@@ -199,19 +199,75 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsConsumer
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Range-style assignment is enough at this layer.** The live Kafka `RangeAssignor`
+  sorts members lexicographically, slices partitions into contiguous blocks, and gives
+  the first `extra = numPartitions % n` members one extra partition. Re-implementing
+  that algorithm here keeps the in-memory contract aligned with what the real
+  `GroupCoordinator` would eventually produce, so downstream listeners see the same
+  partition shape regardless of whether a broker is in the loop.
+- **Full-assignment callback, not deltas.** `onPartitionsAssigned` receives the
+  complete new slice rather than the delta. This matches the Kafka
+  `ConsumerRebalanceListener` contract and lets listeners replace their partition set
+  atomically; the caller still gets a distinct `onPartitionsRevoked` call for the
+  shed partitions so it can invalidate tag state before the new assignment lands.
+- **Tag counter must be monotonic across revokes.** `WsDeliveryTagTracker.invalidatePartitions`
+  drops pending deliveries and per-partition ack maps but deliberately does not roll
+  back `tagCounter`. Rolling it back would break `WsAckHandler`'s ability to tell
+  "unknown tag" from "already-transitioned tag" — the former returns
+  `PRECONDITION_FAILED`, the latter is an idempotent success.
+- **Listeners are invoked under the group's lock.** Callbacks must be fast and must
+  not re-enter the coordinator synchronously, or a deadlock is possible. The existing
+  integrations (`WsSubscriptionManager#invalidateRevokedPartitions`) satisfy that
+  trivially — all they do is call into the tracker, which has its own lock.
+- **Group name never includes vhost.** Per spec, the group id is `ws.{queueName}` and
+  the queue name already carries the vhost prefix when present (`vhost1.q1`
+  → `ws.vhost1.q1`). A test validates the case directly.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **No live broker integration.** The coordinator is entirely in-memory — it does not
+  submit `JoinGroupRequest` / `SyncGroupRequest` / `LeaveGroupRequest` to the real
+  Kafka `GroupCoordinator`. This task's spec explicitly scoped that out in favour of
+  "API surface and contract". Wiring the coordinator to the broker requires a
+  follow-up task that hooks into `KafkaApis` (handleJoinGroup/handleSyncGroup) and
+  turns the `CompletableFuture` returns into genuine async round-trips.
+- **No heartbeat / session timeout.** Real consumer groups keep a heartbeat loop and
+  remove dead members on timeout. This implementation relies on explicit
+  `leaveGroup` calls from `WsSubscriptionManager#unsubscribe` and
+  `WsSubscriptionManager#cancelAll` (on channel close). A crashed / zombie session
+  that never closes the channel would hold its partitions indefinitely.
+- **`WsConsumerFetchLoop` not yet wired to the assignment.** The fetch loop still
+  uses the partitions passed to `subscribe()` verbatim. Re-driving the loop on
+  rebalance requires the real fetch integration (TASK-WS1.16) and is out of scope
+  here. The listener hook lives in `WsSubscriptionManager#invalidateRevokedPartitions`
+  and is enough to keep ack state correct when the fetch integration eventually
+  lands.
+- **Rebalance frame emission from `WsFrameHandler`** is not implemented; the
+  notification is a listener callback, not a wire frame. Rationale: the frame format
+  (§5.8) lives next to the rest of the WS serialiser work and should be added in the
+  same PR that wires fetch-loop re-assignment. The listener contract here is
+  sufficient for that future work — `WsFrameHandler` will instantiate a listener that
+  writes the frame.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- `WsSubscriptionManager` grew a second constructor rather than a mandatory
+  `WsConsumerGroupCoordinator` parameter so existing WS1.* tests continue to work
+  unchanged. The coordinator is optional infrastructure at this layer.
+- `WsDeliveryTagTracker#invalidatePartitions` intentionally does NOT reset the
+  counter; see Learning bullet. A test (`invalidatePartitions_preservesTagMonotonicity`)
+  pins the invariant.
+- `lastCommittedOffsets` is cleared for revoked partitions so a re-assignment of the
+  same partition can cleanly produce new committable watermarks. Test:
+  `invalidatePartitions_resetsCommittedWatermark`.
+- Range-style assignment uses a sort by subscriptionId for determinism — two
+  subscribers joining in different orders end up with the same stable slices, which
+  matters for tests and for reasoning about pinned delivery ordering within a
+  partition.
 
 ---
 
@@ -226,4 +282,14 @@ _To be filled by the executing agent._
 
 ## File Manifest
 
-_To be filled by the executing agent._
+**Created:**
+- `http-server/src/main/java/kafka/server/http/ws/WsConsumerGroupCoordinator.java` — in-memory consumer-group coordinator with range-style partition assignment, `RebalanceListener` callback contract, `joinGroup`/`leaveGroup`/introspection API.
+- `http-server/src/test/java/kafka/server/http/ws/WsConsumerGroupCoordinatorTest.java` — 17 tests covering group naming, distribution, rebalance callbacks, tag invalidation via listener, validation.
+
+**Modified:**
+- `http-server/src/main/java/kafka/server/http/ws/WsSubscriptionManager.java` — optional `WsConsumerGroupCoordinator` constructor arg, `groupCoordinator()` getter, `invalidateRevokedPartitions(subscriptionId, revoked)`.
+- `http-server/src/main/java/kafka/server/http/ws/WsDeliveryTagTracker.java` — `invalidatePartitions(revoked)` method; preserves monotonic tag counter.
+- `http-server/src/test/java/kafka/server/http/ws/WsSubscriptionManagerTest.java` — 5 new tests for coordinator wiring + `invalidateRevokedPartitions`.
+- `http-server/src/test/java/kafka/server/http/ws/WsDeliveryTagTrackerTest.java` — 5 new tests for `invalidatePartitions`.
+
+**Total test delta:** 27 new test methods, all passing. Full 4-class targeted suite: 77 tests, 0 failures.
