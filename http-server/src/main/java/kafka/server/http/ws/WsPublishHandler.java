@@ -18,6 +18,7 @@
 // Time: Update - TASK-WS3.01 - recordPending via WsPublisherConfirmTracker
 // Time: Update - TASK-WS3.02 - enhanced mandatory return semantics
 // Time: Update - TASK-WS3.05 - added ACL checks (WsAuthorizationHelper)
+// Time: Update - TASK-WS3.06 - added produce byte-rate quota enforcement (WsQuotaManager)
 // Time: Update - TASK-WS3.08 - added metrics recording
 // Time: Update - TASK-WS4.05 - integrated dedup cache
 package kafka.server.http.ws;
@@ -116,6 +117,8 @@ public final class WsPublishHandler {
     private static final String ERR_INTERNAL = "INTERNAL_ERROR";
     /** TASK-WS3.02: reject attempts to publish to an {@code internal=true} exchange. */
     private static final String ERR_ACCESS_REFUSED = "ACCESS_REFUSED";
+    /** TASK-WS3.06: emitted when a publish exceeds the produce byte-rate quota. */
+    private static final String ERR_QUOTA_EXCEEDED = "QUOTA_EXCEEDED";
 
     /** AMQP 0.9.1 NO_ROUTE reply code (returned-frame replyCode). */
     private static final int AMQP_NO_ROUTE = 312;
@@ -140,6 +143,11 @@ public final class WsPublishHandler {
      * than authorization). In production wiring this is always supplied.
      */
     private final WsAuthorizationHelper authorizationHelper;
+    /**
+     * TASK-WS3.06: optional produce byte-rate quota manager. {@code null}
+     * disables the byte-rate check (tests / pre-3.06 wiring).
+     */
+    private final WsQuotaManager quotaManager;
 
     /**
      * Convenience constructor for tests that do not care about metrics. Delegates
@@ -151,7 +159,8 @@ public final class WsPublishHandler {
                             WsMessageSerializer messageSerializer,
                             Function<String, String> queueToTopicFn,
                             ProduceRequestSink sink) {
-        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, null, null, null);
+        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink,
+            null, null, null, null);
     }
 
     /**
@@ -164,7 +173,8 @@ public final class WsPublishHandler {
                             Function<String, String> queueToTopicFn,
                             ProduceRequestSink sink,
                             WsMetrics metrics) {
-        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, metrics, null, null);
+        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink,
+            metrics, null, null, null);
     }
 
     /**
@@ -178,7 +188,8 @@ public final class WsPublishHandler {
                             ProduceRequestSink sink,
                             WsMetrics metrics,
                             WsDeduplicationCache dedupCache) {
-        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink, metrics, dedupCache, null);
+        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink,
+            metrics, dedupCache, null, null);
     }
 
     /**
@@ -225,6 +236,28 @@ public final class WsPublishHandler {
                             WsMetrics metrics,
                             WsDeduplicationCache dedupCache,
                             WsAuthorizationHelper authorizationHelper) {
+        this(exchangeManager, routingEngine, messageSerializer, queueToTopicFn, sink,
+            metrics, dedupCache, authorizationHelper, null);
+    }
+
+    /**
+     * Full 9-arg constructor (TASK-WS3.06). The {@code quotaManager} applies
+     * the produce byte-rate quota — when throttled, the handler emits a
+     * {@code QUOTA_EXCEEDED} error frame with a {@code retryAfterMs} hint and
+     * skips routing / produce altogether (publisher confirms, if enabled, are
+     * not emitted either; the broker did not accept the message). {@code null}
+     * disables the byte-rate check — appropriate for tests and pre-3.06
+     * wiring.
+     */
+    public WsPublishHandler(ExchangeManager exchangeManager,
+                            RoutingEngine routingEngine,
+                            WsMessageSerializer messageSerializer,
+                            Function<String, String> queueToTopicFn,
+                            ProduceRequestSink sink,
+                            WsMetrics metrics,
+                            WsDeduplicationCache dedupCache,
+                            WsAuthorizationHelper authorizationHelper,
+                            WsQuotaManager quotaManager) {
         this.exchangeManager = Objects.requireNonNull(exchangeManager, "exchangeManager");
         this.routingEngine = Objects.requireNonNull(routingEngine, "routingEngine");
         this.messageSerializer = Objects.requireNonNull(messageSerializer, "messageSerializer");
@@ -233,6 +266,7 @@ public final class WsPublishHandler {
         this.metrics = metrics; // nullable by design — see Javadoc
         this.dedupCache = dedupCache; // nullable by design — see Javadoc
         this.authorizationHelper = authorizationHelper; // nullable by design — see Javadoc
+        this.quotaManager = quotaManager; // nullable by design — see Javadoc
     }
 
     // ------------------------------------------------------------------
@@ -311,12 +345,84 @@ public final class WsPublishHandler {
             return; // ACCESS_REFUSED frame already emitted
         }
 
+        serializeQuotaAndFanOut(parsed, matchedQueues, ctx, publishId, vhost);
+    }
+
+    /**
+     * TASK-WS3.06: tail steps of {@link #handlePublish} — serialize, produce
+     * quota check, and fan-out. Extracted to keep the entry point under the
+     * checkstyle NPath complexity budget.
+     */
+    private void serializeQuotaAndFanOut(ParsedPublish parsed, Set<String> matchedQueues,
+                                         WsConnectionContext ctx, Long publishId, String vhost) {
         WsMessageSerializer.SerializedMessage serialized = serializeOrError(parsed, ctx, publishId, vhost);
         if (serialized == null) {
             return;
         }
-
+        // TASK-WS3.06: produce byte-rate quota check. Runs AFTER serialization
+        // so we know the exact byte cost, and BEFORE fan-out so an over-quota
+        // publish does not hit the sink for any of its matched queues. When
+        // throttled, the handler emits a QUOTA_EXCEEDED frame (carrying the
+        // suggested retryAfterMs) and skips produce entirely — publisher
+        // confirms are not emitted because the broker did not accept the
+        // message.
+        if (!isProduceQuotaOk(serialized, ctx, publishId)) {
+            return;
+        }
         fanOut(matchedQueues, serialized, ctx, publishId);
+    }
+
+    /**
+     * TASK-WS3.06: checks the produce byte-rate quota. Returns {@code true}
+     * when under quota (or no quota manager is wired); otherwise emits a
+     * {@code QUOTA_EXCEEDED} error frame and returns {@code false}.
+     */
+    private boolean isProduceQuotaOk(WsMessageSerializer.SerializedMessage serialized,
+                                     WsConnectionContext ctx, Long publishId) {
+        if (quotaManager == null) {
+            return true;
+        }
+        long bytes = serializedByteCost(serialized);
+        String clientId = ctx.principal() == null ? null : ctx.principal().getName();
+        long throttleMs = quotaManager.checkProduceQuota(clientId, bytes);
+        if (throttleMs <= 0) {
+            return true;
+        }
+        emitQuotaExceeded(ctx, publishId, throttleMs);
+        return false;
+    }
+
+    /**
+     * TASK-WS3.06: cheap byte-cost estimate for the produce quota check. We
+     * count the key + value bytes plus an 8-byte-per-header fixed overhead so
+     * small payloads with many headers still get a non-zero cost. Good enough
+     * for the rate-limiting heuristic; Kafka's authoritative accounting runs
+     * on the broker side when the record actually lands.
+     */
+    private static long serializedByteCost(WsMessageSerializer.SerializedMessage s) {
+        long key = s.key() == null ? 0L : s.key().length;
+        long value = s.value() == null ? 0L : s.value().length;
+        long headers = s.headers() == null ? 0L : 8L * s.headers().size();
+        return key + value + headers;
+    }
+
+    /**
+     * TASK-WS3.06: emit a {@code QUOTA_EXCEEDED} error frame carrying the
+     * broker-supplied throttle hint.
+     */
+    private void emitQuotaExceeded(WsConnectionContext ctx, Long publishId, long retryAfterMs) {
+        ObjectNode frame = MAPPER.createObjectNode();
+        frame.put("type", "error");
+        frame.put("errorCode", ERR_QUOTA_EXCEEDED);
+        frame.put("errorMessage", "Produce byte-rate quota exceeded");
+        frame.put("retryAfterMs", retryAfterMs);
+        if (publishId != null) {
+            frame.put("publishId", publishId.longValue());
+        }
+        sendFrame(ctx, frame);
+        if (metrics != null) {
+            metrics.errorRate.mark();
+        }
     }
 
     /**

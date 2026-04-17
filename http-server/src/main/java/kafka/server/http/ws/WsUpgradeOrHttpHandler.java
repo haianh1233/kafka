@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 // Time: Created - TASK-WS1.03
+// Time: Update - TASK-WS3.06 - added connection limit enforcement (WsResourceLimitManager)
 // Time: Update - TASK-WS3.07 - added drain support
 package kafka.server.http.ws;
 
@@ -36,6 +37,7 @@ import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.QueryStringDecoder;
+import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.WebSocketFrameAggregator;
 import io.netty.handler.codec.http.websocketx.WebSocketServerHandshaker;
@@ -105,11 +107,25 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
             "\"exchange.direct\",\"exchange.topic\",\"exchange.fanout\","
           + "\"exchange.headers\",\"publisher-confirms\",\"credits\"";
 
+    /**
+     * WebSocket close code used when the broker is at its
+     * {@code ws.max.connections.per.broker} cap (design doc §19.5 /
+     * TASK-WS3.06). Close codes 4000-4999 are reserved for application use;
+     * 4429 mirrors HTTP 429 "Too Many Requests".
+     */
+    static final int CLOSE_CODE_CONNECTION_LIMIT = 4429;
+
     private final WsConfigs wsConfigs;
     private final int brokerId;
     private final String clusterId;
     private final KafkaPrincipalBuilder principalBuilder;
     private final SecurityProtocol securityProtocol;
+    /**
+     * TASK-WS3.06: optional resource limit manager enforcing
+     * {@code ws.max.connections.per.broker}. {@code null} disables the check
+     * for tests that focus on upgrade mechanics.
+     */
+    private final WsResourceLimitManager resourceLimitManager;
 
     /**
      * TASK-WS3.07: when set, new WebSocket upgrade requests are rejected with
@@ -124,11 +140,29 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
             String clusterId,
             KafkaPrincipalBuilder principalBuilder,
             SecurityProtocol securityProtocol) {
+        this(wsConfigs, brokerId, clusterId, principalBuilder, securityProtocol, null);
+    }
+
+    /**
+     * Full constructor (TASK-WS3.06). The {@code resourceLimitManager} enforces
+     * {@code ws.max.connections.per.broker} — when the broker is at capacity,
+     * upgrade requests complete the handshake, immediately emit a WebSocket
+     * close frame with code {@link #CLOSE_CODE_CONNECTION_LIMIT}, and close
+     * the channel. {@code null} disables the check.
+     */
+    public WsUpgradeOrHttpHandler(
+            WsConfigs wsConfigs,
+            int brokerId,
+            String clusterId,
+            KafkaPrincipalBuilder principalBuilder,
+            SecurityProtocol securityProtocol,
+            WsResourceLimitManager resourceLimitManager) {
         this.wsConfigs = Objects.requireNonNull(wsConfigs, "wsConfigs");
         this.brokerId = brokerId;
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
         this.principalBuilder = Objects.requireNonNull(principalBuilder, "principalBuilder");
         this.securityProtocol = Objects.requireNonNull(securityProtocol, "securityProtocol");
+        this.resourceLimitManager = resourceLimitManager;
     }
 
     /**
@@ -172,10 +206,26 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
             return;
         }
 
+        // TASK-WS3.06: enforce ws.max.connections.per.broker. When at capacity
+        // we complete the WS handshake so the client sees a proper WebSocket
+        // close frame with code 4429 (mirroring HTTP 429), then close the
+        // channel. The alternative — rejecting pre-handshake with HTTP 429 —
+        // leaves well-behaved WS clients without the close code they expect
+        // per design §19.5.
+        boolean limited = resourceLimitManager != null && !resourceLimitManager.tryReserveConnection();
+        if (limited) {
+            log.info("WebSocket upgrade rejected — connection limit reached ({})",
+                resourceLimitManager.maxConnectionsPerBroker());
+        }
+
         try {
-            upgradeToWebSocket(ctx, req);
+            upgradeToWebSocket(ctx, req, limited);
         } catch (RuntimeException e) {
             log.warn("WebSocket upgrade failed", e);
+            if (!limited && resourceLimitManager != null) {
+                // Upgrade threw AFTER we reserved a slot — release it.
+                resourceLimitManager.recordConnectionClose();
+            }
             sendHttpErrorAndClose(ctx, HttpResponseStatus.BAD_REQUEST);
         }
     }
@@ -240,7 +290,7 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
     //  Internal
     // ------------------------------------------------------------------
 
-    private void upgradeToWebSocket(ChannelHandlerContext ctx, FullHttpRequest req) {
+    private void upgradeToWebSocket(ChannelHandlerContext ctx, FullHttpRequest req, boolean connectionLimited) {
         // 1. Build the principal from the upgrade request — same path as HTTP.
         KafkaPrincipal principal = buildPrincipal(ctx);
         String vhost = extractVhost(req);
@@ -254,6 +304,10 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
         if (handshaker == null) {
             // Unsupported WebSocket version — Netty helpfully writes the error.
             WebSocketServerHandshakerFactory.sendUnsupportedVersionResponse(ctx.channel());
+            // TASK-WS3.06: release the reserved slot (non-limited path only).
+            if (!connectionLimited && resourceLimitManager != null) {
+                resourceLimitManager.recordConnectionClose();
+            }
             return;
         }
 
@@ -264,7 +318,24 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
         handshakeFuture.addListener((ChannelFutureListener) future -> {
             if (!future.isSuccess()) {
                 log.warn("WebSocket handshake failed", future.cause());
+                // TASK-WS3.06: release the reserved slot on handshake failure
+                // (non-limited path only — we never reserved in the limited
+                // case).
+                if (!connectionLimited && resourceLimitManager != null) {
+                    resourceLimitManager.recordConnectionClose();
+                }
                 ctx.close();
+                return;
+            }
+
+            // TASK-WS3.06: if we're at the connection cap, emit the 4429 close
+            // frame immediately after the handshake completes and shut the
+            // channel down. We do NOT rewire the pipeline or emit the
+            // `connected` frame — the client never gets to send any WS frames.
+            if (connectionLimited) {
+                CloseWebSocketFrame closeFrame = new CloseWebSocketFrame(
+                    CLOSE_CODE_CONNECTION_LIMIT, "connection limit reached");
+                ctx.writeAndFlush(closeFrame).addListener(ChannelFutureListener.CLOSE);
                 return;
             }
 
@@ -293,6 +364,14 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
             // 5. Emit `connected` frame.
             String connectedJson = buildConnectedJson(sessionId);
             ctx.writeAndFlush(new TextWebSocketFrame(connectedJson));
+
+            // TASK-WS3.06: decrement the connection counter when the channel
+            // eventually closes — this keeps the counter accurate across
+            // graceful shutdowns, client disconnects, and abrupt network drops.
+            if (resourceLimitManager != null) {
+                ctx.channel().closeFuture().addListener((ChannelFutureListener) closed ->
+                    resourceLimitManager.recordConnectionClose());
+            }
 
             // Finally, remove ourselves — no more HTTP requests on this channel.
             removeIfPresent(pipeline, HANDLER_NAME);

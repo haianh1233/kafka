@@ -16,6 +16,7 @@
  */
 
 // Time: Created - TASK-WS1.15
+// Time: Update - TASK-WS3.06 - added fetch byte-rate quota (silent throttle)
 // Time: Update - TASK-WS3.08 - added metrics recording
 // Time: Update - TASK-WS4.02 - added per-message TTL check at delivery
 // Time: Update - TASK-WS4.03 - added priority-ordered delivery
@@ -95,6 +96,20 @@ public final class WsConsumerFetchLoop implements Runnable {
      * Set at construction time from {@link WsPriority#maxPriorityFromQueueArgs}.
      */
     private final int queueMaxPriority;
+    /**
+     * TASK-WS3.06: optional fetch byte-rate quota manager. {@code null} leaves
+     * the loop in its pre-3.06 behaviour. When present, a throttled fetch
+     * causes the loop to park for the broker-suggested interval before the
+     * next iteration — no error frame is sent to the client per design §19.4.
+     */
+    private final WsQuotaManager quotaManager;
+    /**
+     * TASK-WS3.06: clientId used when consulting {@link #quotaManager}.
+     * Typically the authenticated principal name — supplied by the owning
+     * subscription manager at construction time. Null disables the quota
+     * lookup.
+     */
+    private final String clientId;
     private final AtomicBoolean active = new AtomicBoolean(true);
 
     /**
@@ -142,6 +157,28 @@ public final class WsConsumerFetchLoop implements Runnable {
                                boolean noAck,
                                WsMetrics metrics,
                                int queueMaxPriority) {
+        this(subscriptionId, topic, startOffsets, creditManager, tagTracker,
+            channel, noAck, metrics, queueMaxPriority, /*quotaManager*/ null, /*clientId*/ null);
+    }
+
+    /**
+     * Full constructor with quota enforcement (TASK-WS3.06). The
+     * {@code quotaManager} is consulted after each fetch iteration; when it
+     * returns a non-zero throttle the loop sleeps for that duration before
+     * the next iteration — no error frame is emitted to the client
+     * (design §19.4).
+     */
+    public WsConsumerFetchLoop(String subscriptionId,
+                               String topic,
+                               Map<TopicPartition, Long> startOffsets,
+                               WsCreditManager creditManager,
+                               WsDeliveryTagTracker tagTracker,
+                               Channel channel,
+                               boolean noAck,
+                               WsMetrics metrics,
+                               int queueMaxPriority,
+                               WsQuotaManager quotaManager,
+                               String clientId) {
         this.subscriptionId = Objects.requireNonNull(subscriptionId, "subscriptionId");
         this.topic = Objects.requireNonNull(topic, "topic");
         Objects.requireNonNull(startOffsets, "startOffsets");
@@ -155,6 +192,8 @@ public final class WsConsumerFetchLoop implements Runnable {
         // the loop treats the queue as non-priority and never calls into sort.
         int clamped = Math.max(0, Math.min(queueMaxPriority, WsPriority.MAX_PRIORITY_CAP));
         this.queueMaxPriority = clamped;
+        this.quotaManager = quotaManager; // nullable
+        this.clientId = clientId; // nullable
     }
 
     /**
@@ -232,6 +271,42 @@ public final class WsConsumerFetchLoop implements Runnable {
      */
     protected void doFetchIteration(int fetchBudget) throws InterruptedException {
         // Intentionally empty — TASK-WS1.16 wires the fetch integration.
+    }
+
+    /**
+     * TASK-WS3.06: apply the fetch byte-rate quota for a freshly-fetched batch.
+     *
+     * <p>The fetch integration (TASK-WS1.16 subclass) calls this AFTER reading
+     * a batch from Kafka and BEFORE delivering its records. When the broker
+     * indicates a throttle, the loop sleeps for the suggested duration
+     * silently — no error frame is emitted to the client per design §19.4.
+     *
+     * <p>No-op when the loop was constructed without a quota manager or
+     * client id.
+     *
+     * @param deliveredBytes total bytes just read from Kafka for this
+     *                       subscription
+     * @return the throttle-time in milliseconds actually applied (0 if the
+     *         client was under quota or quota is disabled). Exposed for tests.
+     * @throws InterruptedException if interrupted while sleeping
+     */
+    public long applyFetchThrottle(long deliveredBytes) throws InterruptedException {
+        if (quotaManager == null || clientId == null || deliveredBytes <= 0) {
+            return 0L;
+        }
+        long throttleMs = quotaManager.checkFetchQuota(clientId, deliveredBytes);
+        if (throttleMs <= 0) {
+            return 0L;
+        }
+        // Cap the pause at a sensible upper bound so cancellation is always
+        // observable within ~CREDIT_WAIT_TIMEOUT_MS * N iterations.
+        long remaining = throttleMs;
+        while (remaining > 0 && active.get()) {
+            long step = Math.min(remaining, CREDIT_WAIT_TIMEOUT_MS);
+            Thread.sleep(step);
+            remaining -= step;
+        }
+        return throttleMs;
     }
 
     /**
