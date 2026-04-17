@@ -602,19 +602,31 @@ cd /home/anh/kafka && ./gradlew :http-server:test --tests 'kafka.server.http.ws.
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Netty `channel.writeAndFlush` from non-Netty thread is genuinely safe** — Netty re-schedules the write on the channel's event loop internally, so the fetch loop can call it directly without wrapping in `channel.eventLoop().execute(...)`. Re-wrapping would actually be wasteful.
+- **Cancellation latency is bounded by `CREDIT_WAIT_TIMEOUT_MS` (500ms).** Using `awaitCredits` with a finite timeout instead of an unbounded park is what makes `stop()` return promptly. The test `run_exitsPromptlyOnStop` verifies this empirically — loop exits under 2s.
+- **`wsConsumerExecutor` is injected as `Executor`, not owned.** The manager takes `Executor` (the minimal interface that supports `execute(Runnable)`) to make tests trivial — any lambda-compatible pool can be passed, including a tracking wrapper that observes scheduling order.
+- **Rollback on `RejectedExecutionException`** — `subscribe()` registers the context in the map FIRST, then submits the runnable. If the executor rejects (shutdown race), we must roll back the map entry so the subscription does not look "active" to subsequent calls. This is a subtle correctness bug that only surfaces during shutdown.
+- **Offset-merge semantics of `cancelAll`** — when multiple subscriptions touch the same `TopicPartition`, `max` is the right merge: committing a higher offset than another subscription saw is safe for at-least-once semantics.
+- **`WsDeliveryTagTracker.getCommittableOffsets()` is destructive** — it prunes the ack bitmap below the returned watermark. `unsubscribe` must call it BEFORE `clear()` or the offsets are lost to callers.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **`doFetchIteration` is a protected no-op hook** — the actual Kafka fetch integration (`RequestChannel → KafkaApis → FetchResponse → deliverRecord`) is deferred to TASK-WS1.16 per the task brief. The current structure is production-ready from a lifecycle/threading/flow-control perspective; only the record source is pending.
+- **Per-message TTL check (design §12.4) moved to caller** — the fetch loop does not see raw Kafka records (the deserialiser produces message JSON strings), so TTL expiration is the caller's responsibility: on TTL hit, caller skips `deliverRecord` while still advancing its read offset so the record is not redelivered.
+- **No per-connection subscription cap enforced here** — `wsMaxSubscriptionsPerConnection` (from `WsConfigs`) is NOT checked in the manager. Per design, this policy lives in `WsFrameHandler` (TASK-WS1.04) which rejects excess `subscribe` frames before calling the manager.
+- **Delivery frame is hand-rolled JSON** — built with `String.format` instead of the Jackson-based `WsMessageSerializer`. The deliver-frame envelope is fixed-shape, and the `messageJson` payload is inserted raw (not re-escaped). A future cleanup could route through `WsMessageSerializer` for consistency.
+- **`subscribe_schedulesFetchLoop` test observes scheduling via a wrapping `ThreadPoolExecutor.execute` override** — the only way to deterministically assert the runnable hits the executor without a timing-sensitive wait on observable state.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- **Tests added:** 30 total — `WsConsumerFetchLoopTest` (13) + `WsSubscriptionManagerTest` (17). All green in 20s against a warm Gradle; only the `:http-server` module built.
+- **Concurrency test** (`concurrent_subscribeUnsubscribe_maintainsConsistency`) runs 8 threads × 20 subscribe/grant/unsubscribe cycles each (160 churn cycles) and asserts `activeCount == 0` at the end — stresses the `ConcurrentHashMap` + `putIfAbsent`/`remove` protocol.
+- **Stale-worktree trap:** the agent initially wrote files to `/home/anh/kafka/` (main checkout) instead of the per-task worktree `/home/anh/kafka/.claude/worktrees/agent-a1c2d2e2/`. Absolute paths must use the worktree prefix — forgetting this looks like "Write succeeded" but the worktree compile picks up nothing. Recovered by deleting the stray files from main and re-writing to the worktree. No cross-contamination with sibling agents' untracked files (`WsConnectionContext.java` etc. remain untouched).
+- **`Executor` vs `ExecutorService` choice:** the skeleton in the task spec used `ExecutorService`, but the manager only calls `execute(Runnable)`. Downgrading to `Executor` simplifies testing (wrap-and-track via override of `execute`) without losing functionality.
 
 ---
 
@@ -635,9 +647,14 @@ _To be filled by the executing agent._
 > Filled by the executing agent after each commit.
 > Run: `git diff --name-status HEAD~1 HEAD -- '*.java' '*.xml' '*.json' '*.yaml' '*.yml'`
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-17 — WsConsumerFetchLoop + WsSubscriptionManager (commit ee1266cad1)
+
 Created:
-  - path/to/NewFile.java — <what it does>
+  - http-server/src/main/java/kafka/server/http/ws/SubscriptionContext.java — per-subscription state container bundling id, queue/topic names, WsDeliveryTagTracker, WsCreditManager, WsConsumerFetchLoop.
+  - http-server/src/main/java/kafka/server/http/ws/WsConsumerFetchLoop.java — Runnable fetch loop; credit-gated, cancellation-aware, noAck-aware; writes deliver frames to the channel and advances offsets; protected `doFetchIteration` hook for TASK-WS1.16 Kafka wiring.
+  - http-server/src/main/java/kafka/server/http/ws/WsSubscriptionManager.java — per-connection subscription registry with subscribe/unsubscribe/grantCredits/cancelAll/activeCount/getSubscription; rolls back on `RejectedExecutionException`; `cancelAll` returns merged committable offsets.
+  - http-server/src/test/java/kafka/server/http/ws/WsConsumerFetchLoopTest.java — 13 tests covering construction, lifecycle (stop/isActive), deliverRecord happy path, noAck mode, monotonic tags, redelivered flag, prompt stop, channel-close exit, no busy-spin, immutable offset snapshot.
+  - http-server/src/test/java/kafka/server/http/ws/WsSubscriptionManagerTest.java — 17 tests covering construction, subscribe, duplicate rejection, executor dispatch observation, unsubscribe/offsets, grantCredits forwarding, cancelAll with merged offsets, 8-thread × 20-cycle concurrent subscribe/unsubscribe consistency.
+
 Modified:
-  - path/to/Existing.java — <what changed>
--->
+  - ivy-docs/tasks/TASK-WS1.15-ws-consumer-fetch-loop.md — Learning / Limitations / Field Notes / File Manifest.
