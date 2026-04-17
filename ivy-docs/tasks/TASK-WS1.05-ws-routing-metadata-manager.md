@@ -590,35 +590,45 @@ timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.ws.WsRoutingM
 
 ## Learning
 
-_To be filled by the executing agent._
+- `JsonNode.fields()` is deprecated in the version of Jackson wired through the clients transitive dependency; use `JsonNode.fieldNames()` + `path(name)` for iterating object entries instead.
+- Binding keys embed the routing key which may itself contain `:`. The replay parser handles this by scanning left-to-right for the first three segments (vhost, exchange, queue) and then peeling the last segment (argsHash) off the right; everything in between is the routing key.
+- For concurrency correctness, the in-memory cache uses `ConcurrentHashMap` plus `compute`/`computeIfPresent` to atomically mutate the per-exchange binding list. Tests that spawn N threads calling `writeExchange`/`writeBinding` observe no lost updates (cache size = threads * writes). Test fixtures using `Collections.synchronizedList` were required because the test-side record-capture list is also hit by concurrent callers.
+- `GroupCoordinator`-style replay is exercised end-to-end in tests (`writeThenReplayViaAppliedRecords_rebuildsCache`, `writeThenDelete_replayReflectsDelete`) — write records through the manager, snapshot the bytes a producer would see, feed them to a fresh manager via `applyRecord`, and verify cache equality including tombstones.
+- `HttpRequestTranslator.MAPPER` is reused so that JSON deserialization in the routing manager honors the same `FAIL_ON_UNKNOWN_PROPERTIES=false` + nesting/length caps that the HTTP layer uses.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- The manager is deliberately producer/consumer-agnostic in this task: the `recordWriter` is a `BiConsumer<String, byte[]>` and replay is driven externally via `applyRecord`. Wiring a real Kafka producer, creating the `__ws_routing_metadata` topic, and driving startup replay are deferred to a follow-up integration task. `isReplayComplete()`/`markReplayComplete()` exist as the hook for that task.
+- `deleteExchange()` also drops any bindings cached under that exchange, but it does NOT emit tombstones for those bindings on the Kafka topic. If a separate broker replays only the exchange tombstone without its binding tombstones, it could momentarily resurrect orphan bindings. Emitting cascading binding tombstones belongs in the higher-level exchange-delete workflow and is intentionally out of scope for the metadata manager.
+- `argsHash` uses `Objects.hash(TreeMap.toString())` which is deterministic but has a narrow 32-bit range; in extreme cases two distinct argument maps could collide on the binding key. The test `argsHash_differentArgsDifferentHash` guards the common case. A stronger hash (e.g. SHA-256 truncated) could be swapped in without changing the wire format.
+- Vhost names that contain `:` are not escaped in the key. The keyspace assumes no colons in vhost, exchange, or queue names; routing keys are allowed to contain colons because the replay parser peels the argsHash off the right.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- The worktree started from `feature/http-protocol` at `dd6ffa4e16`. That commit already included merged WS1.09/10/13/14 so `WsMessageSerializer`, `WsMessageDeserializer`, `WsDeliveryTagTracker`, `WsCreditManager`, and `WsConfigs` were present — nothing to re-create.
+- `http-server` checkstyle flags `new String[] { ... }` (whitespace after `{`) — wrote as `new String[]{...}` to pass.
+- `http-server` uses `-Werror`. Any compiler warning (e.g. deprecation) fails the build. Stuck to non-deprecated Jackson APIs (`fieldNames()` not `fields()`).
+- Confirmed that running `./gradlew :http-server:test --tests 'kafka.server.http.ws.WsRoutingMetadataManagerTest'` exercises `checkstyleMain`, `checkstyleTest`, and `spotbugsMain` as part of the test task graph, so the single command covers all quality gates for this task.
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] `WsRoutingMetadataManager.java` exists at `http-server/src/main/java/kafka/server/http/ws/WsRoutingMetadataManager.java`
-- [ ] `ExchangeMetadata.java`, `QueueMetadata.java`, `BindingMetadata.java` exist in same package
-- [ ] Key format: `exchange:{vhost}:{name}`, `queue:{vhost}:{name}`, `binding:{vhost}:{exchange}:{queue}:{routingKey}:{argsHash}`
-- [ ] `writeExchange()` persists to writer AND updates cache
-- [ ] `deleteExchange()` writes tombstone (null) AND removes from cache
-- [ ] `applyRecord()` handles both write and tombstone cases
-- [ ] `argsHash()` is deterministic regardless of map iteration order
-- [ ] `isReplayComplete()` / `markReplayComplete()` work correctly
-- [ ] `timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.ws.WsRoutingMetadataManagerTest"` exits 0
-- [ ] Learning section filled with at least one entry
-- [ ] Limitations section filled (use "None" if truly none)
+- [x] `WsRoutingMetadataManager.java` exists at `http-server/src/main/java/kafka/server/http/ws/WsRoutingMetadataManager.java`
+- [x] `ExchangeMetadata.java`, `QueueMetadata.java`, `BindingMetadata.java` exist in same package
+- [x] Key format: `exchange:{vhost}:{name}`, `queue:{vhost}:{name}`, `binding:{vhost}:{exchange}:{queue}:{routingKey}:{argsHash}`
+- [x] `writeExchange()` persists to writer AND updates cache
+- [x] `deleteExchange()` writes tombstone (null) AND removes from cache
+- [x] `applyRecord()` handles both write and tombstone cases
+- [x] `argsHash()` is deterministic regardless of map iteration order
+- [x] `isReplayComplete()` / `markReplayComplete()` work correctly
+- [x] `timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.ws.WsRoutingMetadataManagerTest"` exits 0
+- [x] Learning section filled with at least one entry
+- [x] Limitations section filled (use "None" if truly none)
 
 ---
 
