@@ -413,19 +413,32 @@ cd /home/anh/kafka && ./gradlew :http-server:test --tests 'kafka.server.http.ws.
 
 ## Learning
 
-_To be filled by the executing agent._
+- **`getAndUpdate` is the idiomatic floor-at-zero decrement.** `decrementAndGet` can go negative under concurrent consume before a reader reads, requiring a retry loop. `getAndUpdate(c -> c > 0 ? c - 1 : 0)` does it atomically in one CAS cycle and the return value (prev) tells us whether a credit was actually available.
+- **`LockSupport.parkNanos` is used as a sleep, not for handoff.** There is no `unpark` when credits are granted — the 10ms polling interval is what guarantees bounded wakeup latency. This keeps the API lock-free on the grant side (`grant()` is only an `addAndGet`, safe from the Netty event loop) at the cost of up to 10ms latency on cross-thread wakeup. The concurrent tests confirmed the 10ms window is fast enough to meet a 2s latch.
+- **`channel.isWritable()` is treated as a gate equivalent to "credits == 0."** Even if the client has granted credits, pushing data into a full Netty write buffer would defeat the backpressure. By blending both signals into a single `awaitCredits` return value, the fetch loop doesn't need two separate checks.
+- **Deadline-based timeout, not remaining decrement.** Computing `deadline = nanoTime() + timeoutNanos` once at entry and comparing against `nanoTime()` each loop prevents drift from the 10ms polling interval accumulating across iterations.
+- **Zero-credits is a valid initial state.** The task spec permits `initialCredits = 0` (consumer must grant before receiving anything). Only strictly negative is rejected.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **Polling instead of explicit unpark.** `grant()` could `LockSupport.unpark(waiterThread)` for instantaneous wakeup, but that requires tracking the waiter thread reference with additional synchronization, complicating the API. 10ms latency is acceptable for WebSocket delivery pacing.
+- **Single-waiter assumption.** The design doc makes this per-subscription, so only one fetch loop ever calls `awaitCredits`. If multiple threads called it simultaneously they would all wake on the same credit increment and race in `consume()`. Correctness still holds (consume is atomic floor-at-zero), but efficiency would degrade.
+- **No bounded cap on credits.** The spec doesn't enforce a maximum, so a malicious/buggy client could grant `Integer.MAX_VALUE` and cause overflow on `addAndGet`. A future `ws.max.credits` config (referenced in TASK-WS1.01) would add this bound — out of scope here.
+- **`reset()` does not unblock a waiter on another thread.** After reset, the waiter keeps polling until timeout. This is intentional: reset is called on close and the caller is responsible for also interrupting the fetch loop. Adding wakeup would require tracking a parked thread.
+- **Pre-existing branch compilation issue (not caused by this task).** `http-server/src/main/scala/kafka/network/HttpRequestHandler.scala` references Java symbols that don't exist on the current Java API (`HttpRouter.validateClientId`, `HttpRouter.HandlerType`, `HttpResponseSerializer.serialize`, `HttpRequestTranslator.translateCommitOffsets`, etc.) — and `http-server/src/main/scala/kafka/server/http/HttpRouter.scala` defines a Scala object that shadows the Java `HttpRouter` class in the same package. `compileScala` fails with 23 errors out-of-the-box on branch HEAD. Tests were run with `-x compileScala -x compileTestScala` to bypass; the Java side (WsCreditManager + test) compiles cleanly on its own.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- **TDD cycle:** test file written first (22 methods compiled against nothing and failed with "cannot find symbol"); production class written second; tests ran green on first attempt.
+- **Concurrent test tuned for invariants, not exact counts.** The test runs 4 grant threads × 1000 grants and 4 consume threads × 1000 consume attempts (with no blocking). Since consumers can race ahead and observe zero credits, the exact invariant `granted == consumed + remaining` is verified, plus `remaining >= 0` and `consumed <= granted`. No flaky time-based assertions.
+- **`awaitCredits_unblocksWhenChannelBecomesWritable`** mirrors the grant-unblock test and ensures the writability gate is symmetric with the credits gate.
+- **Mockito for Channel.** The Netty `Channel` interface has many methods; only `isWritable()` is needed.
+- Test runs in ~200ms including the concurrent test; well below any reasonable CI budget.
+- Run command requires Scala excludes on this branch: `./gradlew :http-server:test --tests 'kafka.server.http.ws.WsCreditManagerTest' -x compileScala -x compileTestScala`.
 
 ---
 
@@ -452,3 +465,9 @@ Created:
 Modified:
   - path/to/Existing.java — <what changed>
 -->
+
+### 2026-04-17 — WS1.14 WsCreditManager (commit 364438b49c)
+
+Created:
+  - http-server/src/main/java/kafka/server/http/ws/WsCreditManager.java — per-subscription credit counter with `grant`/`consume`/`awaitCredits`/`available`/`reset`; lock-free via `AtomicInteger`, blocking via `LockSupport.parkNanos` (10ms polling); additionally gates on Netty `Channel.isWritable()`
+  - http-server/src/test/java/kafka/server/http/ws/WsCreditManagerTest.java — 22 unit tests covering basic state, consume floor-at-zero, grant validation, awaitCredits (immediate/zero-timeout/timeout/writability gate/cross-thread unblock-on-grant/cross-thread unblock-on-writable), reset, constructor validation, 8-thread concurrent grant/consume invariant
