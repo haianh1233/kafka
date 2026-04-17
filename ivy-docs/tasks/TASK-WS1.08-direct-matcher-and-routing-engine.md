@@ -659,19 +659,33 @@ private void routeRecursive(String exchange, String routingKey, Map<String, Stri
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Strategy pattern via functional interfaces, not an interface hierarchy.** The task-file spec treats `DirectMatcher` as a concrete final class rather than an implementation of an `ExchangeMatcher` interface. Using a plain class is lower-ceremony and still keeps the extension point (a new field + case branch in `matchQueueBindings`) equivalent to adding a new matcher, while avoiding premature abstraction ahead of WS2.01–WS2.03 where the other matcher contracts become concrete.
+- **Route-root vs. e2e destination is a single boolean flag.** The design doc frames the root call as "throw on unknown exchange" and e2e recursion as "skip dangling destinations." Threading a `rootCall` boolean through `routeRecursive` keeps the recursion one method instead of two, and makes the branch symmetry (error vs. warn) obvious at the call site.
+- **`HashSet.add()` is the correct cycle guard.** `visited.contains(x); visited.add(x)` races with itself in the sense that future edits may accidentally reverse or drop one side. `if (!visited.add(exchange)) return;` is atomic for the single-thread recursion and matches the ivy-ref `Amqp091RoutingEngine` pattern exactly.
+- **Checkstyle NPath complexity is cumulative across nested branches.** The original one-method recursion hit 900 (max 500) because each switch-case arm multiplied by each subsequent conditional. Splitting into `resolveType`, `matchQueueBindings`, `recurseE2E`, and `e2eMatches` brought it under budget and improved readability. Future task files that touch this file should be aware: keep per-method branching shallow.
+- **`Map.of()` as the `Map<String, String>` arg to `Binding`/`E2EBinding` works because the record canonical constructor provides the target type** — no explicit type witnesses are needed in tests.
+- **Per-call HashMap rebuild is fine for Phase 1.** The design doc explicitly notes the `HashMap<String, List<String>>` index is rebuilt per call; optimization (cache + invalidation on binding mutations) is deferred. This keeps `DirectMatcher` stateless and trivially thread-safe.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- Only the `direct` exchange type routes real matches. `topic`, `fanout`, and `headers` throw `UnsupportedOperationException` (stubs for WS2.01 / WS2.02 / WS2.03 respectively).
+- E2E recursion match rules are only implemented for `direct` source exchanges. When fanout/topic e2e bindings are added later, the source-exchange branch in `matchQueueBindings` will throw before `recurseE2E` is ever reached — so e2e semantics for those types are effectively unreachable today and are deferred to WS2.01–WS2.03.
+- The direct matcher rebuilds its routing-key index on every `match()` call. For high-fan-in exchanges this is O(n) per publish instead of O(1); caching + invalidation is out of scope for Phase 1.
+- Headers parameter is ignored by `DirectMatcher` (and therefore for all direct routing). That is spec-correct — direct type does not use headers — but it means `route()` silently accepts any `Map<String, String>` for direct exchanges without validation.
+- No integration with the real `ExchangeManager` / `BindingManager` yet — the engine accepts functional lookups so WsPublishHandler (WS1.11) can wire them in. Any mismatch between the manager APIs and these function signatures is detected at that integration site, not here.
+- Default exchange (empty-string name `""`) is not a built-in special case in this engine. The task-file spec does not carve it out; it is expected to be registered as a normal `direct` exchange with a default binding whose routing key equals the queue name. The prompt text's mention of "default exchange routes to queue named == routingKey" is not part of the authoritative task-file contract for WS1.08 and is therefore not implemented here.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- `Binding` and `E2EBinding` use `Map<String, String> arguments`, not `Map<String, Object>` as the prompt text implied. Test data and signatures were aligned to the record definitions in the worktree.
+- First build attempt failed checkstyle `NPathComplexity` at 900; fix was extracting the switch + loop into helper methods. Future additions to the switch (topic/fanout/headers real matchers) must re-check this budget.
+- Ran only the two targeted test classes as required (`--tests 'kafka.server.http.routing.DirectMatcherTest' --tests 'kafka.server.http.routing.RoutingEngineTest'`); no full `http-server` or module-wide test runs.
+- Initial worktree HEAD was stale (`f95a1f995d`, a Kafka mainline commit), not on `feature/http-protocol`; required `git fetch origin && git reset --hard origin/feature/http-protocol` to reach `3ce20e84db`.
+- Included an extra test `route_e2eDanglingDestination_silentlyIgnored` that was not in the spec table — documents the root-vs-e2e error asymmetry and protects the warn-only branch in `resolveType`.
 
 ---
 
@@ -695,9 +709,13 @@ _To be filled by the executing agent._
 
 > Filled by the executing agent after each commit.
 
-<!-- ### YYYY-MM-DD — <short description> (commit <hash>)
+### 2026-04-17 — WS1.08 DirectMatcher + RoutingEngine initial implementation (commit 1602d0df4e)
+
 Created:
-  - path/to/NewFile.java — <what it does>
+  - http-server/src/main/java/kafka/server/http/routing/DirectMatcher.java — stateless matcher that returns the set of queues whose binding routing key exactly equals the message routing key; rebuilds a `HashMap<String, List<String>>` index per call
+  - http-server/src/main/java/kafka/server/http/routing/RoutingEngine.java — top-level router with functional dependencies on ExchangeManager / BindingManager; dispatches per exchange type; recurses into e2e destinations with a `Set<String>` cycle guard; throws `IllegalArgumentException` on unknown root exchange and `UnsupportedOperationException` on Phase 1 stub types (topic/fanout/headers)
+  - http-server/src/test/java/kafka/server/http/routing/DirectMatcherTest.java — 10 unit tests covering exact match, no match, multi-queue same key, multi-binding single match, empty bindings, empty-string key, case sensitivity, null rejection, dedup
+  - http-server/src/test/java/kafka/server/http/routing/RoutingEngineTest.java — 20 unit tests covering direct routing, headers-ignored pass-through, unknown exchange, all three Phase 1 stub types, e2e recurse/no-recurse/cycle/combined/dangling, null exchange/routingKey/headers, and constructor null-fn rejection
+
 Modified:
-  - path/to/Existing.java — <what changed>
--->
+  - ivy-docs/tasks/TASK-WS1.08-direct-matcher-and-routing-engine.md — filled Learning / Limitations / Field Notes / File Manifest sections
