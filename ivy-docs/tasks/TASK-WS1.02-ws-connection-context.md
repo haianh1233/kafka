@@ -372,19 +372,27 @@ timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.ws.WsConnecti
 
 ## Learning
 
-_To be filled by the executing agent._
+- `Objects.requireNonNull(arg, "arg")` is the idiomatic constructor null-check; the NPE message matches the parameter name, which makes failure diagnosis trivial.
+- Netty's `ChannelHandlerContext.writeAndFlush(msg)` transfers ownership of the `ByteBuf`-backed frame to the pipeline. Tests that capture the frame via `ArgumentCaptor` MUST call `frame.release()` to avoid leak warnings.
+- `CloseWebSocketFrame` is followed by `ChannelFutureListener.CLOSE` so the TCP close happens only after the close frame has been flushed — otherwise peers see a TCP RST and lose the close reason.
+- `ConcurrentHashMap` + `AtomicBoolean` together cover all the mutable state needed for this class; no extra synchronisation blocks are required because each field's invariants are independent.
+- Mockito `any()` matcher on `writeAndFlush` is required because `close()` chains `.addListener` on the returned `ChannelFuture` — stubbing is mandatory, otherwise the mocked return value is `null` and `.addListener` throws NPE.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- `subscriptions()` returns the live mutable `ConcurrentHashMap`, not a defensive copy. This is intentional (callers mutate it) but means a misbehaving caller could clear the map. Acceptable for an internal-only type.
+- `sendFrame()` ignores the returned `ChannelFuture` — callers that need write-completion semantics (e.g. back-pressure on slow peers) will have to access `channel()` directly. Revisit once a WS back-pressure task lands.
+- The subscription value type is `Object`; a typed `WsSubscription` is deferred to the subscription-manager task per the spec.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Worktree cross-contamination: the main repo (`/home/anh/kafka`) had untracked leftover files from other concurrent worktrees (`WsSubscriptionManager.java`, `WsConsumerFetchLoop.java`, `WsRoutingMetadataManager.java`, `ExchangeMetadata.java`, `QueueMetadata.java`, `BindingMetadata.java`, `SubscriptionContext.java`, plus matching tests) that broke `:http-server:compileJava` in the main repo. They did NOT affect this worktree once commands were run from the worktree directory. Running gradle from the worktree path (`/home/anh/kafka/.claude/worktrees/agent-ac9570ee`) sees only files tracked by this branch plus my new ones.
+- Lesson: when writing files in a worktree session, ensure the absolute path is under the worktree root — `/home/anh/kafka/http-server/...` points to the *main* checkout, not the worktree.
+- Test count: 19 methods, all green. Thread-safety smoke test spins 8 threads x 500 ops on the subscriptions map; completes well under a second.
 
 ---
 
@@ -409,3 +417,13 @@ _To be filled by the executing agent._
 
 > Filled by the executing agent after each commit.
 > Run: `git diff --name-status HEAD~1 HEAD -- '*.java' '*.xml' '*.json' '*.yaml' '*.yml'`
+
+### Commit `db26df7e93` — feat: WS1.02 — WsConnectionContext
+
+```
+A	http-server/src/main/java/kafka/server/http/ws/WsConnectionContext.java
+A	http-server/src/test/java/kafka/server/http/ws/WsConnectionContextTest.java
+```
+
+- `WsConnectionContext.java` — per-connection state holder (final class, Netty+KafkaPrincipal, ConcurrentHashMap subscriptions, AtomicBoolean publish-confirms, sendFrame/close/isActive helpers).
+- `WsConnectionContextTest.java` — 19 tests; `:http-server:test --tests 'kafka.server.http.ws.WsConnectionContextTest'` BUILD SUCCESSFUL.
