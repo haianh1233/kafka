@@ -15,19 +15,25 @@
  * limitations under the License.
  */
 // Time: Created - TASK-WS1.04
+// Time: Update - TASK-WS3.05 - added ACL checks (WsAuthorizationHelper)
 package kafka.server.http.ws;
+
+import org.apache.kafka.common.acl.AclOperation;
+import org.apache.kafka.common.resource.ResourceType;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.SimpleChannelInboundHandler;
-import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Objects;
+
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
 
 /**
  * Parses incoming WebSocket JSON text frames and dispatches them by the
@@ -91,6 +97,12 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
     static final String ERR_PROTOCOL = "PROTOCOL_ERROR";
     static final String ERR_UNKNOWN_TYPE = "UNKNOWN_MESSAGE_TYPE";
     static final String ERR_INTERNAL = "INTERNAL_ERROR";
+    /** TASK-WS3.05: emitted on any ACL denial. */
+    static final String ERR_ACCESS_REFUSED = "ACCESS_REFUSED";
+    /** TASK-WS3.05: conventional CLUSTER resource name used by existing Kafka authorizers. */
+    static final String CLUSTER_RESOURCE_NAME = "kafka-cluster";
+    /** TASK-WS3.05: queue → topic prefix (mirrors the placeholder mapping used by {@link WsPublishHandler}). */
+    static final String WS_TOPIC_PREFIX = "ws.";
 
     // --- Message types -------------------------------------------------------
 
@@ -113,15 +125,27 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
     private final WsConnectionContext connectionContext;
     private final WsConfigs wsConfigs;
     private final WsMetrics metrics;
+    /**
+     * TASK-WS3.05: optional ACL authorization helper. {@code null} disables ACL
+     * checks for this handler — appropriate for unit tests that focus on
+     * dispatching / protocol parsing rather than authorization.
+     */
+    private final WsAuthorizationHelper authorizationHelper;
 
     public WsFrameHandler(WsConnectionContext connectionContext, WsConfigs wsConfigs) {
-        this(connectionContext, wsConfigs, null);
+        this(connectionContext, wsConfigs, null, null);
     }
 
     public WsFrameHandler(WsConnectionContext connectionContext, WsConfigs wsConfigs, WsMetrics metrics) {
+        this(connectionContext, wsConfigs, metrics, null);
+    }
+
+    public WsFrameHandler(WsConnectionContext connectionContext, WsConfigs wsConfigs, WsMetrics metrics,
+                          WsAuthorizationHelper authorizationHelper) {
         this.connectionContext = Objects.requireNonNull(connectionContext, "connectionContext");
         this.wsConfigs = Objects.requireNonNull(wsConfigs, "wsConfigs");
         this.metrics = metrics;
+        this.authorizationHelper = authorizationHelper;
     }
 
     // ------------------------------------------------------------------
@@ -381,6 +405,68 @@ public class WsFrameHandler extends SimpleChannelInboundHandler<TextWebSocketFra
             log.warn("Failed to serialise confirms-enabled frame for session {}",
                     connectionContext.sessionId(), e);
         }
+    }
+
+    // ------------------------------------------------------------------
+    //  TASK-WS3.05 — ACL helpers for subclasses / later-task handler impls
+    // ------------------------------------------------------------------
+
+    /**
+     * Checks that the authenticated principal is authorized for the given
+     * resource / operation. Emits an {@code ACCESS_REFUSED} error frame (with
+     * the supplied correlation id) and returns {@code false} on denial.
+     *
+     * <p>When no {@link WsAuthorizationHelper} is configured (e.g. unit tests
+     * that don't exercise ACLs) this is a permissive no-op — always returns
+     * {@code true} without touching the wire. Production wiring always supplies
+     * a helper.
+     *
+     * @return {@code true} if authorized (or helper not configured);
+     *         {@code false} after emitting the error frame.
+     */
+    boolean requireAuthorized(String correlationId, String failingOperation,
+                              ResourceType resourceType, String resourceName,
+                              AclOperation operation) {
+        if (authorizationHelper == null) {
+            return true;
+        }
+        if (authorizationHelper.authorize(
+                connectionContext.principal(), resourceType, resourceName, operation)) {
+            return true;
+        }
+        sendErrorFrame(correlationId, ERR_ACCESS_REFUSED,
+            "Not authorized: " + operation + " on " + resourceType + ":" + resourceName,
+            failingOperation, null);
+        return false;
+    }
+
+    /**
+     * Convenience: ACL check for a {@code declare-exchange} / {@code delete-exchange}
+     * operation ({@code CLUSTER:ALTER}).
+     */
+    boolean requireExchangeAdmin(String correlationId, String failingOperation) {
+        return requireAuthorized(correlationId, failingOperation,
+            ResourceType.CLUSTER, CLUSTER_RESOURCE_NAME, AclOperation.ALTER);
+    }
+
+    /**
+     * Convenience: ACL check for a queue-admin operation against the backing
+     * topic {@code ws.<queue>}.
+     *
+     * @param operation {@link AclOperation#CREATE} for {@code declare-queue},
+     *                  {@link AclOperation#DELETE} for {@code delete-queue},
+     *                  {@link AclOperation#ALTER} for {@code bind}/{@code unbind}
+     */
+    boolean requireQueueAccess(String correlationId, String failingOperation,
+                               String queueName, AclOperation operation) {
+        String topic = WS_TOPIC_PREFIX + queueName;
+        return requireAuthorized(correlationId, failingOperation,
+            ResourceType.TOPIC, topic, operation);
+    }
+
+    /** @return the authorization helper configured on this handler, or {@code null}. */
+    WsAuthorizationHelper authorizationHelper() {
+        return authorizationHelper;
     }
 
     // ------------------------------------------------------------------
