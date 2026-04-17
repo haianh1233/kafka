@@ -294,4 +294,15 @@ public final class WsDeliveryTagTracker {
             return pendingDeliveries.size();
         }
     }
+
+    /**
+     * Returns the highest delivery tag ever assigned by {@link #assign}. Tags are
+     * monotonically allocated from 1, so a tag {@code t} is "known" iff
+     * {@code 1 <= t <= currentTagCounter()}. Used by callers (notably
+     * {@link WsAckHandler}) to distinguish unknown tags (PRECONDITION_FAILED) from
+     * already-transitioned tags (idempotent success) per design doc §5.9.
+     */
+    public long currentTagCounter() {
+        return tagCounter.get();
+    }
 }

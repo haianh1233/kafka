@@ -200,4 +200,14 @@ public final class WsSubscriptionManager {
     public int activeCount() {
         return subscriptions.size();
     }
+
+    /**
+     * @return a snapshot of the currently-active subscription ids. Safe to iterate
+     *         concurrently with {@link #subscribe} / {@link #unsubscribe}; the snapshot
+     *         reflects the state at call time and will not throw
+     *         {@link java.util.ConcurrentModificationException}.
+     */
+    public Set<String> activeSubscriptionIds() {
+        return Set.copyOf(subscriptions.keySet());
+    }
 }
