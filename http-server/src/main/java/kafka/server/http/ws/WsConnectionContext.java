@@ -16,6 +16,7 @@
  */
 // Time: Created - TASK-WS1.02
 // Time: Update - TASK-WS3.01 - added WsPublisherConfirmTracker field
+// Time: Update - TASK-WS3.04 - added exclusive consumer semantics
 package kafka.server.http.ws;
 
 import io.netty.channel.ChannelFutureListener;
@@ -26,6 +27,8 @@ import org.apache.kafka.common.security.auth.KafkaPrincipal;
 
 import java.net.InetSocketAddress;
 import java.time.Instant;
+import java.util.Collections;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -62,6 +65,7 @@ public final class WsConnectionContext {
     private final ConcurrentHashMap<String, Object> subscriptions;
     private final AtomicBoolean publishConfirmsEnabled;
     private final WsPublisherConfirmTracker confirmTracker;
+    private final ExclusiveConsumerManager exclusiveConsumerManager;
 
     public WsConnectionContext(
             String sessionId,
@@ -69,6 +73,24 @@ public final class WsConnectionContext {
             String vhost,
             ChannelHandlerContext channel,
             InetSocketAddress remoteAddress) {
+        this(sessionId, principal, vhost, channel, remoteAddress, null);
+    }
+
+    /**
+     * @param exclusiveConsumerManager optional cross-connection exclusive-consumer
+     *                                 registry (TASK-WS3.04). When supplied, the
+     *                                 connection-close hook {@link #onClose()} will
+     *                                 release all exclusive locks this connection held.
+     *                                 When {@code null}, exclusive semantics are
+     *                                 effectively disabled for this connection.
+     */
+    public WsConnectionContext(
+            String sessionId,
+            KafkaPrincipal principal,
+            String vhost,
+            ChannelHandlerContext channel,
+            InetSocketAddress remoteAddress,
+            ExclusiveConsumerManager exclusiveConsumerManager) {
         this.sessionId = Objects.requireNonNull(sessionId, "sessionId");
         this.principal = Objects.requireNonNull(principal, "principal");
         this.vhost = Objects.requireNonNull(vhost, "vhost");
@@ -78,6 +100,7 @@ public final class WsConnectionContext {
         this.subscriptions = new ConcurrentHashMap<>();
         this.publishConfirmsEnabled = new AtomicBoolean(false);
         this.confirmTracker = new WsPublisherConfirmTracker(this);
+        this.exclusiveConsumerManager = exclusiveConsumerManager;
     }
 
     // --- Immutable accessors ---
@@ -162,5 +185,31 @@ public final class WsConnectionContext {
      */
     public boolean isActive() {
         return channel.channel().isActive();
+    }
+
+    /**
+     * @return the exclusive-consumer manager wired into this connection, or {@code null}
+     *         when exclusive semantics are disabled (e.g. in unit tests that do not
+     *         exercise exclusive subscriptions).
+     */
+    public ExclusiveConsumerManager exclusiveConsumerManager() {
+        return exclusiveConsumerManager;
+    }
+
+    /**
+     * Connection-close hook (TASK-WS3.04): release all exclusive-consumer locks held by
+     * this connection. Intended to be invoked from the Netty channel's close handler
+     * after {@code WsSubscriptionManager.cancelAll()} has torn down the subscriptions.
+     *
+     * @return list of queue names whose exclusive lock this connection released. Never
+     *         {@code null}; empty when no locks were held (or when no
+     *         {@link ExclusiveConsumerManager} is wired). Callers may use the list to
+     *         trigger cascading queue deletion per design §11.3.
+     */
+    public List<String> onClose() {
+        if (exclusiveConsumerManager == null) {
+            return Collections.emptyList();
+        }
+        return exclusiveConsumerManager.onConnectionClose(sessionId);
     }
 }

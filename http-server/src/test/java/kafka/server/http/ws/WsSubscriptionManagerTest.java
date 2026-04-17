@@ -17,6 +17,7 @@
 
 // Time: Created - TASK-WS1.15
 // Time: Update - TASK-WS3.03 - added competing consumer / group integration
+// Time: Update - TASK-WS3.04 - added exclusive consumer semantics
 
 package kafka.server.http.ws;
 
@@ -46,6 +47,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -361,6 +363,115 @@ class WsSubscriptionManagerTest {
             Set.of(tp0), Map.of(tp0, 0L), 10, false, channel);
         assertEquals(0, manager.invalidateRevokedPartitions("sub-1", null));
         assertEquals(0, manager.invalidateRevokedPartitions("sub-1", Set.of()));
+    }
+
+    // ---- TASK-WS3.04: exclusive consumer semantics ----
+
+    @Test
+    void subscribeExclusive_firstCall_acquiresLockAndRegistersSubscription() {
+        ExclusiveConsumerManager excl = new ExclusiveConsumerManager();
+        WsSubscriptionManager mgr = new WsSubscriptionManager(executor, null, excl);
+        try {
+            mgr.subscribeExclusive("conn-A", "sub-1", "orders", "ws.orders",
+                Set.of(tp0), Map.of(tp0, 0L), 10, false, channel);
+
+            assertEquals(1, mgr.activeCount());
+            assertTrue(excl.isLockedBy("orders", "conn-A"));
+        } finally {
+            mgr.cancelAll();
+        }
+    }
+
+    @Test
+    void subscribeExclusive_secondConnection_throwsExclusiveLockDenied() {
+        ExclusiveConsumerManager excl = new ExclusiveConsumerManager();
+        WsSubscriptionManager mgr = new WsSubscriptionManager(executor, null, excl);
+        try {
+            mgr.subscribeExclusive("conn-A", "sub-1", "orders", "ws.orders",
+                Set.of(tp0), Map.of(tp0, 0L), 10, false, channel);
+
+            WsSubscriptionManager.ExclusiveLockDeniedException ex =
+                assertThrows(WsSubscriptionManager.ExclusiveLockDeniedException.class,
+                    () -> mgr.subscribeExclusive("conn-B", "sub-2", "orders", "ws.orders",
+                        Set.of(tp0), Map.of(tp0, 0L), 10, false, channel));
+
+            assertEquals("orders", ex.queueName());
+            // No subscription was created for the denied attempt.
+            assertEquals(1, mgr.activeCount());
+            assertNull(mgr.getSubscription("sub-2"));
+        } finally {
+            mgr.cancelAll();
+        }
+    }
+
+    @Test
+    void subscribeExclusive_withoutExclusiveManager_throwsIllegalState() {
+        // No ExclusiveConsumerManager wired — the overload must refuse to operate.
+        assertThrows(IllegalStateException.class, () ->
+            manager.subscribeExclusive("conn-A", "sub-1", "orders", "ws.orders",
+                Set.of(tp0), Map.of(tp0, 0L), 10, false, channel));
+    }
+
+    @Test
+    void unsubscribeExclusive_releasesLock() {
+        ExclusiveConsumerManager excl = new ExclusiveConsumerManager();
+        WsSubscriptionManager mgr = new WsSubscriptionManager(executor, null, excl);
+        try {
+            mgr.subscribeExclusive("conn-A", "sub-1", "orders", "ws.orders",
+                Set.of(tp0), Map.of(tp0, 0L), 10, false, channel);
+            assertTrue(excl.isExclusivelyLocked("orders"));
+
+            mgr.unsubscribeExclusive("conn-A", "sub-1");
+
+            assertFalse(excl.isExclusivelyLocked("orders"));
+            assertEquals(0, mgr.activeCount());
+        } finally {
+            mgr.cancelAll();
+        }
+    }
+
+    @Test
+    void unsubscribeExclusive_withoutExclusiveManager_stillUnsubscribes() {
+        // Plain unsubscribe path must work even when the overload is invoked on a
+        // manager that has no exclusive registry wired.
+        manager.subscribe("sub-1", "orders", "ws.orders",
+            Set.of(tp0), Map.of(tp0, 0L), 10, false, channel);
+        manager.unsubscribeExclusive("conn-A", "sub-1");
+        assertEquals(0, manager.activeCount());
+    }
+
+    @Test
+    void exclusiveManager_accessor_returnsNullWhenUnset() {
+        assertNull(manager.exclusiveManager());
+    }
+
+    @Test
+    void exclusiveManager_accessor_returnsConfiguredInstance() {
+        ExclusiveConsumerManager excl = new ExclusiveConsumerManager();
+        WsSubscriptionManager mgr = new WsSubscriptionManager(executor, null, excl);
+        assertSame(excl, mgr.exclusiveManager());
+    }
+
+    @Test
+    void subscribeExclusive_secondCall_bySameConnection_isIdempotent() {
+        // Re-acquiring the same queue for the same connection (e.g. subscription restart)
+        // is allowed, but the subscription id itself must remain unique.
+        ExclusiveConsumerManager excl = new ExclusiveConsumerManager();
+        WsSubscriptionManager mgr = new WsSubscriptionManager(executor, null, excl);
+        try {
+            mgr.subscribeExclusive("conn-A", "sub-1", "orders", "ws.orders",
+                Set.of(tp0), Map.of(tp0, 0L), 10, false, channel);
+            assertTrue(excl.isLockedBy("orders", "conn-A"));
+
+            // Same connection, different subscription id, same queue — idempotent acquire
+            // via ExclusiveConsumerManager. The lock is still held by conn-A.
+            mgr.subscribeExclusive("conn-A", "sub-1b", "orders", "ws.orders",
+                Set.of(tp0), Map.of(tp0, 0L), 10, false, channel);
+            assertTrue(excl.isLockedBy("orders", "conn-A"));
+            assertEquals(2, mgr.activeCount());
+        } finally {
+            mgr.cancelAll();
+        }
     }
 
     @Test
