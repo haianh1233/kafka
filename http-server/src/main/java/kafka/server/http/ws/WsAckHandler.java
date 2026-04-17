@@ -18,6 +18,7 @@
 // Time: Created - TASK-WS1.16
 // Time: Update - TASK-WS3.08 - added metrics recording
 // Time: Update - TASK-WS4.01 - added DLX path
+// Time: Update - TASK-WS4.04 - added poison protection PoisonGate on NACK(requeue=true)
 
 package kafka.server.http.ws;
 
@@ -143,11 +144,37 @@ public final class WsAckHandler {
         CompletableFuture<Void> deadLetter(String queueName, WsDeliveryTagTracker.PendingDelivery pd);
     }
 
+    /**
+     * Poison-protection gate (TASK-WS4.04). Consulted on
+     * {@code nack(requeue=true)} BEFORE the tag is transitioned to
+     * {@code NACKED_REQUEUE}. When the gate returns {@code true} it has already
+     * dispatched the record to the DLX (reason {@code "max-retries-exceeded"});
+     * the handler then flips the tag to {@code NACKED_DISCARD} so the commit
+     * watermark advances and the message stops bouncing. When the gate returns
+     * {@code false} the standard requeue path runs (offset stays uncommitted,
+     * redelivery relies on next fetch).
+     *
+     * <p>The gate owns its own DLX sink and header lookup — this interface
+     * deliberately surfaces only the cheap {@code (queueName, PendingDelivery)}
+     * pair so the {@link WsDeliveryTagTracker} memory bound (§21.3) is
+     * preserved: the tracker does not carry record headers.
+     */
+    @FunctionalInterface
+    public interface PoisonGate {
+        /**
+         * @return {@code true} iff the record was dispatched to the DLX and the
+         *         commit watermark should advance past its offset; {@code false}
+         *         to fall through to the normal requeue path
+         */
+        boolean maybeDeadLetter(String queueName, WsDeliveryTagTracker.PendingDelivery pd);
+    }
+
     private final WsSubscriptionManager subscriptionManager;
     private final long commitIntervalMs;
     private final OffsetCommitSink sink;
     private final WsMetrics metrics;
     private final DeadLetterHook deadLetterHook;
+    private final PoisonGate poisonGate;
     private final ScheduledExecutorService scheduler;
     private final AtomicBoolean started = new AtomicBoolean(false);
     private final AtomicBoolean stopped = new AtomicBoolean(false);
@@ -159,7 +186,7 @@ public final class WsAckHandler {
     public WsAckHandler(WsSubscriptionManager subscriptionManager,
                         long commitIntervalMs,
                         OffsetCommitSink sink) {
-        this(subscriptionManager, commitIntervalMs, sink, null, null);
+        this(subscriptionManager, commitIntervalMs, sink, null, null, null);
     }
 
     /**
@@ -170,7 +197,19 @@ public final class WsAckHandler {
                         long commitIntervalMs,
                         OffsetCommitSink sink,
                         WsMetrics metrics) {
-        this(subscriptionManager, commitIntervalMs, sink, metrics, null);
+        this(subscriptionManager, commitIntervalMs, sink, metrics, null, null);
+    }
+
+    /**
+     * Convenience constructor for WS4.01 call sites that pre-date the
+     * TASK-WS4.04 poison-gate parameter.
+     */
+    public WsAckHandler(WsSubscriptionManager subscriptionManager,
+                        long commitIntervalMs,
+                        OffsetCommitSink sink,
+                        WsMetrics metrics,
+                        DeadLetterHook deadLetterHook) {
+        this(subscriptionManager, commitIntervalMs, sink, metrics, deadLetterHook, null);
     }
 
     /**
@@ -182,12 +221,17 @@ public final class WsAckHandler {
      * @param deadLetterHook       optional DLX hook (TASK-WS4.01); when {@code null} the
      *                             pre-WS4.01 behaviour is preserved (NACK no-requeue
      *                             advances the commit watermark immediately, message lost)
+     * @param poisonGate           optional poison-protection gate (TASK-WS4.04); consulted
+     *                             on {@code NACK(requeue=true)} and allowed to redirect the
+     *                             record to the DLX when the per-message delivery count
+     *                             exceeds the configured threshold
      */
     public WsAckHandler(WsSubscriptionManager subscriptionManager,
                         long commitIntervalMs,
                         OffsetCommitSink sink,
                         WsMetrics metrics,
-                        DeadLetterHook deadLetterHook) {
+                        DeadLetterHook deadLetterHook,
+                        PoisonGate poisonGate) {
         this.subscriptionManager = Objects.requireNonNull(subscriptionManager, "subscriptionManager");
         this.sink = Objects.requireNonNull(sink, "sink");
         if (commitIntervalMs < 0) {
@@ -196,6 +240,7 @@ public final class WsAckHandler {
         this.commitIntervalMs = commitIntervalMs;
         this.metrics = metrics;
         this.deadLetterHook = deadLetterHook;
+        this.poisonGate = poisonGate;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "ws-ack-commit-timer");
             t.setDaemon(true);
@@ -312,7 +357,37 @@ public final class WsAckHandler {
         if (!requeue && deadLetterHook != null) {
             return processDlxNack(ctx, tracker, subscriptionId, tag);
         }
-        // Either requeue=true, or no DLX hook configured (legacy drop path).
+        // Poison protection (TASK-WS4.04): on requeue=true, let the gate redirect
+        // the record to the DLX when the per-message delivery count has crossed
+        // the threshold. The gate runs BEFORE the tracker transition so we can
+        // choose NACKED_DISCARD (commit advances) vs NACKED_REQUEUE (offset held)
+        // based on its verdict.
+        if (requeue && poisonGate != null) {
+            WsDeliveryTagTracker.PendingDelivery peeked = tracker.peek(tag);
+            if (peeked == null) {
+                if (!isTagWithinAssignedRange(tracker, tag)) {
+                    return "PRECONDITION_FAILED: unknown delivery tag " + tag;
+                }
+                return null; // already-transitioned tag → idempotent success
+            }
+            boolean dlxed = invokePoisonGate(subscriptionId, tag, ctx.queueName(), peeked);
+            WsDeliveryTagTracker.PendingDelivery pd = tracker.nack(tag, /* requeue */ !dlxed);
+            if (pd == null) {
+                return null;
+            }
+            // Count this as a nack regardless; the dlx-rate is emitted by the gate's
+            // own sink plumbing on the auto-DLX path (WsMetrics.dlxRate is WS4.01's
+            // concern — we don't double-count here).
+            recordNackMetrics(!dlxed);
+            if (dlxed) {
+                log.debug("Poison auto-DLX: sub={} tag={} tp={} offset={} — commit will advance",
+                    subscriptionId, tag, pd.topicPartition(), pd.offset());
+            } else {
+                triggerRedelivery(ctx, pd);
+            }
+            return null;
+        }
+        // Either requeue=true without a poison gate, or no DLX hook configured (legacy drop path).
         WsDeliveryTagTracker.PendingDelivery pd = tracker.nack(tag, requeue);
         if (pd == null) {
             if (!isTagWithinAssignedRange(tracker, tag)) {
@@ -327,6 +402,23 @@ public final class WsAckHandler {
             handleDlxOrDiscard(ctx, pd);
         }
         return null;
+    }
+
+    /**
+     * Invokes {@link PoisonGate#maybeDeadLetter}; any synchronous throw is
+     * treated as "gate declined" so a faulty gate can never break ack
+     * processing (the message will simply requeue as before).
+     */
+    private boolean invokePoisonGate(String subscriptionId, long tag,
+                                     String queueName,
+                                     WsDeliveryTagTracker.PendingDelivery pd) {
+        try {
+            return poisonGate.maybeDeadLetter(queueName, pd);
+        } catch (RuntimeException e) {
+            log.warn("PoisonGate threw synchronously for sub={} tag={} tp={} offset={}: {}",
+                subscriptionId, tag, pd.topicPartition(), pd.offset(), e.toString());
+            return false;
+        }
     }
 
     /**
