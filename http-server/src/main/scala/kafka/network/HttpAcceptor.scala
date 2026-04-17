@@ -104,6 +104,7 @@ class HttpAcceptor(
   // --- Request pipeline wiring (set via setRequestChannel before startup) ---
   @volatile private var _requestChannel: RequestChannel = _
   @volatile private var _metadataSupplier: java.util.function.Function[String, Integer] = _
+  @volatile private var _topicIdSupplier: java.util.function.Function[String, org.apache.kafka.common.Uuid] = _
   @volatile private var _httpProcessor: HttpProcessor = _
 
   // Processor ID for the HTTP processor. Uses a high base to avoid collision
@@ -116,6 +117,10 @@ class HttpAcceptor(
 
   override def setMetadataSupplier(supplier: java.util.function.Function[String, Integer]): Unit = {
     _metadataSupplier = supplier
+  }
+
+  override def setTopicIdSupplier(supplier: java.util.function.Function[String, org.apache.kafka.common.Uuid]): Unit = {
+    _topicIdSupplier = supplier
   }
 
   // Track whether startup has been called already (make idempotent)
@@ -156,7 +161,8 @@ class HttpAcceptor(
         clusterId = clusterId,
         requestChannel = _requestChannel,
         httpProcessor = _httpProcessor,
-        metadataSupplier = _metadataSupplier))
+        metadataSupplier = _metadataSupplier,
+        topicIdSupplier = _topicIdSupplier))
 
     val host = if (endpoint.host() == null || endpoint.host().isEmpty) "0.0.0.0" else endpoint.host()
     try {

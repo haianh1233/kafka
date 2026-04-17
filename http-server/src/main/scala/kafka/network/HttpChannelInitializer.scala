@@ -67,6 +67,7 @@ class HttpChannelInitializer(
   requestChannel: RequestChannel = null,
   httpProcessor: HttpProcessor = null,
   metadataSupplier: java.util.function.Function[String, Integer] = null,
+  topicIdSupplier: java.util.function.Function[String, org.apache.kafka.common.Uuid] = null,
   httpServerConfigs: HttpServerConfigs = HttpServerConfigs.withDefaults()
 ) extends ChannelInitializer[SocketChannel] {
 
@@ -82,7 +83,7 @@ class HttpChannelInitializer(
         pipeline.addLast("ssl", ssl.newHandler(ch.alloc()))
         val handlerFactory: java.util.function.Supplier[ChannelHandler] = () =>
           new HttpRequestHandler(principalBuilder, securityProtocol, draining, inFlightCount,
-            brokerId, clusterId, requestChannel, httpProcessor, metadataSupplier, httpServerConfigs)
+            brokerId, clusterId, requestChannel, httpProcessor, metadataSupplier, topicIdSupplier, httpServerConfigs)
         pipeline.addLast("protocol-negotiation",
           new HttpProtocolNegotiationHandler(
             draining, inFlightCount, httpMetrics,
@@ -110,7 +111,7 @@ class HttpChannelInitializer(
     pipeline.addLast("idle-closer", new IdleStateCloseHandler(httpMetrics))
     pipeline.addLast("kafka-handler",
       new HttpRequestHandler(principalBuilder, securityProtocol, draining, inFlightCount,
-        brokerId, clusterId, requestChannel, httpProcessor, metadataSupplier, httpServerConfigs))
+        brokerId, clusterId, requestChannel, httpProcessor, metadataSupplier, topicIdSupplier, httpServerConfigs))
   }
 }
 

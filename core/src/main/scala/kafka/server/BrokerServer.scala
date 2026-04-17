@@ -284,6 +284,10 @@ class BrokerServer(
             s"Topic '$topicName' not found"))
       }
 
+      val httpTopicIdSupplier: java.util.function.Function[String, org.apache.kafka.common.Uuid] = { (topicName: String) =>
+        metadataCache.getTopicId(topicName)
+      }
+
       val httpFactory: (org.apache.kafka.common.Endpoint, org.apache.kafka.common.utils.Time) => kafka.network.HttpAcceptorLike = {
         (ep, t) =>
           try {
@@ -310,6 +314,7 @@ class BrokerServer(
             ).asInstanceOf[kafka.network.HttpAcceptorLike]
             // Inject metadata supplier before SocketServer calls startup()
             acceptor.setMetadataSupplier(httpMetadataSupplier)
+            acceptor.setTopicIdSupplier(httpTopicIdSupplier)
             acceptor
           } catch {
             case e: ClassNotFoundException =>

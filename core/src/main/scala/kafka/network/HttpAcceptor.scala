@@ -84,4 +84,12 @@ trait HttpAcceptorLike {
    * Default implementation is a no-op for backward compatibility.
    */
   def setMetadataSupplier(supplier: java.util.function.Function[String, Integer]): Unit = {}
+
+  /**
+   * Injects a topic ID supplier that maps topic names to topic UUIDs.
+   * Used by share group request translation (ShareFetch requires topic IDs).
+   * Must be called before startup().
+   * Default implementation is a no-op for backward compatibility.
+   */
+  def setTopicIdSupplier(supplier: java.util.function.Function[String, org.apache.kafka.common.Uuid]): Unit = {}
 }

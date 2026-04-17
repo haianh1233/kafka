@@ -28,7 +28,8 @@ import kafka.server.http.{HttpProcessor, HttpRequestTranslator, HttpRouter, Http
 import org.apache.kafka.common.memory.MemoryPool
 import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.ApiKeys
-import org.apache.kafka.common.requests.{RequestContext, RequestHeader}
+import org.apache.kafka.common.message.ShareGroupHeartbeatRequestData
+import org.apache.kafka.common.requests.{RequestContext, RequestHeader, ShareAcknowledgeRequest, ShareFetchRequest, ShareGroupHeartbeatRequest, ShareRequestMetadata}
 import org.apache.kafka.common.security.auth.{HttpAuthenticationContext, KafkaPrincipal, KafkaPrincipalBuilder, SecurityProtocol}
 import org.apache.kafka.common.utils.Time
 
@@ -38,6 +39,7 @@ import java.nio.charset.StandardCharsets
 import java.security.cert.X509Certificate
 import java.util.Base64
 import java.util.Optional
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 /**
@@ -69,6 +71,7 @@ class HttpRequestHandler(
   requestChannel: RequestChannel = null,
   httpProcessor: HttpProcessor = null,
   metadataSupplier: java.util.function.Function[String, Integer] = null,
+  topicIdSupplier: java.util.function.Function[String, org.apache.kafka.common.Uuid] = null,
   httpServerConfigs: HttpServerConfigs = HttpServerConfigs.withDefaults()
 ) extends SimpleChannelInboundHandler[FullHttpRequest] {
 
@@ -221,7 +224,9 @@ class HttpRequestHandler(
       if (req.method() == io.netty.handler.codec.http.HttpMethod.POST &&
         (handlerType == HttpRouter.HandlerType.PRODUCE ||
          handlerType == HttpRouter.HandlerType.FETCH ||
-         handlerType == HttpRouter.HandlerType.COMMIT_OFFSETS)) {
+         handlerType == HttpRouter.HandlerType.COMMIT_OFFSETS ||
+         handlerType == HttpRouter.HandlerType.SHARE_POLL ||
+         handlerType == HttpRouter.HandlerType.SHARE_ACKNOWLEDGE)) {
         val contentType = req.headers().get(HttpHeaderNames.CONTENT_TYPE)
         if (contentType == null || !contentType.toLowerCase.startsWith("application/json")) {
           sendErrorResponse(ctx, HttpResponseStatus.UNSUPPORTED_MEDIA_TYPE,
@@ -234,6 +239,14 @@ class HttpRequestHandler(
       if (handlerType == HttpRouter.HandlerType.COMMIT_OFFSETS ||
           handlerType == HttpRouter.HandlerType.FETCH_OFFSETS) {
         handleOffsetRequest(ctx, req, routeResult)
+        handedOffToAsyncPipeline = true
+        return
+      }
+
+      // --- Handle SHARE_POLL and SHARE_ACKNOWLEDGE with dedicated translation ---
+      if (handlerType == HttpRouter.HandlerType.SHARE_POLL ||
+          handlerType == HttpRouter.HandlerType.SHARE_ACKNOWLEDGE) {
+        handleShareRequest(ctx, req, routeResult)
         handedOffToAsyncPipeline = true
         return
       }
@@ -469,6 +482,402 @@ class HttpRequestHandler(
           s"""{"errorCode":-1,"errorMessage":"${escapeJson(e.getMessage)}"}""")
         inFlightCount.decrementAndGet()
     }
+  }
+
+  /**
+   * Handles share group poll (SHARE_POLL) and acknowledge (SHARE_ACKNOWLEDGE) requests.
+   *
+   * SHARE_POLL body format:
+   * {
+   *   "topics": ["topic1", "topic2"],
+   *   "maxRecords": 10,
+   *   "maxWaitMs": 5000
+   * }
+   *
+   * SHARE_ACKNOWLEDGE body format:
+   * {
+   *   "acknowledgements": [
+   *     {"acquireId": "topic:partition:offset", "type": "ACCEPT|REJECT|RELEASE"}
+   *   ]
+   * }
+   */
+  private[network] def handleShareRequest(
+    ctx: ChannelHandlerContext,
+    req: FullHttpRequest,
+    routeResult: HttpRouter.RouteResult
+  ): Unit = {
+    val groupId = routeResult.groupId()
+    val isPoll = routeResult.handlerType() == HttpRouter.HandlerType.SHARE_POLL
+
+    try {
+      val bodyBytes = if (req.content().isReadable) {
+        val bytes = new Array[Byte](req.content().readableBytes())
+        req.content().readBytes(bytes)
+        bytes
+      } else {
+        null
+      }
+      if (bodyBytes == null || bodyBytes.isEmpty) {
+        sendErrorResponse(ctx, HttpResponseStatus.BAD_REQUEST,
+          s"""{"errorCode":-1,"errorMessage":"Request body is required for share group ${if (isPoll) "poll" else "acknowledge"} requests"}""")
+        inFlightCount.decrementAndGet()
+        return
+      }
+
+      val json = objectMapper.readTree(bodyBytes)
+
+      // Use a deterministic memberId based on the group ID so the same member
+      // is reused across HTTP requests to the same share group.
+      val memberId = org.apache.kafka.common.Uuid.fromString(
+        java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+          java.security.MessageDigest.getInstance("MD5").digest(
+            s"http-share-$groupId".getBytes(StandardCharsets.UTF_8)
+          ).take(16)
+        ).take(22)  // Uuid fromString expects 22-char base64
+      )
+
+      // For share poll, register the member with the share group coordinator
+      // via heartbeat, then send the fetch with epoch=0
+      if (isPoll) {
+        val topicsNode = json.get("topics")
+        val topicNames = new java.util.ArrayList[String]()
+        if (topicsNode != null && topicsNode.isArray) {
+          val iter = topicsNode.elements()
+          while (iter.hasNext) {
+            topicNames.add(iter.next().asText())
+          }
+        }
+
+        // Send heartbeat to register the member with the group coordinator
+        // and wait for partition assignment (up to 5 seconds)
+        val deadline = System.currentTimeMillis() + 5000
+        var assigned = false
+        while (!assigned && System.currentTimeMillis() < deadline) {
+          val hbResponse = sendInternalHeartbeat(ctx, req, groupId, memberId, topicNames)
+          if (hbResponse != null) {
+            val hbData = hbResponse.asInstanceOf[org.apache.kafka.common.requests.ShareGroupHeartbeatResponse].data()
+            if (hbData.assignment() != null && !hbData.assignment().topicPartitions().isEmpty) {
+              assigned = true
+            }
+          }
+          if (!assigned) Thread.sleep(300)
+        }
+      }
+
+      // Build the share fetch or acknowledge request
+      val (apiKey: ApiKeys, apiVersion: Short, buffer: java.nio.ByteBuffer, topicIdNames: java.util.Map[String, String]) = if (isPoll) {
+        buildShareFetchRequest(groupId, json, memberId, 0)
+      } else {
+        buildShareAcknowledgeRequest(groupId, json)
+      }
+
+      // Build request context and enqueue (same pattern as offset requests)
+      val principal = buildPrincipal(ctx, req)
+      val connectionId = ctx.channel().id().asLongText()
+      val clientAddress = ctx.channel().remoteAddress().asInstanceOf[InetSocketAddress]
+      val clientId = HttpRouter.validateClientId(req.headers().get("X-Kafka-Client-ID"))
+      val correlationId = correlationIdCounter.getAndIncrement()
+
+      val requestHeader = new RequestHeader(apiKey, apiVersion, clientId, correlationId)
+      val requestContext = new RequestContext(
+        requestHeader, connectionId, clientAddress.getAddress,
+        Optional.of(Integer.valueOf(clientAddress.getPort)),
+        principal, ListenerName.normalised("HTTP"), securityProtocol,
+        ClientInformation.EMPTY, false
+      )
+
+      if (buffer.position() != 0) buffer.rewind()
+
+      val channelRequest = new RequestChannel.Request(
+        processor = httpProcessor.id(),
+        context = requestContext,
+        startTimeNanos = Time.SYSTEM.nanoseconds(),
+        memoryPool = MemoryPool.NONE,
+        buffer = buffer,
+        metrics = requestChannel.metrics,
+        envelope = None
+      )
+
+      // Store topic ID -> name mapping for response serialization
+      if (topicIdNames != null && !topicIdNames.isEmpty) {
+        channelRequest.requestLocalProperties.put("httpTopicIdNames", topicIdNames)
+      }
+
+      httpProcessor.registerChannel(connectionId, ctx)
+      val enqueued = requestChannel.tryEnqueue(channelRequest)
+      if (!enqueued) {
+        httpProcessor.unregisterChannel(connectionId)
+        sendErrorResponse(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE,
+          """{"errorCode":-1,"errorMessage":"Request queue full","detail":"SERVICE_UNAVAILABLE"}""")
+        inFlightCount.decrementAndGet()
+      }
+    } catch {
+      case e: org.apache.kafka.common.errors.InvalidRequestException =>
+        sendErrorResponse(ctx, HttpResponseStatus.BAD_REQUEST,
+          s"""{"errorCode":-1,"errorMessage":"${escapeJson(e.getMessage)}"}""")
+        inFlightCount.decrementAndGet()
+      case e: Exception =>
+        sendErrorResponse(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR,
+          s"""{"errorCode":-1,"errorMessage":"${escapeJson(e.getMessage)}"}""")
+        inFlightCount.decrementAndGet()
+    }
+  }
+
+  /**
+   * Sends a ShareGroupHeartbeat request internally and waits for the response.
+   * This is needed to register the member with the share group coordinator before
+   * the first share fetch can return records.
+   *
+   * The heartbeat is sent through the RequestChannel and the response is captured
+   * via the HttpProcessor's internal callback mechanism.
+   */
+  private def sendInternalHeartbeat(
+    ctx: ChannelHandlerContext,
+    req: FullHttpRequest,
+    groupId: String,
+    memberId: org.apache.kafka.common.Uuid,
+    topicNames: java.util.List[String]
+  ): org.apache.kafka.common.requests.AbstractResponse = {
+    val hbData = new ShareGroupHeartbeatRequestData()
+      .setGroupId(groupId)
+      .setMemberId(memberId.toString)
+      .setMemberEpoch(0)
+      .setSubscribedTopicNames(topicNames)
+
+    val hbVersion: Short = ApiKeys.SHARE_GROUP_HEARTBEAT.latestVersion()
+    val hbRequest = new ShareGroupHeartbeatRequest.Builder(hbData).build(hbVersion)
+    val hbBuffer = hbRequest.serialize().buffer()
+
+    val principal = buildPrincipal(ctx, req)
+    val internalConnectionId = "internal-hb-" + java.util.UUID.randomUUID().toString
+    val clientAddress = ctx.channel().remoteAddress().asInstanceOf[InetSocketAddress]
+    val clientId = HttpRouter.validateClientId(req.headers().get("X-Kafka-Client-ID"))
+    val correlationId = correlationIdCounter.getAndIncrement()
+
+    val hbHeader = new RequestHeader(ApiKeys.SHARE_GROUP_HEARTBEAT, hbVersion, clientId, correlationId)
+    val hbContext = new RequestContext(
+      hbHeader, internalConnectionId, clientAddress.getAddress,
+      Optional.of(Integer.valueOf(clientAddress.getPort)),
+      principal, ListenerName.normalised("HTTP"), securityProtocol,
+      ClientInformation.EMPTY, false
+    )
+
+    if (hbBuffer.position() != 0) hbBuffer.rewind()
+
+    val hbChannelRequest = new RequestChannel.Request(
+      processor = httpProcessor.id(),
+      context = hbContext,
+      startTimeNanos = Time.SYSTEM.nanoseconds(),
+      memoryPool = MemoryPool.NONE,
+      buffer = hbBuffer,
+      metrics = requestChannel.metrics,
+      envelope = None
+    )
+
+    // Register internal callback to capture the heartbeat response
+    val responseFuture = httpProcessor.registerInternalCallback(internalConnectionId)
+    inFlightCount.incrementAndGet()
+
+    val enqueued = requestChannel.tryEnqueue(hbChannelRequest)
+    if (!enqueued) {
+      inFlightCount.decrementAndGet()
+      return null // Silently skip heartbeat if queue is full
+    }
+
+    // Wait for heartbeat response (up to 5 seconds)
+    try {
+      val response = responseFuture.get(5, TimeUnit.SECONDS)
+      return response
+    } catch {
+      case _: Exception => return null
+    }
+  }
+
+  /**
+   * Builds a ShareFetchRequest from the JSON body.
+   *
+   * Topics in the body are resolved to topic IDs via the topicIdSupplier.
+   * Each topic's partition count is obtained from metadataSupplier to add
+   * all partitions for the topic to the fetch request.
+   *
+   * Returns (apiKey, version, serializedBuffer, topicIdNamesMap).
+   */
+  private def buildShareFetchRequest(groupId: String, json: JsonNode, memberId: org.apache.kafka.common.Uuid, epoch: Int): (ApiKeys, Short, java.nio.ByteBuffer, java.util.Map[String, String]) = {
+    val topicsNode = json.get("topics")
+    if (topicsNode == null || !topicsNode.isArray || topicsNode.size() == 0) {
+      throw new org.apache.kafka.common.errors.InvalidRequestException(
+        "'topics' array is required and must not be empty in share poll request")
+    }
+
+    val maxWaitMs = if (json.has("maxWaitMs")) json.get("maxWaitMs").asInt() else 5000
+    val maxRecords = if (json.has("maxRecords")) json.get("maxRecords").asInt() else 100
+
+    // Build the list of TopicIdPartition to fetch and the topic ID -> name mapping
+    val topicPartitions = new java.util.ArrayList[org.apache.kafka.common.TopicIdPartition]()
+    val topicIdNames = new java.util.HashMap[String, String]()
+    val topicsIter = topicsNode.elements()
+    while (topicsIter.hasNext) {
+      val topicNameNode = topicsIter.next()
+      val topicName = topicNameNode.asText()
+
+      // Resolve topic name to topic ID
+      val topicId = if (topicIdSupplier != null) {
+        topicIdSupplier.apply(topicName)
+      } else {
+        org.apache.kafka.common.Uuid.ZERO_UUID
+      }
+
+      if (topicId == null || topicId.equals(org.apache.kafka.common.Uuid.ZERO_UUID)) {
+        throw new org.apache.kafka.common.errors.InvalidRequestException(
+          s"Topic '$topicName' not found")
+      }
+
+      // Store topic ID -> name mapping for response serialization
+      topicIdNames.put(topicId.toString, topicName)
+      System.out.println(s"[SHARE-DEBUG] Topic '$topicName' resolved to topicId=$topicId")
+
+      // Get partition count for the topic
+      val partitionCount = if (metadataSupplier != null) {
+        metadataSupplier.apply(topicName)
+      } else {
+        throw new org.apache.kafka.common.errors.InvalidRequestException(
+          s"Cannot resolve partitions for topic '$topicName'")
+      }
+
+      for (p <- 0 until partitionCount) {
+        topicPartitions.add(new org.apache.kafka.common.TopicIdPartition(
+          topicId, new org.apache.kafka.common.TopicPartition(topicName, p)))
+      }
+    }
+
+    val metadata = new ShareRequestMetadata(
+      memberId, // memberId from heartbeat registration
+      epoch // shareSessionEpoch (0 for init, 1 for actual fetch)
+    )
+
+    val version: Short = 1.toShort  // Use version 1 (stable KIP-932) instead of latest
+    val builder = ShareFetchRequest.Builder.forConsumer(
+      groupId,
+      metadata,
+      maxWaitMs,
+      1, // minBytes
+      Integer.MAX_VALUE, // maxBytes
+      maxRecords,
+      100, // batchSize
+      0.toByte, // shareAcquireMode = BATCH_OPTIMIZED
+      false, // isRenewAck
+      topicPartitions,
+      java.util.Collections.emptyList(), // forget
+      java.util.Collections.emptyMap() // acknowledgements
+    )
+
+    val request = builder.build(version)
+    val buffer = request.serialize().buffer()
+    (ApiKeys.SHARE_FETCH, version, buffer, topicIdNames.asInstanceOf[java.util.Map[String, String]])
+  }
+
+  /**
+   * Builds a ShareAcknowledgeRequest from the JSON body.
+   *
+   * The acquireId format is "topic:partition:offset" which encodes the
+   * topic name, partition index, and offset for the record to acknowledge.
+   *
+   * Returns (apiKey, version, serializedBuffer, topicIdNamesMap).
+   */
+  private def buildShareAcknowledgeRequest(groupId: String, json: JsonNode): (ApiKeys, Short, java.nio.ByteBuffer, java.util.Map[String, String]) = {
+    val acksNode = json.get("acknowledgements")
+    if (acksNode == null || !acksNode.isArray || acksNode.size() == 0) {
+      throw new org.apache.kafka.common.errors.InvalidRequestException(
+        "'acknowledgements' array is required and must not be empty")
+    }
+
+    // Parse acknowledgements and group by TopicIdPartition
+    // acquireId format: "topic:partition:offset"
+    val ackMap = new java.util.LinkedHashMap[
+      org.apache.kafka.common.TopicIdPartition,
+      java.util.List[org.apache.kafka.common.message.ShareAcknowledgeRequestData.AcknowledgementBatch]
+    ]()
+
+    val acksIter = acksNode.elements()
+    while (acksIter.hasNext) {
+      val ackEntry = acksIter.next()
+      val acquireId = ackEntry.get("acquireId").asText()
+      val ackTypeStr = ackEntry.get("type").asText()
+
+      // Parse acquireId: "topic:partition:offset"
+      val parts = acquireId.split(":")
+      if (parts.length < 3) {
+        throw new org.apache.kafka.common.errors.InvalidRequestException(
+          s"Invalid acquireId format: '$acquireId'. Expected 'topic:partition:offset'")
+      }
+
+      val topicName = parts.dropRight(2).mkString(":") // Handle topic names with colons
+      val partition = try {
+        parts(parts.length - 2).toInt
+      } catch {
+        case _: NumberFormatException =>
+          throw new org.apache.kafka.common.errors.InvalidRequestException(
+            s"Invalid partition in acquireId: '$acquireId'")
+      }
+      val offset = try {
+        parts(parts.length - 1).toLong
+      } catch {
+        case _: NumberFormatException =>
+          throw new org.apache.kafka.common.errors.InvalidRequestException(
+            s"Invalid offset in acquireId: '$acquireId'")
+      }
+
+      // Map ack type string to wire protocol value
+      // 0:Gap, 1:Accept, 2:Release, 3:Reject, 4:Renew
+      val ackType: Byte = ackTypeStr match {
+        case "ACCEPT" => 1
+        case "RELEASE" => 2
+        case "REJECT" => 3
+        case _ => throw new org.apache.kafka.common.errors.InvalidRequestException(
+          s"Unknown acknowledge type: '$ackTypeStr'. Must be ACCEPT, REJECT, or RELEASE")
+      }
+
+      // Resolve topic ID
+      val topicId = if (topicIdSupplier != null) {
+        topicIdSupplier.apply(topicName)
+      } else {
+        org.apache.kafka.common.Uuid.ZERO_UUID
+      }
+
+      if (topicId == null || topicId.equals(org.apache.kafka.common.Uuid.ZERO_UUID)) {
+        throw new org.apache.kafka.common.errors.InvalidRequestException(
+          s"Topic '$topicName' not found")
+      }
+
+      val tip = new org.apache.kafka.common.TopicIdPartition(
+        topicId, new org.apache.kafka.common.TopicPartition(topicName, partition))
+
+      val batch = new org.apache.kafka.common.message.ShareAcknowledgeRequestData.AcknowledgementBatch()
+        .setFirstOffset(offset)
+        .setLastOffset(offset)
+        .setAcknowledgeTypes(java.util.Collections.singletonList(java.lang.Byte.valueOf(ackType)))
+
+      val batches = ackMap.computeIfAbsent(tip, _ =>
+        new java.util.ArrayList[org.apache.kafka.common.message.ShareAcknowledgeRequestData.AcknowledgementBatch]())
+      batches.add(batch)
+    }
+
+    val metadata = new ShareRequestMetadata(
+      org.apache.kafka.common.Uuid.ZERO_UUID, // memberId = ZERO_UUID
+      0 // shareSessionEpoch = 0
+    )
+
+    val version: Short = ApiKeys.SHARE_ACKNOWLEDGE.latestVersion()
+    val builder = ShareAcknowledgeRequest.Builder.forConsumer(
+      groupId,
+      metadata,
+      false, // isRenewAck
+      ackMap
+    )
+
+    val request = builder.build(version)
+    val buffer = request.serialize().buffer()
+    (ApiKeys.SHARE_ACKNOWLEDGE, version, buffer, null.asInstanceOf[java.util.Map[String, String]])
   }
 
   /**

@@ -35,6 +35,8 @@ import org.apache.kafka.common.message.MetadataResponseData;
 import org.apache.kafka.common.message.OffsetCommitResponseData;
 import org.apache.kafka.common.message.OffsetFetchResponseData;
 import org.apache.kafka.common.message.ProduceResponseData;
+import org.apache.kafka.common.message.ShareAcknowledgeResponseData;
+import org.apache.kafka.common.message.ShareFetchResponseData;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.internal.BaseRecords;
@@ -48,6 +50,8 @@ import org.apache.kafka.common.requests.MetadataResponse;
 import org.apache.kafka.common.requests.OffsetCommitResponse;
 import org.apache.kafka.common.requests.OffsetFetchResponse;
 import org.apache.kafka.common.requests.ProduceResponse;
+import org.apache.kafka.common.requests.ShareAcknowledgeResponse;
+import org.apache.kafka.common.requests.ShareFetchResponse;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
@@ -58,6 +62,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -98,6 +103,35 @@ public final class HttpResponseSerializer {
     private HttpResponseSerializer() {} // utility class
 
     /**
+     * Serializes a Kafka AbstractResponse into a Netty FullHttpResponse,
+     * with an optional topic ID -> topic name mapping for share group responses.
+     *
+     * @param kafkaResponse     the Kafka protocol response
+     * @param requestId         X-Kafka-Request-ID to echo back in response header
+     * @param apiKey            the ApiKey of the original request
+     * @param effectiveMaxWaitMs applied maxWaitMs cap for FETCH responses (-1 if not applicable)
+     * @param topicIdNames      mapping from topic ID string to topic name (for share group responses)
+     * @return FullHttpResponse ready to write to Netty channel
+     */
+    public static FullHttpResponse serialize(
+            AbstractResponse kafkaResponse,
+            String requestId,
+            ApiKeys apiKey,
+            int effectiveMaxWaitMs,
+            Map<String, String> topicIdNames) {
+        // Store the mapping in a thread-local so the share serializers can access it
+        TOPIC_ID_NAMES.set(topicIdNames);
+        try {
+            return serialize(kafkaResponse, requestId, apiKey, effectiveMaxWaitMs);
+        } finally {
+            TOPIC_ID_NAMES.remove();
+        }
+    }
+
+    // Thread-local for passing topic ID -> name mapping to share group serializers
+    private static final ThreadLocal<Map<String, String>> TOPIC_ID_NAMES = new ThreadLocal<>();
+
+    /**
      * Serializes a Kafka AbstractResponse into a Netty FullHttpResponse.
      *
      * @param kafkaResponse     the Kafka protocol response (ProduceResponse, FetchResponse, etc.)
@@ -114,48 +148,20 @@ public final class HttpResponseSerializer {
         Objects.requireNonNull(kafkaResponse, "kafkaResponse");
         Objects.requireNonNull(apiKey, "apiKey");
 
-        ObjectNode body;
         List<Errors> partitionErrors = new ArrayList<>();
 
-        switch (apiKey) {
-            case PRODUCE:
-                body = serializeProduceResponse((ProduceResponse) kafkaResponse);
-                collectProduceErrors((ProduceResponse) kafkaResponse, partitionErrors);
-                break;
-            case FETCH:
-                body = serializeFetchResponse((FetchResponse) kafkaResponse);
-                collectFetchErrors((FetchResponse) kafkaResponse, partitionErrors);
-                break;
-            case METADATA:
-                MetadataResponse metadataResponse = (MetadataResponse) kafkaResponse;
-                // Check for topic-level errors (e.g., UNKNOWN_TOPIC_OR_PARTITION)
-                Errors metadataTopicError = collectMetadataTopicError(metadataResponse);
-                if (metadataTopicError != Errors.NONE) {
-                    String errorBody = buildErrorBody(metadataTopicError, null);
-                    return buildResponse(mapErrorToHttpStatus(metadataTopicError), errorBody,
-                            requestId, -1);
-                }
-                body = serializeMetadataResponse(metadataResponse);
-                break;
-            case LIST_OFFSETS:
-                body = serializeListOffsetsResponse((ListOffsetsResponse) kafkaResponse);
-                collectListOffsetsErrors((ListOffsetsResponse) kafkaResponse, partitionErrors);
-                break;
-            case OFFSET_COMMIT:
-                body = serializeOffsetCommitResponse((OffsetCommitResponse) kafkaResponse);
-                collectOffsetCommitErrors((OffsetCommitResponse) kafkaResponse, partitionErrors);
-                break;
-            case OFFSET_FETCH:
-                OffsetFetchResponse ofr = (OffsetFetchResponse) kafkaResponse;
-                // Extract the first group ID from the response
-                String groupId = ofr.data().groups().isEmpty() ? "" :
-                    ofr.data().groups().get(0).groupId();
-                body = serializeOffsetFetchResponse(ofr, groupId);
-                break;
-            default:
-                body = serializeGenericResponse(kafkaResponse);
-                break;
+        // Metadata has a special early-return path for topic-level errors
+        if (apiKey == ApiKeys.METADATA) {
+            MetadataResponse metadataResponse = (MetadataResponse) kafkaResponse;
+            Errors metadataTopicError = collectMetadataTopicError(metadataResponse);
+            if (metadataTopicError != Errors.NONE) {
+                String errorBody = buildErrorBody(metadataTopicError, null);
+                return buildResponse(mapErrorToHttpStatus(metadataTopicError), errorBody,
+                        requestId, -1);
+            }
         }
+
+        ObjectNode body = serializeResponseBody(kafkaResponse, apiKey, partitionErrors);
 
         String jsonBody;
         try {
@@ -190,6 +196,44 @@ public final class HttpResponseSerializer {
         }
 
         return response;
+    }
+
+    // --- Response body dispatch ---
+
+    /**
+     * Dispatches to the appropriate serializer based on apiKey and collects errors.
+     */
+    private static ObjectNode serializeResponseBody(
+            AbstractResponse kafkaResponse, ApiKeys apiKey, List<Errors> partitionErrors) {
+        switch (apiKey) {
+            case PRODUCE:
+                collectProduceErrors((ProduceResponse) kafkaResponse, partitionErrors);
+                return serializeProduceResponse((ProduceResponse) kafkaResponse);
+            case FETCH:
+                collectFetchErrors((FetchResponse) kafkaResponse, partitionErrors);
+                return serializeFetchResponse((FetchResponse) kafkaResponse);
+            case METADATA:
+                return serializeMetadataResponse((MetadataResponse) kafkaResponse);
+            case LIST_OFFSETS:
+                collectListOffsetsErrors((ListOffsetsResponse) kafkaResponse, partitionErrors);
+                return serializeListOffsetsResponse((ListOffsetsResponse) kafkaResponse);
+            case OFFSET_COMMIT:
+                collectOffsetCommitErrors((OffsetCommitResponse) kafkaResponse, partitionErrors);
+                return serializeOffsetCommitResponse((OffsetCommitResponse) kafkaResponse);
+            case OFFSET_FETCH:
+                OffsetFetchResponse ofr = (OffsetFetchResponse) kafkaResponse;
+                String groupId = ofr.data().groups().isEmpty() ? "" :
+                    ofr.data().groups().get(0).groupId();
+                return serializeOffsetFetchResponse(ofr, groupId);
+            case SHARE_FETCH:
+                collectShareFetchErrors((ShareFetchResponse) kafkaResponse, partitionErrors);
+                return serializeShareFetchResponse((ShareFetchResponse) kafkaResponse);
+            case SHARE_ACKNOWLEDGE:
+                collectShareAcknowledgeErrors((ShareAcknowledgeResponse) kafkaResponse, partitionErrors);
+                return serializeShareAcknowledgeResponse((ShareAcknowledgeResponse) kafkaResponse);
+            default:
+                return serializeGenericResponse(kafkaResponse);
+        }
     }
 
     // --- Produce response errors ---
@@ -543,6 +587,164 @@ public final class HttpResponseSerializer {
 
         // Group not found in response -- return empty topics
         root.putArray("topics");
+        return root;
+    }
+
+    // --- ShareFetch response errors ---
+
+    private static void collectShareFetchErrors(ShareFetchResponse response, List<Errors> errors) {
+        // Top-level error
+        if (response.error() != Errors.NONE) {
+            errors.add(response.error());
+        }
+        for (ShareFetchResponseData.ShareFetchableTopicResponse topicResponse : response.data().responses()) {
+            for (ShareFetchResponseData.PartitionData partitionData : topicResponse.partitions()) {
+                errors.add(Errors.forCode(partitionData.errorCode()));
+            }
+        }
+    }
+
+    // --- ShareAcknowledge response errors ---
+
+    private static void collectShareAcknowledgeErrors(ShareAcknowledgeResponse response, List<Errors> errors) {
+        // Top-level error
+        if (response.error() != Errors.NONE) {
+            errors.add(response.error());
+        }
+        for (ShareAcknowledgeResponseData.ShareAcknowledgeTopicResponse topicResponse : response.data().responses()) {
+            for (ShareAcknowledgeResponseData.PartitionData partitionData : topicResponse.partitions()) {
+                errors.add(Errors.forCode(partitionData.errorCode()));
+            }
+        }
+    }
+
+    /**
+     * Serializes a ShareFetchResponse to JSON.
+     *
+     * Output shape:
+     * {
+     *   "records": [
+     *     { "topic": "t", "partition": 0, "offset": 42, "key": null, "value": {...}, "acquireId": "t:0:42" }
+     *   ]
+     * }
+     *
+     * The acquireId is synthesized from topic:partition:offset since the HTTP
+     * client is stateless and doesn't maintain share sessions.
+     */
+    static ObjectNode serializeShareFetchResponse(ShareFetchResponse response) {
+        ObjectNode root = MAPPER.createObjectNode();
+
+        // Include top-level error if present
+        if (response.error() != Errors.NONE) {
+            root.put("errorCode", response.error().code());
+            root.put("errorMessage", response.error().name());
+        }
+
+        ArrayNode recordsArray = root.putArray("records");
+
+        for (ShareFetchResponseData.ShareFetchableTopicResponse topicResponse : response.data().responses()) {
+            String topicName = resolveTopicName(topicResponse);
+            for (ShareFetchResponseData.PartitionData partitionData : topicResponse.partitions()) {
+                if (partitionData.errorCode() != 0) {
+                    continue;
+                }
+
+                BaseRecords baseRecords = partitionData.records();
+                if (baseRecords instanceof Records) {
+                    Records records = (Records) baseRecords;
+                    for (RecordBatch batch : records.batches()) {
+                        for (Record record : batch) {
+                            ObjectNode recordNode = recordsArray.addObject();
+                            recordNode.put("topic", topicName);
+                            recordNode.put("partition", partitionData.partitionIndex());
+                            recordNode.put("offset", record.offset());
+
+                            // Serialize key
+                            byte[] keyBytes = bufferToBytes(record.key());
+                            if (keyBytes != null) {
+                                recordNode.put("key", new String(keyBytes, StandardCharsets.UTF_8));
+                            } else {
+                                recordNode.putNull("key");
+                            }
+
+                            // Serialize value
+                            byte[] valueBytes = bufferToBytes(record.value());
+                            if (valueBytes != null) {
+                                recordNode.set("value", detectAndSerializeValue(valueBytes, record.headers()));
+                            } else {
+                                recordNode.putNull("value");
+                            }
+
+                            // Synthesize acquireId from topic:partition:offset
+                            String acquireId = topicName + ":" + partitionData.partitionIndex() + ":" + record.offset();
+                            recordNode.put("acquireId", acquireId);
+                        }
+                    }
+                }
+            }
+        }
+
+        return root;
+    }
+
+    /**
+     * Resolves the topic name from a ShareFetchableTopicResponse.
+     * The response carries topic IDs, not names. Uses the thread-local mapping
+     * set by the serialize() overload that accepts topicIdNames.
+     *
+     * Falls back to the topic ID string if the name cannot be resolved.
+     */
+    private static String resolveTopicName(ShareFetchResponseData.ShareFetchableTopicResponse topicResponse) {
+        Map<String, String> names = TOPIC_ID_NAMES.get();
+        if (names != null) {
+            String name = names.get(topicResponse.topicId().toString());
+            if (name != null) {
+                return name;
+            }
+        }
+        return topicResponse.topicId().toString();
+    }
+
+    /**
+     * Serializes a ShareAcknowledgeResponse to JSON.
+     *
+     * Output shape:
+     * {
+     *   "partitions": [
+     *     { "topicId": "uuid", "partition": 0, "errorCode": 0 }
+     *   ]
+     * }
+     *
+     * Or on top-level error:
+     * {
+     *   "errorCode": 42,
+     *   "errorMessage": "ERROR_NAME"
+     * }
+     */
+    static ObjectNode serializeShareAcknowledgeResponse(ShareAcknowledgeResponse response) {
+        ObjectNode root = MAPPER.createObjectNode();
+
+        // Check top-level error
+        if (response.error() != Errors.NONE) {
+            root.put("errorCode", response.error().code());
+            root.put("errorMessage", response.error().name());
+            return root;
+        }
+
+        ArrayNode partitionsArray = root.putArray("partitions");
+        for (ShareAcknowledgeResponseData.ShareAcknowledgeTopicResponse topicResponse : response.data().responses()) {
+            for (ShareAcknowledgeResponseData.PartitionData partitionData : topicResponse.partitions()) {
+                ObjectNode partNode = partitionsArray.addObject();
+                partNode.put("topicId", topicResponse.topicId().toString());
+                partNode.put("partition", partitionData.partitionIndex());
+                partNode.put("errorCode", partitionData.errorCode());
+                if (partitionData.errorCode() != 0) {
+                    Errors error = Errors.forCode(partitionData.errorCode());
+                    partNode.put("errorMessage", error.name());
+                }
+            }
+        }
+
         return root;
     }
 

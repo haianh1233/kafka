@@ -169,6 +169,8 @@ public final class HttpRequestTranslator {
             case CONSUMER_LAG -> translateConsumerLag(routeResult);
             case COMMIT_OFFSETS, FETCH_OFFSETS -> throw new InvalidRequestException(
                 "Offset commit/fetch requests use dedicated translation methods, not the generic translate()");
+            case SHARE_POLL, SHARE_ACKNOWLEDGE -> throw new InvalidRequestException(
+                "Share group requests use dedicated translation methods, not the generic translate()");
             case HEALTH -> throw new InvalidRequestException(
                 "HEALTH requests should be handled directly, not translated");
             case OPENAPI_SPEC -> throw new InvalidRequestException(

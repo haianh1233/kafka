@@ -213,6 +213,13 @@ public class HttpProcessor implements ResponseProcessor {
      * Handles a SendResponse by serializing to HTTP and writing to the Netty channel.
      */
     private void handleSendResponse(RequestChannel.SendResponse sendResp, String connectionId) {
+        // Check for internal callback first (used by share group heartbeat flow)
+        if (tryCompleteInternalCallback(connectionId, sendResp)) {
+            inFlightCount.decrementAndGet();
+            safeUpdateMetrics(sendResp);
+            return;
+        }
+
         ChannelHandlerContext ctx = channels.get(connectionId);
         if (ctx != null && ctx.channel().isActive()) {
             FullHttpResponse httpResponse = buildHttpResponse(sendResp, connectionId);
@@ -248,6 +255,16 @@ public class HttpProcessor implements ResponseProcessor {
                 AbstractResponse abstractResponse = (AbstractResponse) storedResponse;
                 Object maxWaitObj = props.get("httpMaxWaitApplied");
                 int effectiveMaxWaitMs = maxWaitObj instanceof Integer ? (Integer) maxWaitObj : -1;
+
+                // Pass topic ID -> name mapping for share group responses
+                @SuppressWarnings("unchecked")
+                java.util.Map<String, String> topicIdNames =
+                    (java.util.Map<String, String>) props.get("httpTopicIdNames");
+                if (topicIdNames != null) {
+                    return HttpResponseSerializer.serialize(
+                        abstractResponse, requestId, apiKey, effectiveMaxWaitMs, topicIdNames);
+                }
+
                 return HttpResponseSerializer.serialize(abstractResponse, requestId, apiKey, effectiveMaxWaitMs);
             }
         }
@@ -415,5 +432,53 @@ public class HttpProcessor implements ResponseProcessor {
      */
     public int responseQueueSize() {
         return responseQueue.size();
+    }
+
+    // --- Internal request support (for orchestrating multi-step flows like share groups) ---
+
+    /**
+     * Pending internal response callbacks. Used by HttpRequestHandler to send
+     * internal requests (like ShareGroupHeartbeat) and wait for their responses
+     * synchronously.
+     */
+    private final ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<AbstractResponse>> internalCallbacks =
+        new ConcurrentHashMap<>();
+
+    /**
+     * Registers a callback for an internal request. When the response for this
+     * connectionId arrives, the callback future is completed instead of writing
+     * to a Netty channel.
+     *
+     * @param connectionId the internal connection ID
+     * @return a CompletableFuture that completes with the response
+     */
+    public java.util.concurrent.CompletableFuture<AbstractResponse> registerInternalCallback(String connectionId) {
+        java.util.concurrent.CompletableFuture<AbstractResponse> future = new java.util.concurrent.CompletableFuture<>();
+        internalCallbacks.put(connectionId, future);
+        return future;
+    }
+
+    /**
+     * Checks if a connectionId has an internal callback registered.
+     * If so, completes the callback with the response data.
+     *
+     * @return true if the response was handled internally
+     */
+    boolean tryCompleteInternalCallback(String connectionId, RequestChannel.SendResponse sendResp) {
+        java.util.concurrent.CompletableFuture<AbstractResponse> callback = internalCallbacks.remove(connectionId);
+        if (callback != null) {
+            java.util.concurrent.ConcurrentHashMap<String, Object> props =
+                sendResp.request().requestLocalProperties();
+            if (props != null) {
+                Object stored = props.get("httpAbstractResponse");
+                if (stored instanceof AbstractResponse) {
+                    callback.complete((AbstractResponse) stored);
+                    return true;
+                }
+            }
+            callback.complete(null);
+            return true;
+        }
+        return false;
     }
 }

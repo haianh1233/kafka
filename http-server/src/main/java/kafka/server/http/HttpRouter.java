@@ -59,6 +59,8 @@ public final class HttpRouter {
         CONSUMER_LAG,
         COMMIT_OFFSETS,
         FETCH_OFFSETS,
+        SHARE_POLL,
+        SHARE_ACKNOWLEDGE,
         HEALTH,
         OPENAPI_SPEC
     }
@@ -69,6 +71,7 @@ public final class HttpRouter {
         private final String topicName;
         private final Integer partition;
         private final String consumerGroup;
+        private final String groupId;
         private final Map<String, String> queryParams;
 
         public RouteResult(
@@ -78,10 +81,22 @@ public final class HttpRouter {
             String consumerGroup,
             Map<String, String> queryParams
         ) {
+            this(handlerType, topicName, partition, consumerGroup, null, queryParams);
+        }
+
+        public RouteResult(
+            HandlerType handlerType,
+            String topicName,
+            Integer partition,
+            String consumerGroup,
+            String groupId,
+            Map<String, String> queryParams
+        ) {
             this.handlerType = handlerType;
             this.topicName = topicName;
             this.partition = partition;
             this.consumerGroup = consumerGroup;
+            this.groupId = groupId;
             this.queryParams = queryParams;
         }
 
@@ -99,6 +114,10 @@ public final class HttpRouter {
 
         public String consumerGroup() {
             return consumerGroup;
+        }
+
+        public String groupId() {
+            return groupId;
         }
 
         public Map<String, String> queryParams() {
@@ -128,6 +147,14 @@ public final class HttpRouter {
     // Matches: /v1/topics
     private static final Pattern METADATA_ALL_PATTERN =
         Pattern.compile("^/v1/topics$");
+
+    // Matches: /v1/share-groups/{group}/records
+    private static final Pattern SHARE_POLL_PATTERN =
+        Pattern.compile("^/v1/share-groups/([^/?]+)/records$");
+
+    // Matches: /v1/share-groups/{group}/acknowledge
+    private static final Pattern SHARE_ACKNOWLEDGE_PATTERN =
+        Pattern.compile("^/v1/share-groups/([^/?]+)/acknowledge$");
 
     // Matches: /v1/consumer-groups/{group}/lags
     private static final Pattern CONSUMER_LAG_PATTERN =
@@ -178,8 +205,11 @@ public final class HttpRouter {
 
         Map<String, String> queryParams = parseQueryParams(queryString);
 
-        // Try topic routes first, then consumer-group routes, then utility routes
+        // Try topic routes first, then share-group, consumer-group, then utility routes
         RouteResult result = matchTopicRoutes(method, path, queryParams);
+        if (result != null) return result;
+
+        result = matchShareGroupRoutes(method, path, queryParams);
         if (result != null) return result;
 
         result = matchConsumerGroupRoutes(method, path, queryParams);
@@ -231,6 +261,29 @@ public final class HttpRouter {
         if (matcher.matches()) {
             requireMethod(method, HttpMethod.GET, path);
             return new RouteResult(HandlerType.METADATA_ALL, null, null, null, queryParams);
+        }
+
+        return null;
+    }
+
+    /**
+     * Matches share-group routes: SHARE_POLL, SHARE_ACKNOWLEDGE.
+     */
+    private RouteResult matchShareGroupRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
+        Matcher matcher;
+
+        matcher = SHARE_POLL_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.POST, path);
+            String groupId = validateGroupId(matcher.group(1));
+            return new RouteResult(HandlerType.SHARE_POLL, null, null, null, groupId, queryParams);
+        }
+
+        matcher = SHARE_ACKNOWLEDGE_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.POST, path);
+            String groupId = validateGroupId(matcher.group(1));
+            return new RouteResult(HandlerType.SHARE_ACKNOWLEDGE, null, null, null, groupId, queryParams);
         }
 
         return null;

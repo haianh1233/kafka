@@ -67,6 +67,11 @@ class HttpShareGroupIntegrationTest extends HttpIntegrationTestHarness {
         "group.coordinator.rebalance.protocols",
         "classic,consumer,share"
       )
+      // Disable persister so share partition state is stored in memory only.
+      // This avoids the need for the __share_group_state internal topic.
+      config.setProperty("group.share.persister.class.name", "")
+      config.setProperty("offsets.topic.num.partitions", "1")
+      config.setProperty("offsets.topic.replication.factor", "1")
     }
   }
 
@@ -298,21 +303,36 @@ class HttpShareGroupIntegrationTest extends HttpIntegrationTestHarness {
     val topicsJson = topics.map(t => s""""$t"""").mkString(",")
     val body = s"""{"topics":[$topicsJson],"maxRecords":$maxRecords,"maxWaitMs":$maxWaitMs}"""
 
-    val response = client.rawPost(
-      s"$httpBaseUrl/v1/share-groups/$group/records", body)
+    // Share groups need initialization on the first poll. The handler sends
+    // a heartbeat to register the member, then a fetch. Retry if the first
+    // poll returns empty (share partition still initializing).
+    val deadline = System.currentTimeMillis() + maxWaitMs + 15000
+    var lastResult: SharePollResult = null
 
-    // Skip test if share group endpoint is not yet implemented (404 or 501)
-    Assumptions.assumeTrue(
-      response.getStatus != 404 && response.getStatus != 501,
-      s"Share group endpoint not yet implemented (status=${response.getStatus})")
+    while (System.currentTimeMillis() < deadline) {
+      val response = client.rawPost(
+        s"$httpBaseUrl/v1/share-groups/$group/records", body)
 
-    val json = mapper.readTree(response.getContentAsString)
-    val records = if (json.has("records")) {
-      (0 until json.get("records").size()).map(i => json.get("records").get(i))
-    } else {
-      Seq.empty
+      // Skip test if share group endpoint is not yet implemented (404 or 501)
+      Assumptions.assumeTrue(
+        response.getStatus != 404 && response.getStatus != 501,
+        s"Share group endpoint not yet implemented (status=${response.getStatus})")
+
+      val json = mapper.readTree(response.getContentAsString)
+      val records = if (json.has("records")) {
+        (0 until json.get("records").size()).map(i => json.get("records").get(i))
+      } else {
+        Seq.empty
+      }
+      lastResult = SharePollResult(response.getStatus, records)
+
+      if (records.nonEmpty || response.getStatus != 200) {
+        return lastResult
+      }
+      // Brief wait before retry
+      Thread.sleep(1000)
     }
-    SharePollResult(response.getStatus, records)
+    lastResult
   }
 
   /**
