@@ -22,6 +22,7 @@ import kafka.utils.TestUtils
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.message.ApiMessageType.ListenerType
 import org.apache.kafka.common.Endpoint
+import org.apache.kafka.common.config.ConfigException
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.common.utils.Time
 import org.apache.kafka.common.security.scram.internals.ScramMechanism
@@ -230,5 +231,69 @@ class SocketServerHttpTest {
     // Verify security protocols
     assertEquals(SecurityProtocol.PLAINTEXT, dataPlaneEndpoint.securityProtocol())
     assertEquals(SecurityProtocol.HTTP, httpEndpoint.securityProtocol())
+  }
+
+  // ===================================================================
+  // Test 6: HTTPS listener without SSL keystore config fails fast
+  // ===================================================================
+  @Test
+  def testHttpsListenerRequiresSslConfig(): Unit = {
+    val props = TestUtils.createBrokerConfig(0, port = 0)
+    props.put(SocketServerConfigs.LISTENERS_CONFIG,
+      "PLAINTEXT://localhost:0,HTTPS://localhost:0")
+    props.put(SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG,
+      "PLAINTEXT://localhost:0,HTTPS://localhost:0")
+    props.put(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG,
+      "PLAINTEXT:PLAINTEXT,HTTPS:HTTPS,CONTROLLER:PLAINTEXT")
+    props.put(ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG, "PLAINTEXT")
+    // Intentionally do NOT set ssl.keystore.location
+
+    val config = KafkaConfig.fromProps(props)
+    val factory: (Endpoint, Time) => HttpAcceptorLike = (ep, t) => new HttpAcceptorLike {
+      private val _startedFuture = new java.util.concurrent.CompletableFuture[Void]()
+      override def endpoint: Endpoint = ep
+      override def startedFuture: java.util.concurrent.CompletableFuture[Void] = _startedFuture
+      override def startup(): Unit = _startedFuture.complete(null)
+      override def beginDrain(): Unit = ()
+      override def awaitDrain(timeoutMs: Long): Unit = ()
+      override def boundPort: Int = 0
+      override def close(): Unit = ()
+      override def isDraining: Boolean = false
+      override def pendingRequestCount: Int = 0
+    }
+
+    val exception = assertThrows(classOf[ConfigException], () => {
+      server = new SocketServer(config, metrics, Time.SYSTEM, credentialProvider, apiVersionManager,
+        httpAcceptorFactory = factory)
+      server.enableRequestProcessing(Map.empty).get(1, TimeUnit.MINUTES)
+    })
+
+    assertTrue(exception.getMessage.contains("ssl.keystore.location"),
+      s"Exception should mention ssl.keystore.location, got: ${exception.getMessage}")
+    assertTrue(exception.getMessage.toLowerCase.contains("https"),
+      s"Exception should mention HTTPS, got: ${exception.getMessage}")
+  }
+
+  // ===================================================================
+  // Test 7: HTTP listener endpoint is logged on startup
+  // ===================================================================
+  @Test
+  def testHttpListenerLoggedOnStartup(): Unit = {
+    val props = createProps()
+    val ss = createSocketServer(props)
+    ss.enableRequestProcessing(Map.empty).get(1, TimeUnit.MINUTES)
+
+    // Verify HTTP acceptor is present (logging happens in BrokerServer,
+    // but we verify the httpAcceptors map is populated which is what
+    // BrokerServer reads to produce the log message)
+    assertFalse(ss.httpAcceptors.isEmpty,
+      "httpAcceptors should be populated for BrokerServer startup logging")
+
+    val httpEntry = ss.httpAcceptors.entrySet().asScala.head
+    val ep = httpEntry.getKey
+    assertEquals(SecurityProtocol.HTTP, ep.securityProtocol(),
+      "HTTP endpoint should have HTTP security protocol")
+    assertNotNull(httpEntry.getValue,
+      "HTTP acceptor should not be null")
   }
 }

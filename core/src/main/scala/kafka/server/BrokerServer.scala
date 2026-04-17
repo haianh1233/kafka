@@ -333,6 +333,12 @@ class BrokerServer(
         connectionDisconnectListeners,
         httpFactory)
 
+      // Log HTTP/HTTPS listener endpoints
+      val httpEndpoints = socketServer.httpListenerEndpoints
+      if (httpEndpoints.nonEmpty) {
+        info(s"HTTP listener(s) started: ${httpEndpoints.mkString(", ")}")
+      }
+
       clientQuotaMetadataManager = new ClientQuotaMetadataManager(quotaManagers, socketServer.connectionQuotas)
 
       val listenerInfo = ListenerInfo.create(Optional.of(config.interBrokerListenerName.value()),

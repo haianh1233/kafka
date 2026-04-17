@@ -1810,11 +1810,44 @@ New properties added to `KafkaConfig`:
 
 Listener registration (no new config needed beyond standard listener machinery):
 
+**Minimal HTTP setup:**
 ```properties
+# Add HTTP listener alongside the binary protocol listener
 listeners=PLAINTEXT://0.0.0.0:9092,HTTP://0.0.0.0:9094
-listener.security.protocol.map=PLAINTEXT:PLAINTEXT,HTTP:HTTP
+# listener.security.protocol.map auto-includes HTTP:HTTP
 advertised.listeners=PLAINTEXT://broker1.example.com:9092,HTTP://broker1.example.com:9094
 ```
+
+**Full HTTP + HTTPS setup:**
+```properties
+listeners=PLAINTEXT://0.0.0.0:9092,SSL://0.0.0.0:9093,HTTP://0.0.0.0:9094,HTTPS://0.0.0.0:9095
+listener.security.protocol.map=PLAINTEXT:PLAINTEXT,SSL:SSL,HTTP:HTTP,HTTPS:HTTPS
+advertised.listeners=PLAINTEXT://broker1:9092,SSL://broker1:9093,HTTP://broker1:9094,HTTPS://broker1:9095
+
+# inter.broker.listener.name MUST be a binary protocol (not HTTP/HTTPS)
+inter.broker.listener.name=PLAINTEXT
+
+# HTTPS requires SSL keystore configuration
+ssl.keystore.location=/path/to/keystore.jks
+ssl.keystore.password=changeit
+ssl.key.password=changeit
+```
+
+**HTTP-specific tuning:**
+```properties
+num.http.network.threads=4
+http.request.max.bytes=10485760
+http.consume.max.wait.ms=5000
+http.cors.allowed.origins=*
+http.connection.idle.timeout.ms=60000
+http.shutdown.drain.ms=2000
+num.http.async.threads=4
+```
+
+**Validation rules:**
+- `inter.broker.listener.name` cannot be HTTP or HTTPS (broker-to-broker communication uses the Kafka binary protocol)
+- HTTPS listeners require `ssl.keystore.location` to be configured (either globally or with the listener prefix)
+- HTTP/HTTPS listeners require the `http-server` module JAR on the broker classpath
 
 ---
 

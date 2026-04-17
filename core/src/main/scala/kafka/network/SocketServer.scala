@@ -106,6 +106,16 @@ class SocketServer(
   // Time: Update - TASK-B.06
   private[network] val httpAcceptors = new ConcurrentHashMap[Endpoint, HttpAcceptorLike]()
 
+  /**
+   * Returns a description of each HTTP/HTTPS listener endpoint for startup logging.
+   * Each entry is formatted as "PROTOCOL://host:port".
+   */
+  def httpListenerEndpoints: Seq[String] = {
+    httpAcceptors.asScala.map { case (ep, acceptor) =>
+      s"${ep.securityProtocol.name}://${ep.host}:${acceptor.boundPort}"
+    }.toSeq
+  }
+
   private[this] val nextProcessorId: AtomicInteger = new AtomicInteger(0)
   val connectionQuotas = new ConnectionQuotas(config, time, metrics)
 
@@ -257,7 +267,9 @@ class SocketServer(
     // Validate inter-broker listener is not HTTP/HTTPS
     if (config.interBrokerListenerName == listenerName) {
       require(!endpoint.securityProtocol().isHttp,
-        s"inter.broker.listener.name ($listenerName) must not be an HTTP/HTTPS listener")
+        s"inter.broker.listener.name cannot use HTTP or HTTPS. The inter-broker listener must use " +
+        "a binary protocol (PLAINTEXT, SSL, SASL_PLAINTEXT, or SASL_SSL) because broker-to-broker " +
+        "communication uses the Kafka binary protocol.")
     }
 
     endpoint.securityProtocol() match {
@@ -265,7 +277,18 @@ class SocketServer(
         // HTTP/HTTPS endpoint — create HttpAcceptor (Netty-based) via factory
         if (httpAcceptorFactory == null) {
           throw new IllegalStateException(
-            s"HTTP listener $listenerName requires httpAcceptorFactory to be set on SocketServer")
+            "HTTP listener configured but http-server module not on classpath. " +
+            "Ensure the http-server JAR is included in the broker's classpath.")
+        }
+        // HTTPS requires SSL keystore to be configured
+        if (endpoint.securityProtocol() == SecurityProtocol.HTTPS) {
+          val listenerPrefix = listenerName.configPrefix
+          val parsedConfigs = config.valuesFromThisConfigWithPrefixOverride(listenerPrefix)
+          val keystoreLocation = parsedConfigs.get(org.apache.kafka.common.config.SslConfigs.SSL_KEYSTORE_LOCATION_CONFIG)
+          if (keystoreLocation == null || keystoreLocation.toString.isEmpty) {
+            throw new ConfigException(s"HTTPS listener '$listenerName' requires ssl.keystore.location to be configured. " +
+              s"Set either '${listenerPrefix}ssl.keystore.location' or 'ssl.keystore.location'.")
+          }
         }
         val httpAcceptor = httpAcceptorFactory(endpoint, time)
         // Inject the shared RequestChannel so HTTP requests flow through KafkaApis

@@ -42,9 +42,12 @@ public class HttpServerConfigs {
     public static final String HTTP_ENABLED_CONFIG = "http.enabled";
     public static final boolean HTTP_ENABLED_DEFAULT = false;
     public static final String HTTP_ENABLED_DOC = "Master switch to enable the HTTP listener. " +
-            "When set to true, the broker starts an HTTP listener on the port specified in the " +
-            "'listeners' configuration. Alternatively, adding an HTTP:// or HTTPS:// entry to " +
-            "'listeners' implicitly enables the HTTP listener regardless of this setting.";
+            "HTTP/HTTPS listeners are configured through the standard 'listeners' property using the " +
+            "HTTP:// or HTTPS:// URI scheme. Example: listeners=PLAINTEXT://0.0.0.0:9092,HTTP://0.0.0.0:9094. " +
+            "The listener.security.protocol.map automatically includes HTTP:HTTP and HTTPS:HTTPS mappings. " +
+            "Adding an HTTP:// or HTTPS:// entry to 'listeners' implicitly enables the HTTP listener " +
+            "regardless of this setting. The inter.broker.listener.name must remain a binary protocol " +
+            "listener (PLAINTEXT, SSL, SASL_PLAINTEXT, or SASL_SSL).";
 
     // ---- num.http.network.threads ----
     public static final String NUM_HTTP_NETWORK_THREADS_CONFIG = "num.http.network.threads";
