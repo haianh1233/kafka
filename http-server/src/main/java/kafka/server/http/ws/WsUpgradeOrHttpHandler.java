@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 // Time: Created - TASK-WS1.03
+// Time: Update - TASK-WS3.07 - added drain support
 package kafka.server.http.ws;
 
 import io.netty.buffer.Unpooled;
@@ -53,6 +54,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Detects WebSocket upgrade requests on {@code GET /v1/ws} and switches the
@@ -109,6 +111,13 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
     private final KafkaPrincipalBuilder principalBuilder;
     private final SecurityProtocol securityProtocol;
 
+    /**
+     * TASK-WS3.07: when set, new WebSocket upgrade requests are rejected with
+     * HTTP 503. Flipped via {@link #beginDrain()} during graceful shutdown and
+     * never reset — the handler is single-use per shutdown lifecycle.
+     */
+    private final AtomicBoolean draining = new AtomicBoolean(false);
+
     public WsUpgradeOrHttpHandler(
             WsConfigs wsConfigs,
             int brokerId,
@@ -120,6 +129,25 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
         this.principalBuilder = Objects.requireNonNull(principalBuilder, "principalBuilder");
         this.securityProtocol = Objects.requireNonNull(securityProtocol, "securityProtocol");
+    }
+
+    /**
+     * Signal the handler to stop accepting new WebSocket upgrades (TASK-WS3.07).
+     * After this call, any subsequent upgrade request receives HTTP 503.
+     *
+     * <p>Idempotent: subsequent invocations are no-ops. The flag is not
+     * resettable; the handler is intended to be replaced, not reused, after
+     * a drain cycle.
+     */
+    public void beginDrain() {
+        if (draining.compareAndSet(false, true)) {
+            log.info("WebSocket upgrade handler entering drain mode — new upgrades will be rejected with 503");
+        }
+    }
+
+    /** @return {@code true} if {@link #beginDrain()} has been called. */
+    public boolean isDraining() {
+        return draining.get();
     }
 
     @Override
@@ -135,6 +163,12 @@ public class WsUpgradeOrHttpHandler extends SimpleChannelInboundHandler<FullHttp
         if (!wsConfigs.wsEnabled()) {
             log.debug("WebSocket upgrade rejected — ws.enabled=false");
             sendHttpErrorAndClose(ctx, HttpResponseStatus.NOT_FOUND);
+            return;
+        }
+
+        if (draining.get()) {
+            log.debug("WebSocket upgrade rejected — server draining");
+            sendHttpErrorAndClose(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE);
             return;
         }
 

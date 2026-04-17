@@ -15,7 +15,11 @@
  * limitations under the License.
  */
 // Time: Created - TASK-WS2.07
+// Time: Update - TASK-WS3.07 - added drain support
 package kafka.server.http.ws;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Collection;
 import java.util.Collections;
@@ -40,6 +44,17 @@ import java.util.concurrent.ConcurrentHashMap;
  * // Time: Created - TASK-WS2.07
  */
 public final class WsConnectionRegistry {
+
+    private static final Logger log = LoggerFactory.getLogger(WsConnectionRegistry.class);
+
+    /** Close-frame code used during graceful shutdown. RFC 6455 §7.4.1: "Going Away". */
+    static final int CLOSE_CODE_GOING_AWAY = 1001;
+
+    /** Close-frame reason broadcast to clients at drain time. */
+    static final String CLOSE_REASON_DRAINING = "server shutting down";
+
+    /** Poll interval while waiting for connections to clear during drain. */
+    private static final long DRAIN_POLL_MS = 25L;
 
     private final ConcurrentHashMap<String, WsConnectionContext> connections = new ConcurrentHashMap<>();
 
@@ -87,5 +102,71 @@ public final class WsConnectionRegistry {
     /** @return number of currently registered connections. */
     public int size() {
         return connections.size();
+    }
+
+    /**
+     * Graceful drain (TASK-WS3.07). Sends a WebSocket close frame with code
+     * {@value #CLOSE_CODE_GOING_AWAY} ("{@value #CLOSE_REASON_DRAINING}") to
+     * every registered connection, then polls until the registry is empty or
+     * {@code timeoutMs} elapses.
+     *
+     * <p>Thread-safe. Calling {@code drain} on an empty registry returns
+     * {@code true} immediately. Connections register/unregister lock-free, so
+     * the pass over {@link #contexts()} is a snapshot — any connections
+     * registered after the close-frame broadcast are not signalled and will
+     * cause {@code drain} to time out.
+     *
+     * <p>The method does <em>not</em> force-close connections after the
+     * timeout: it simply reports {@code false} to the caller. The caller is
+     * expected to decide whether to proceed with shutdown anyway.
+     *
+     * @param timeoutMs hard upper bound on how long to wait for the registry
+     *                  to empty, measured from the moment drain starts.
+     *                  {@code <= 0} means "check once and return".
+     * @return {@code true} if every connection cleared within the timeout;
+     *         {@code false} if connections remained when the timeout expired.
+     */
+    public boolean drain(long timeoutMs) {
+        // Snapshot before signalling — any connection that registers after this
+        // point will not receive the close frame, which is fine: it either
+        // finishes its own handshake and stays connected (caller's problem) or
+        // times out here.
+        Collection<WsConnectionContext> snapshot = contexts();
+        if (snapshot.isEmpty()) {
+            return true;
+        }
+
+        int count = snapshot.size();
+        log.info("Draining {} WebSocket connection(s) with close code {}",
+                count, CLOSE_CODE_GOING_AWAY);
+
+        for (WsConnectionContext ctx : snapshot) {
+            try {
+                ctx.close(CLOSE_CODE_GOING_AWAY, CLOSE_REASON_DRAINING);
+            } catch (RuntimeException e) {
+                // Never let one broken connection stop the broadcast.
+                log.warn("Failed to send drain close frame to session {}", ctx.sessionId(), e);
+            }
+        }
+
+        long deadline = System.nanoTime() + Math.max(0L, timeoutMs) * 1_000_000L;
+        while (!connections.isEmpty()) {
+            long remainingNs = deadline - System.nanoTime();
+            if (remainingNs <= 0L) {
+                log.warn("Drain timed out after {} ms with {} connection(s) still registered",
+                        timeoutMs, connections.size());
+                return false;
+            }
+            long sleepMs = Math.min(DRAIN_POLL_MS, remainingNs / 1_000_000L + 1L);
+            try {
+                Thread.sleep(sleepMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("Drain interrupted after {} ms with {} connection(s) still registered",
+                        timeoutMs, connections.size());
+                return false;
+            }
+        }
+        return true;
     }
 }
