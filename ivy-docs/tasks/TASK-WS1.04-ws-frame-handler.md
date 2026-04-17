@@ -429,19 +429,79 @@ timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.ws.WsFrameHan
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Checkstyle NPath complexity rule bites linear pipelines.** The original
+  `channelRead0` chained empty-check, JSON parse, shape guard, type extract, and
+  dispatch in a single method.  Checkstyle computed NPath = 543 (ceiling 500).
+  The rule multiplies, not adds — every `||` inside an `if` still expands its
+  product of paths.  Splitting parse-and-validate into `parseFrame()` and
+  `routeAndDispatch()` (and lifting `extractType()` / `isBlank()` out) dropped
+  each method comfortably under the ceiling without changing behaviour.
+- **`ObjectMapper.readTree("null")` does not return Java `null`.** It returns a
+  `NullNode` whose `isObject()` is `false`.  The `msg == null || !msg.isObject()`
+  guard catches both cases — a useful double-check that saved a subtle bug
+  (dispatching on a `NullNode.get("type")` throws NPE).
+- **`SimpleChannelInboundHandler` auto-releases the text frame** after
+  `channelRead0` returns, so we never call `frame.release()` ourselves.  In the
+  unit test we invoke `handler.channelRead(...)` (not `channelRead0`) to keep
+  the auto-release semantics and avoid leak warnings.
+- **`Objects.requireNonNullElse` is the clean way** to default null code or
+  message strings in `sendErrorFrame` — no need for a local `if` chain.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **All 15 dispatch methods are stubs.**  Each throws
+  `UnsupportedOperationException("Not yet implemented: <type>")`.  The frame
+  handler catches that exception and converts it into an `INTERNAL_ERROR`
+  frame with a helpful message so a half-built server does not silently drop
+  client frames.  Later tasks will fill these in:
+  - `handlePublish` → TASK-WS1.11 (`WsPublishHandler`)
+  - `handleSubscribe` / `handleUnsubscribe` / `handleCredits` → WS1.14 (`WsCreditManager`)
+    + WS1.15 (`WsSubscriptionManager`)
+  - `handleAck` / `handleNack` → WS1.16 (`WsAckHandler`)
+  - `handleDeclareExchange` / `handleDeleteExchange` → WS1.06 (`ExchangeManager`)
+  - `handleBind` / `handleUnbind` → WS1.07 (`BindingManager`)
+  - `handleDeclareQueue` / `handleDeleteQueue` / `handleGet` / `handlePurgeQueue`
+    → later task (queue manager not yet scheduled in WS1).
+  - `handleEnableConfirms` → WS3.01 (publisher confirms).
+- **Rate limiting is out of scope** per the task spec ("Rate limiting of
+  control messages is NOT implemented in this task — separate task").  The
+  `maxControlMessagesPerSecond()` config value is read but not enforced here;
+  enforcement will be added alongside the publisher/consumer implementations
+  so it can see the whole per-connection traffic profile.
+- **WsUpgradeOrHttpHandler is not modified.**  The task file explicitly says
+  "Files to modify: None".  The upgrade handler still installs a no-op
+  placeholder at pipeline name `ws-handler`; a follow-up task (or the
+  integration test task WS1.17) will swap the placeholder for
+  `new WsFrameHandler(connCtx, wsConfigs)`.  This isolation keeps WS1.03's
+  test suite green and avoids touching the well-tested upgrade path before
+  the dispatch handlers are wired in.
+- **`channelInactive` clears the subscription map but does not yet drain
+  in-flight deliveries.**  Subscription tear-down with credit / ack cleanup
+  belongs in `WsSubscriptionManager` (WS1.15) and will be invoked here once
+  that manager is reachable from the connection context.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- Checkstyle NPath rule is worth remembering for future WS frame-heavy
+  handlers: prefer decomposing parse pipelines into small named methods
+  rather than chaining `if/return` guards in one body.
+- Jackson `ObjectNode.put(String,String)` treats a `null` value as an explicit
+  JSON `null`; we guarded the optional `detail` fields in `sendErrorFrame` by
+  building the sub-object only when at least one of the two inputs was
+  non-null.  That keeps the wire format minimal.
+- The per-type dispatch test is parameterised via a helper
+  (`assertDispatchedTo`) that overrides every handler and flips a single
+  flag when the expected method is called.  This is ugly but obvious and
+  avoids pulling in a test-only matcher library.  15 tests × 2 lines each is
+  worth the duplication for the readability.
+- Initial implementation wrote dispatch as a big `switch`.  Once the
+  checkstyle NPath rule fired, the switch turned out to be innocent (it
+  contributes linearly to NPath); the real culprit was the compound guards
+  in `channelRead0`.  Moral: measure before refactoring.
 
 ---
 
@@ -466,3 +526,15 @@ _To be filled by the executing agent._
 
 > Filled by the executing agent after each commit.
 > Run: `git diff --name-status HEAD~1 HEAD -- '*.java' '*.xml' '*.json' '*.yaml' '*.yml'`
+
+```
+A  http-server/src/main/java/kafka/server/http/ws/WsFrameHandler.java
+A  http-server/src/test/java/kafka/server/http/ws/WsFrameHandlerTest.java
+```
+
+**Test count:** 32 tests, all passing.
+
+**Run command:**
+```
+timeout 300 ./gradlew :http-server:test --tests "kafka.server.http.ws.WsFrameHandlerTest"
+```
