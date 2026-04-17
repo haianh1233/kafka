@@ -16,6 +16,7 @@
  */
 // Time: Created - TASK-B.01
 // Time: Update - TASK-WS2.06 - added exchange/queue/binding REST routes
+// Time: Update - TASK-WS2.07 - added connection/consumer REST routes
 package kafka.server.http;
 
 import io.netty.handler.codec.http.HttpMethod;
@@ -77,7 +78,13 @@ public final class HttpRouter {
         PURGE_QUEUE,
         CREATE_BINDING,
         LIST_BINDINGS,
-        DELETE_BINDING
+        DELETE_BINDING,
+        // --- WS2.07: Connection / consumer management ---
+        LIST_CONNECTIONS,
+        GET_CONNECTION,
+        FORCE_CLOSE_CONNECTION,
+        LIST_CONSUMERS,
+        FORCE_CANCEL_CONSUMER
     }
 
     // --- Route result ---
@@ -232,6 +239,24 @@ public final class HttpRouter {
     private static final Pattern BINDINGS_PATTERN =
         Pattern.compile("^/v1/bindings$");
 
+    // --- WS2.07 connection / consumer management patterns ---
+
+    // Matches: /v1/connections
+    private static final Pattern CONNECTIONS_LIST_PATTERN =
+        Pattern.compile("^/v1/connections$");
+
+    // Matches: /v1/connections/{connectionId}
+    private static final Pattern CONNECTION_DETAIL_PATTERN =
+        Pattern.compile("^/v1/connections/([^/?]+)$");
+
+    // Matches: /v1/consumers
+    private static final Pattern CONSUMERS_LIST_PATTERN =
+        Pattern.compile("^/v1/consumers$");
+
+    // Matches: /v1/consumers/{connectionId}/{subscriptionId}
+    private static final Pattern CONSUMER_CANCEL_PATTERN =
+        Pattern.compile("^/v1/consumers/([^/?]+)/([^/?]+)$");
+
     // --- Client ID validation ---
     private static final Pattern CLIENT_ID_PATTERN =
         Pattern.compile("^[a-zA-Z0-9._-]{1,128}$");
@@ -276,6 +301,9 @@ public final class HttpRouter {
         if (result != null) return result;
 
         result = matchRoutingRoutes(method, path, queryParams);
+        if (result != null) return result;
+
+        result = matchAdminRoutes(method, path, queryParams);
         if (result != null) return result;
 
         result = matchUtilityRoutes(method, path, queryParams);
@@ -452,6 +480,57 @@ public final class HttpRouter {
                 "Method " + method + " not allowed for " + path + "; expected POST, GET or DELETE");
         }
         return new RouteResult(ht, null, null, null, null, null, queryParams);
+    }
+
+    /**
+     * WS2.07 — Matches connection and consumer management routes.
+     *
+     * <p>Consumer cancel uses a two-segment identifier path — connectionId and
+     * subscriptionId — so we reuse {@link RouteResult#consumerGroup()} for the
+     * connection id and {@link RouteResult#resourceName()} for the
+     * subscriptionId to avoid adding yet another dedicated field.
+     */
+    private RouteResult matchAdminRoutes(HttpMethod method, String path, Map<String, String> queryParams) {
+        Matcher matcher;
+
+        // /v1/consumers/{connectionId}/{subscriptionId} — must come before the list pattern.
+        matcher = CONSUMER_CANCEL_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.DELETE, path);
+            String connectionId = validateResourceName(matcher.group(1), "connection");
+            String subscriptionId = validateResourceName(matcher.group(2), "subscription");
+            return new RouteResult(HandlerType.FORCE_CANCEL_CONSUMER,
+                null, null, connectionId, null, subscriptionId, queryParams);
+        }
+
+        matcher = CONSUMERS_LIST_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.GET, path);
+            return new RouteResult(HandlerType.LIST_CONSUMERS, null, null, null, null, null, queryParams);
+        }
+
+        matcher = CONNECTION_DETAIL_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            String connectionId = validateResourceName(matcher.group(1), "connection");
+            HandlerType ht;
+            if (method.equals(HttpMethod.GET)) {
+                ht = HandlerType.GET_CONNECTION;
+            } else if (method.equals(HttpMethod.DELETE)) {
+                ht = HandlerType.FORCE_CLOSE_CONNECTION;
+            } else {
+                throw new InvalidRequestException(
+                    "Method " + method + " not allowed for " + path + "; expected GET or DELETE");
+            }
+            return new RouteResult(ht, null, null, null, null, connectionId, queryParams);
+        }
+
+        matcher = CONNECTIONS_LIST_PATTERN.matcher(path);
+        if (matcher.matches()) {
+            requireMethod(method, HttpMethod.GET, path);
+            return new RouteResult(HandlerType.LIST_CONNECTIONS, null, null, null, null, null, queryParams);
+        }
+
+        return null;
     }
 
     private static HandlerType exchangeMethodToHandler(HttpMethod method, String path) {

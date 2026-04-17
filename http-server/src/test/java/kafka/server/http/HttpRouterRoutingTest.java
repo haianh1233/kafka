@@ -217,4 +217,61 @@ class HttpRouterRoutingTest {
         assertEquals(HttpRouter.HandlerType.PURGE_QUEUE, r.handlerType());
         assertNotNull(r.resourceName());
     }
+
+    // --- WS2.07: Connection management routes ---
+
+    @Test
+    void route_listConnections_get() {
+        var r = router.route(HttpMethod.GET, "/v1/connections");
+        assertEquals(HttpRouter.HandlerType.LIST_CONNECTIONS, r.handlerType());
+    }
+
+    @Test
+    void route_getConnection_get() {
+        var r = router.route(HttpMethod.GET, "/v1/connections/abc-123");
+        assertEquals(HttpRouter.HandlerType.GET_CONNECTION, r.handlerType());
+        assertEquals("abc-123", r.resourceName());
+    }
+
+    @Test
+    void route_forceCloseConnection_delete() {
+        var r = router.route(HttpMethod.DELETE, "/v1/connections/abc-123");
+        assertEquals(HttpRouter.HandlerType.FORCE_CLOSE_CONNECTION, r.handlerType());
+        assertEquals("abc-123", r.resourceName());
+    }
+
+    @Test
+    void route_connectionWrongMethod_throws() {
+        assertThrows(InvalidRequestException.class,
+            () -> router.route(HttpMethod.POST, "/v1/connections/abc-123"));
+    }
+
+    // --- WS2.07: Consumer management routes ---
+
+    @Test
+    void route_listConsumers_get() {
+        var r = router.route(HttpMethod.GET, "/v1/consumers");
+        assertEquals(HttpRouter.HandlerType.LIST_CONSUMERS, r.handlerType());
+    }
+
+    @Test
+    void route_listConsumers_queueFilter() {
+        var r = router.route(HttpMethod.GET, "/v1/consumers?queue=orders");
+        assertEquals(HttpRouter.HandlerType.LIST_CONSUMERS, r.handlerType());
+        assertEquals("orders", r.queryParams().get("queue"));
+    }
+
+    @Test
+    void route_forceCancelConsumer_delete() {
+        var r = router.route(HttpMethod.DELETE, "/v1/consumers/conn-1/sub-42");
+        assertEquals(HttpRouter.HandlerType.FORCE_CANCEL_CONSUMER, r.handlerType());
+        assertEquals("conn-1", r.consumerGroup()); // connectionId reused via consumerGroup slot
+        assertEquals("sub-42", r.resourceName());  // subscriptionId via resourceName slot
+    }
+
+    @Test
+    void route_forceCancelConsumer_wrongMethod_throws() {
+        assertThrows(InvalidRequestException.class,
+            () -> router.route(HttpMethod.GET, "/v1/consumers/conn-1/sub-42"));
+    }
 }

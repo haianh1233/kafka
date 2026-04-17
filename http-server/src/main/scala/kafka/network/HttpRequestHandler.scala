@@ -18,6 +18,7 @@
 // Time: Modified - TASK-F.06 (drain check + in-flight tracking)
 // Time: Modified - TASK-B.06 (request pipeline wiring)
 // Time: Modified - TASK-WS2.06 (REST exchange/queue/binding CRUD dispatch)
+// Time: Modified - TASK-WS2.07 (REST connection/consumer management dispatch)
 package kafka.network
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
@@ -26,7 +27,7 @@ import io.netty.channel.{ChannelFutureListener, ChannelHandlerContext, SimpleCha
 import io.netty.handler.codec.http.{DefaultFullHttpResponse, FullHttpRequest, HttpHeaderNames, HttpResponseStatus, HttpVersion}
 import io.netty.handler.ssl.SslHandler
 import kafka.server.http.{HttpProcessor, HttpRequestTranslator, HttpRouter, HttpServerConfigs}
-import kafka.server.http.rest.{BindingRestHandler, ExchangeRestHandler, QueueRestHandler}
+import kafka.server.http.rest.{BindingRestHandler, ConnectionRestHandler, ConsumerRestHandler, ExchangeRestHandler, QueueRestHandler}
 import org.apache.kafka.common.memory.MemoryPool
 import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.ApiKeys
@@ -77,7 +78,9 @@ class HttpRequestHandler(
   httpServerConfigs: HttpServerConfigs = HttpServerConfigs.withDefaults(),
   exchangeRestHandler: ExchangeRestHandler = null,
   queueRestHandler: QueueRestHandler = null,
-  bindingRestHandler: BindingRestHandler = null
+  bindingRestHandler: BindingRestHandler = null,
+  connectionRestHandler: ConnectionRestHandler = null,
+  consumerRestHandler: ConsumerRestHandler = null
 ) extends SimpleChannelInboundHandler[FullHttpRequest] {
 
   /** Convenience constructor for backward compatibility (no drain support). */
@@ -1128,7 +1131,12 @@ class HttpRequestHandler(
          HttpRouter.HandlerType.PURGE_QUEUE |
          HttpRouter.HandlerType.CREATE_BINDING |
          HttpRouter.HandlerType.LIST_BINDINGS |
-         HttpRouter.HandlerType.DELETE_BINDING => true
+         HttpRouter.HandlerType.DELETE_BINDING |
+         HttpRouter.HandlerType.LIST_CONNECTIONS |
+         HttpRouter.HandlerType.GET_CONNECTION |
+         HttpRouter.HandlerType.FORCE_CLOSE_CONNECTION |
+         HttpRouter.HandlerType.LIST_CONSUMERS |
+         HttpRouter.HandlerType.FORCE_CANCEL_CONSUMER => true
     case _ => false
   }
 
@@ -1195,6 +1203,30 @@ class HttpRequestHandler(
 
       case HttpRouter.HandlerType.PATCH_QUEUE | HttpRouter.HandlerType.PURGE_QUEUE =>
         notWired("QueueRestHandler (patch/purge not implemented in WS2.06)")
+
+      // --- WS2.07: connection management ---
+      case HttpRouter.HandlerType.LIST_CONNECTIONS =>
+        if (connectionRestHandler == null) notWired("ConnectionRestHandler")
+        else connectionRestHandler.handleList()
+
+      case HttpRouter.HandlerType.GET_CONNECTION =>
+        if (connectionRestHandler == null) notWired("ConnectionRestHandler")
+        else connectionRestHandler.handleGet(routeResult.resourceName())
+
+      case HttpRouter.HandlerType.FORCE_CLOSE_CONNECTION =>
+        if (connectionRestHandler == null) notWired("ConnectionRestHandler")
+        else connectionRestHandler.handleForceClose(routeResult.resourceName(), req)
+
+      // --- WS2.07: consumer management ---
+      case HttpRouter.HandlerType.LIST_CONSUMERS =>
+        if (consumerRestHandler == null) notWired("ConsumerRestHandler")
+        else consumerRestHandler.handleList(qp.get("queue"))
+
+      case HttpRouter.HandlerType.FORCE_CANCEL_CONSUMER =>
+        if (consumerRestHandler == null) notWired("ConsumerRestHandler")
+        // consumerGroup slot holds connectionId, resourceName holds subscriptionId
+        else consumerRestHandler.handleForceCancel(
+          routeResult.consumerGroup(), routeResult.resourceName())
 
       case _ =>
         notWired("Unknown REST routing handler")

@@ -249,19 +249,131 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.rest.Connecti
 
 ## Learning
 
-_To be filled by the executing agent._
+- **`WsConnectionRegistry` as the decoupling seam.** The task spec names a
+  `WsConnectionRegistry` dependency without one existing. Introducing a tiny
+  class that wraps `ConcurrentHashMap<String, WsConnectionContext>` (register,
+  unregister, get, contains, connectionIds, contexts, size) gave the REST
+  admin handlers a clean surface to target and kept them decoupled from
+  `HttpProcessor`. The processor already holds the authoritative map; wiring
+  at startup simply hands the same registry instance to both sides.
+- **Two-segment routes reuse existing RouteResult slots.** The consumer
+  force-cancel path `/v1/consumers/{connectionId}/{subscriptionId}` needs two
+  identifiers. Rather than grow `RouteResult` with a new field, the
+  `consumerGroup()` slot carries the connectionId and `resourceName()` carries
+  the subscriptionId. Documented at the site of the routing code and again in
+  the scala dispatch. Less invasive than another constructor overload.
+- **Consumer manager lookup is a functional interface.** Each WS connection
+  owns its own `WsSubscriptionManager` (see WS1.15), so the admin handler
+  accepts a `SubscriptionManagerLookup` rather than a single global manager.
+  Production wiring plugs in a map lookup; tests can inject an always-return
+  lambda for a single manager. Mirrors the `QueueStore` facade trick from
+  WS2.06.
+- **Force-cancel must NOT commit offsets.** `WsSubscriptionManager.unsubscribe`
+  returns committable offsets as its contract — the admin handler intentionally
+  discards them. Commenting this explicitly in both the handler javadoc and the
+  test (`forceCancel_requeuesUnacked`) matters because the contract is load-
+  bearing for at-least-once redelivery on reconnect.
+- **Switch exhaustiveness in `HttpRequestTranslator`.** Adding new
+  `HandlerType` enum values broke the pattern-matched switch in the translator.
+  The fix is one-line (throw `InvalidRequestException` with a clear message
+  saying these handlers are dispatched directly) but easy to miss without a
+  compile.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **No real wiring yet.** `HttpRequestHandler.scala` gains two optional
+  constructor parameters (`connectionRestHandler`, `consumerRestHandler`) that
+  default to `null` and a dispatch arm that returns 501 "not wired" until the
+  broker startup sequence constructs the handlers with a shared
+  `WsConnectionRegistry`. That wire-up lives in a later phase — the handlers
+  are production-ready, only the bootstrap is pending.
+- **Consumer list performance is linear.** `handleList` iterates all
+  connections and all subscriptions per call — fine at moderate scale
+  (O(connections × subs/connection)) but will need an index for ops dashboards
+  polling every second at >10k connections. Acceptable for Phase-2 admin
+  endpoints.
+- **Force-close does not drain in-flight deliveries.** The admin intent is
+  "stop serving this client now", so we just send the WS close frame and let
+  the existing channel-close pipeline requeue unacked messages. If operators
+  need a graceful "stop new work, let existing batches finish" variant, that
+  is a separate WS3.07 concern.
+- **No ACL check.** Admin endpoints are unauthenticated at this layer; the
+  enforcement lives in the `KafkaPrincipalBuilder` + later ACL task
+  (WS3.05). The handler treats every caller that reaches it as authorized.
+- **Pattern for reason text.** Force-close reason from the body is passed
+  verbatim to `CloseWebSocketFrame`. The WS spec caps the reason at
+  125 bytes — Netty will throw if exceeded. A production hardening pass should
+  truncate at the handler layer.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- **TDD roundtrip.** Wrote 9 + 9 handler tests and 7 router tests before any
+  production code. First compile failed on `HttpRequestTranslator` exhaustive
+  switch — a tidy reminder that enum additions ripple.
+- **Test harness re-used the WS1.12 pattern.** The `HttpProcessorWsTest`
+  harness — a real `WsConnectionContext` wrapped around a mocked
+  `ChannelHandlerContext` — made it trivial to `verify(channel).writeAndFlush`
+  the `CloseWebSocketFrame` for force-close and the `TextWebSocketFrame` for
+  subscription-cancelled. No embedded Netty channel needed.
+- **`subscriptions()` returns a `ConcurrentHashMap<String, Object>`** on
+  `WsConnectionContext`. Tests populate it directly to simulate active
+  subscriptions for the list detail endpoint — keeps the test independent
+  of `WsSubscriptionManager`. The two inspections are orthogonal:
+  `WsConnectionContext.subscriptions()` is the subscription-id set,
+  `WsSubscriptionManager` is the full lifecycle.
+- **Order matters in `matchAdminRoutes`.** The two-segment cancel pattern
+  must be tested before `CONSUMERS_LIST_PATTERN` so that
+  `/v1/consumers/abc/xyz` doesn't fall through as "list with stray segments".
+- **HttpRouter now has three "matchXxxRoutes" families.** Topic / share-group
+  / consumer-group / routing / admin / utility — neat and readable, but the
+  file is nearing the point where each family deserves its own class.
+  Deferring that refactor.
+
+---
+
+## File Manifest
+
+**Created:**
+- `http-server/src/main/java/kafka/server/http/ws/WsConnectionRegistry.java`
+  — broker-wide registry of active WS connections, backed by a
+  `ConcurrentHashMap`. Read-side used by the admin handlers; write-side used
+  by the WS upgrade handler (wire-up deferred).
+- `http-server/src/main/java/kafka/server/http/rest/ConnectionRestHandler.java`
+  — `GET /v1/connections`, `GET /v1/connections/{id}`,
+  `DELETE /v1/connections/{id}`. Force-close emits
+  `CloseWebSocketFrame(1001, reason)`.
+- `http-server/src/main/java/kafka/server/http/rest/ConsumerRestHandler.java`
+  — `GET /v1/consumers?queue=...`, `DELETE /v1/consumers/{conn}/{sub}`.
+  Force-cancel emits `subscription-cancelled` with `reason: "ADMIN_CANCEL"`
+  and deliberately discards committable offsets (unacked → requeue).
+- `http-server/src/test/java/kafka/server/http/rest/ConnectionRestHandlerTest.java`
+  — 9 tests covering list/get/force-close happy & error paths.
+- `http-server/src/test/java/kafka/server/http/rest/ConsumerRestHandlerTest.java`
+  — 9 tests covering list (with queue filter), force-cancel, subscription-
+  cancelled frame content, requeue contract, and 404 paths.
+
+**Modified:**
+- `http-server/src/main/java/kafka/server/http/HttpRouter.java` — new
+  `HandlerType` values (`LIST_CONNECTIONS`, `GET_CONNECTION`,
+  `FORCE_CLOSE_CONNECTION`, `LIST_CONSUMERS`, `FORCE_CANCEL_CONSUMER`), four
+  patterns (`CONNECTIONS_LIST_PATTERN`, `CONNECTION_DETAIL_PATTERN`,
+  `CONSUMERS_LIST_PATTERN`, `CONSUMER_CANCEL_PATTERN`), `matchAdminRoutes`
+  method, and `route()` wired to call it before `matchUtilityRoutes`.
+- `http-server/src/main/java/kafka/server/http/HttpRequestTranslator.java`
+  — added exhaustive switch arm for the five new HandlerType values (throws,
+  mirroring the WS2.06 "handled directly, not translated" arm).
+- `http-server/src/main/scala/kafka/network/HttpRequestHandler.scala`
+  — constructor gains `connectionRestHandler` and `consumerRestHandler`
+  (nullable), `isRestRoutingHandler` matches the new types, and
+  `handleRestRoutingRequest` dispatches them. Unwired handlers return
+  501 via `notWired`.
+- `http-server/src/test/java/kafka/server/http/HttpRouterRoutingTest.java`
+  — 7 new tests covering all five new routes plus wrong-method and
+  query-filter cases.
 
 ---
 
@@ -273,9 +385,3 @@ _To be filled by the executing agent._
 - [ ] Force-close sends WebSocket close frame code 1001
 - [ ] Force-cancel sends subscription-cancelled with reason ADMIN_CANCEL
 - [ ] Learning section filled with at least one entry
-
----
-
-## File Manifest
-
-_To be filled by the executing agent._
