@@ -211,19 +211,48 @@ timeout 300 ./gradlew :http-server:test --tests 'kafka.server.http.ws.WsQueueLif
 
 ## Learning
 
-_To be filled by the executing agent._
+- **Decouple the delete hook from the manager.** The lifecycle rules (auto-delete, x-expires, exclusive close) have to trigger the physical deletion of the queue (routing-metadata entry, backing Kafka topic, bindings), but that physical deletion does not yet exist in the codebase — there is no `QueueManager`. Shipping this as a `Consumer<String> deleteHook` injected at construction keeps the class pure, trivially testable, and leaves the destructive side-effect to whoever wires this up later.
+- **Atomic "transition 1 → 0" is the only reliable auto-delete trigger.** Using `AtomicInteger.updateAndGet` loses the pre-value in multi-reader races, and `decrementAndGet` lets a stray unsubscribe (unmatched by a prior subscribe) drive the count negative and then trigger auto-delete on the *next* zero crossing. The compareAndSet loop in `onUnsubscribe` (a) clamps at 0 so stray unsubscribes are no-ops, and (b) guarantees that exactly one thread observes `prev == 1` — that thread owns the delete. A secondary `autoDeleteFired` guard makes the hook idempotent belt-and-braces for any external double-trigger.
+- **x-expires timer must recheck subscriber count at fire time.** A naïve "schedule delete in N ms" races with a subscribe that arrives between scheduling and firing. The scheduler task therefore re-reads `subscriberCount` before invoking the hook; the explicit `cancelExpiryTimer` path (called from `onSubscribe`) is an optimisation, not a correctness requirement.
+- **Server-generated names use `UUID.randomUUID()` not `nameUUIDFromBytes`.** Random UUIDs (v4) come from a SecureRandom-backed pool and are unguessable; name-based UUIDs would be trivially predictable from a connection id and would let a malicious client collide names with server-generated queues.
+- **Redeclare validation is intentionally flag-only.** AMQP clients reconnecting after a broker restart routinely resubmit `queue.declare` with the arguments their client library knows — those may not match the broker's stored args exactly (e.g. default values substituted in). Checking `durable`/`exclusive`/`autoDelete` catches real configuration drift while ignoring arguments lets idempotent reconnects succeed.
 
 ---
 
 ## Limitations
 
-_To be filled by the executing agent._
+- **No wiring into WsSubscriptionManager / WsConnectionContext / QueueManager yet.** The spec listed those integrations as "files to modify" but doing so is scope creep against the warning in the executing-agent prompt — there is no QueueManager today, WsSubscriptionManager's exclusive-consumer integration lives in TASK-WS3.04 (already merged), and the correct boundary is for each of those components to call into this manager when their owning tasks wire them together. As a result:
+  - `WsSubscriptionManager.subscribe`/`unsubscribe` does NOT yet call `onSubscribe`/`onUnsubscribe`.
+  - `WsConnectionContext.onClose` does NOT yet call `onConnectionClose`.
+  - `QueueManager.declare`/`delete` does NOT yet call `registerQueue`/`unregisterQueue`, use `generateQueueName` for empty names, or `validateRedeclare` — QueueManager does not exist.
+- **The delete hook does not cascade bindings/topic.** The hook is a `Consumer<String>` that receives only the queue name; a real implementation must look up the queue's bindings, delete them, then delete the backing Kafka topic. That glue belongs in the future QueueManager.
+- **No vhost dimension in the registry.** Queue names are unique within a vhost but can collide across vhosts. This manager is keyed on bare queue name; a future vhost integration (TASK-WS2.09) will need to key by `(vhost, name)`.
+- **Scheduler is a shared dependency.** Callers supply a `ScheduledExecutorService`; this class does not own its lifecycle. If a caller passes an already-shutdown scheduler, `startExpiryTimer` will throw `RejectedExecutionException` — behaviour not covered by tests because the fix is caller-side.
 
 ---
 
 ## Field Notes
 
-_To be filled by the executing agent._
+- **TDD flow.** RED was verified by running `compileTestJava` alone — it failed with "cannot find symbol `WsQueueLifecycleManager`" across 9 locations. GREEN came from implementing the class; all 23 tests passed on the first run after fixing the checkstyle unused-import violation that the test file initially carried.
+- **Concurrency test.** The `autoDelete_concurrentUnsubscribes_deletesExactlyOnce` test uses 64 subscribers and 64 concurrent unsubscribe calls on a 16-thread pool, asserting the hook fires exactly once. This exercise is the real contract for auto-delete and is the reason for the compareAndSet loop over a naïve `decrementAndGet`.
+- **Checkstyle caught an unused import** (`java.util.concurrent.ConcurrentHashMap`) in the test file on the first run — a reminder that spotless isn't the only lint gate in this module.
+
+---
+
+## File Manifest
+
+**Created:**
+
+- `http-server/src/main/java/kafka/server/http/ws/WsQueueLifecycleManager.java` — lifecycle manager: auto-delete, x-expires, exclusive cleanup, server-generated names, redeclare validation.
+- `http-server/src/test/java/kafka/server/http/ws/WsQueueLifecycleManagerTest.java` — 23 unit tests covering every acceptance-criteria row plus concurrency, defensive null checks, timer restart semantics.
+
+**Modified:** none.
+
+**Future integration points** (to be wired by their respective tasks):
+
+- `WsSubscriptionManager.subscribe`/`unsubscribe` → call `onSubscribe`/`onUnsubscribe`.
+- `WsConnectionContext.onClose` → call `onConnectionClose`.
+- Future `QueueManager.declare`/`delete` → call `registerQueue`/`unregisterQueue`, use `generateQueueName` for empty names, `validateRedeclare` for existing queues.
 
 ---
 
